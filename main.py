@@ -20,6 +20,7 @@ from core.adapters.paper.broker import PaperBroker
 from core.audit import AuditLogger, configure_runtime_logging
 from core.risk.policy import RiskPolicy
 from core.engine.loader import get_registry
+from api.server import start_control_api_thread
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +47,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy", default=None, help="Run one strategy by id")
     parser.add_argument("--dry-run", action="store_true", help="Signals only, no native orders")
     parser.add_argument("--lookback-days", type=int, default=None)
+    parser.add_argument("--api", action="store_true", help="Enable read-only control API")
+    parser.add_argument("--api-host", default=None, help="Control API host override")
+    parser.add_argument("--api-port", type=int, default=None, help="Control API port override")
+    parser.add_argument("--api-token-env", default=None, help="Bearer token environment variable")
     return parser.parse_args()
 
 
@@ -100,12 +105,16 @@ def main() -> None:
         adopted_position_map=_adopted_position_map(config),
         audit_logger=audit_logger,
     )
+    api_server = _start_control_api(config, engine, strategy_ids)
 
     print("Running. Press Ctrl+C to stop.")
     try:
         engine.run_live()
     except KeyboardInterrupt:
         print("\nShutting down.")
+    finally:
+        if api_server is not None:
+            api_server.stop()
 
 
 def _legacy_cli_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -132,6 +141,12 @@ def _legacy_cli_config(args: argparse.Namespace) -> dict[str, Any]:
             "historical": {"provider": "ibkr"},
             "live": {"provider": "ibkr"},
         },
+        "api": {
+            "enabled": False,
+            "host": "127.0.0.1",
+            "port": 8550,
+            "token_env": "IBKR_LT_API_TOKEN",
+        },
     }
 
 
@@ -154,6 +169,15 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.strategy:
         config["strategies"] = [args.strategy]
+    api = config.setdefault("api", {})
+    if args.api:
+        api["enabled"] = True
+    if args.api_host is not None:
+        api["host"] = args.api_host
+    if args.api_port is not None:
+        api["port"] = args.api_port
+    if args.api_token_env is not None:
+        api["token_env"] = args.api_token_env
 
     execution = config.setdefault("execution", {})
     if execution.get("provider", "ibkr") == "ibkr":
@@ -279,6 +303,36 @@ def _adopted_position_map(config: dict[str, Any]) -> dict[Instrument, str]:
         )
         result[instrument] = item["strategy_id"]
     return result
+
+
+def _start_control_api(config: dict[str, Any], engine: Engine, strategy_ids: list[str]):
+    api_cfg = dict(config.get("api") or {})
+    if not bool(api_cfg.get("enabled", False)):
+        return None
+    host = str(api_cfg.get("host", "127.0.0.1"))
+    port = int(api_cfg.get("port", 8550))
+    server = start_control_api_thread(
+        engine,
+        host=host,
+        port=port,
+        token_env=str(api_cfg.get("token_env", "IBKR_LT_API_TOKEN")),
+        log_level=str(api_cfg.get("log_level", "warning")),
+        metadata=_api_metadata(config, strategy_ids),
+    )
+    print(f"Control API: http://{host}:{port}")
+    return server
+
+
+def _api_metadata(config: dict[str, Any], strategy_ids: list[str]) -> dict[str, Any]:
+    data = dict(config.get("data") or {})
+    return {
+        "mode": str(config.get("mode", "")),
+        "dry_run": bool(config.get("dry_run", False)),
+        "strategies": list(strategy_ids),
+        "execution_provider": str(dict(config.get("execution") or {}).get("provider", "ibkr")),
+        "historical_provider": str(dict(data.get("historical") or {}).get("provider", "ibkr")),
+        "live_provider": str(dict(data.get("live") or {}).get("provider", "ibkr")),
+    }
 
 
 if __name__ == "__main__":

@@ -33,6 +33,36 @@ Proprietary strategy implementations, detailed strategy docs, research notebooks
 
 To run the project from a fresh public clone, add your own strategy module under `strategies/` or update `config.yaml` to point at an available local strategy.
 
+## Control API
+
+The project includes a read-only FastAPI control surface for runtime visibility:
+
+```bash
+python main.py --paper --api
+```
+
+Default URL:
+
+```text
+http://127.0.0.1:8550
+```
+
+Public endpoints:
+
+- `GET /api/v1/health`
+- `GET /api/v1/meta`
+- `GET /api/v1/meta/capabilities`
+
+Protected endpoints require `Authorization: Bearer <token>` when `IBKR_LT_API_TOKEN` is set:
+
+- `GET /api/v1/runtime/snapshot`
+- `GET /api/v1/runtime/strategies`
+- `GET /api/v1/positions`
+- `GET /api/v1/events`
+- `WS /ws/events`
+
+The API is intentionally read-only. Manual trading, order cancellation, and startup approval commands should be added later through a command bus with explicit guardrails.
+
 ## Tests
 
 ```bash
@@ -44,4 +74,3 @@ In this workspace, the test suite is normally run with:
 ```bash
 ~/.venv/bin/python -m pytest tests/
 ```
-

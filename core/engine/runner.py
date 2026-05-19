@@ -16,8 +16,10 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import RLock
 from typing import TYPE_CHECKING, Any
 
+from ..audit.serialize import to_jsonable
 from ..data.bar_builder import BarBuilder
 from ..data.feed import DataFeed
 from ..data.manager import DataManager
@@ -75,6 +77,18 @@ class Engine:
         self._session_tz = session_tz
         self._adopted_position_map = adopted_position_map or {}
         self._audit = audit_logger
+        self._state_lock = RLock()
+        self._phase = "initialized"
+        self._broker_connected = False
+        self._data_connected = False
+        self._started_at: datetime | None = None
+        self._stopped_at: datetime | None = None
+        self._last_error: str | None = None
+        self._last_bar: dict[str, Any] | None = None
+        self._bar_count = 0
+        self._managers: dict[Instrument, DataManager] = {}
+        self._portfolio: PortfolioState | None = None
+        self._recent_events: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -88,11 +102,83 @@ class Engine:
         """Run backtest to completion. Blocks until all replay bars are consumed."""
         asyncio.run(self._run())
 
+    def snapshot_state(self) -> dict[str, Any]:
+        """Return a JSON-safe read-only runtime snapshot for control APIs."""
+        now = datetime.now(tz=timezone.utc)
+        with self._state_lock:
+            managers = dict(self._managers)
+            portfolio = self._portfolio
+            state = {
+                "timestamp_utc": now.isoformat(),
+                "phase": self._phase,
+                "running": self._phase in {"starting", "running"},
+                "started_at": to_jsonable(self._started_at),
+                "stopped_at": to_jsonable(self._stopped_at),
+                "last_error": self._last_error,
+                "connection": {
+                    "broker_connected": self._broker_connected,
+                    "data_connected": self._data_connected,
+                    "connected": self._broker_connected and self._data_connected,
+                },
+                "broker": {
+                    "name": getattr(self._broker, "name", self._broker.__class__.__name__),
+                    "capabilities": to_jsonable(getattr(self._broker, "capabilities", None)),
+                },
+                "data": {
+                    "capabilities": to_jsonable(getattr(self._data_feed, "capabilities", None)),
+                    "instruments": [
+                        to_jsonable(instrument)
+                        for instrument in sorted(managers, key=lambda item: item.symbol)
+                    ],
+                    "latest_bars": {
+                        instrument.symbol: to_jsonable(manager.latest_timestamp())
+                        for instrument, manager in sorted(
+                            managers.items(),
+                            key=lambda item: item[0].symbol,
+                        )
+                    },
+                    "bar_count": self._bar_count,
+                    "last_bar": to_jsonable(self._last_bar),
+                },
+                "strategies": [
+                    {
+                        "id": kernel.SPEC.id,
+                        "primary_instrument": to_jsonable(kernel.SPEC.primary_instrument),
+                        "execution_instrument": to_jsonable(kernel.SPEC.execution_instrument),
+                        "reference_instruments": to_jsonable(kernel.SPEC.reference_instruments),
+                        "timeframes": list(kernel.SPEC.timeframes),
+                        "warmup_bars": dict(kernel.SPEC.warmup_bars),
+                    }
+                    for kernel, _ in self._strategies
+                ],
+                "risk": {
+                    "position_size_shares": self._risk.position_size_shares,
+                    "max_order_quantity": self._risk.max_order_quantity,
+                },
+                "recent_events": list(self._recent_events),
+            }
+
+        state["positions"] = {
+            "broker": to_jsonable(portfolio.positions()) if portfolio is not None else [],
+            "strategy": [
+                {"strategy_id": sid, "position": to_jsonable(position)}
+                for sid, position in portfolio.strategy_positions()
+            ] if portfolio is not None else [],
+            "net_liquidation": portfolio.net_liquidation() if portfolio is not None else 0.0,
+        }
+        return state
+
     # ------------------------------------------------------------------
     # Core coroutine
     # ------------------------------------------------------------------
 
     async def _run(self) -> None:
+        self._set_runtime_state(
+            phase="starting",
+            started_at=datetime.now(tz=timezone.utc),
+            stopped_at=None,
+            last_error=None,
+        )
         loop = asyncio.get_running_loop()
         is_simulated = isinstance(self._clock, SimulatedClock)
 
@@ -106,15 +192,19 @@ class Engine:
             instr: DataManager(instr, self._lookback_days, self._session_tz)
             for instr in all_instruments
         }
+        self._set_managers(managers)
         features = FeatureRegistry(managers)
         bar_builders: dict[Instrument, BarBuilder] = {}
 
         # Connect broker
         await self._broker.connect()
+        self._set_runtime_state(broker_connected=True)
         await self._data_feed.connect()
+        self._set_runtime_state(data_connected=True)
 
         # Portfolio state and order manager
         portfolio = PortfolioState()
+        self._set_portfolio(portfolio)
         adopted = await self._broker.get_positions()
         if adopted:
             strategy_map = self._resolve_adopted_position_map(adopted)
@@ -142,8 +232,20 @@ class Engine:
                 bars = await self._data_feed.fetch(instr, TF_1M, start, end)
                 dm.merge_backfill(bars, live_session_date=end.date())
                 log.info("Backfilled %d bars for %s", len(bars), instr.symbol)
+                self._record_event(
+                    "data",
+                    "backfill_complete",
+                    instrument=instr.symbol,
+                    bars=len(bars),
+                )
             except Exception as e:
                 log.warning("Backfill failed for %s: %s", instr.symbol, e)
+                self._record_event(
+                    "data",
+                    "backfill_failed",
+                    instrument=instr.symbol,
+                    error=str(e),
+                )
 
         # Subscribe streaming
         for instr in all_instruments:
@@ -155,6 +257,7 @@ class Engine:
             else:
                 # Replay / moomoo: subscribe at 1m directly
                 await self._data_feed.subscribe(instr, TF_1M)
+            self._record_event("data", "subscribed", instrument=instr.symbol)
 
         # Register strategies in scheduler
         scheduler = Scheduler(features)
@@ -167,6 +270,7 @@ class Engine:
         pool = ThreadPoolExecutor(max_workers=self._pool_workers)
         drain_orders_task = loop.create_task(order_manager.drain_orders())
         drain_fills_task = loop.create_task(order_manager.drain_fills())
+        self._set_runtime_state(phase="running")
 
         try:
             async for raw_bar in self._data_feed.bars():
@@ -188,6 +292,7 @@ class Engine:
                 if dm is None:
                     continue
                 dm.on_bar(bar_1m)
+                self._record_bar(bar_1m)
 
                 # Let PaperBroker resolve pending orders on new bar
                 if hasattr(self._broker, "on_bar"):
@@ -240,6 +345,12 @@ class Engine:
                             await asyncio.sleep(0)
                     except Exception as e:
                         log.exception("Strategy %s raised: %s", kernel.SPEC.id, e)
+                        self._record_event(
+                            "strategy",
+                            "strategy_error",
+                            strategy_id=kernel.SPEC.id,
+                            error=str(e),
+                        )
                         self._write_signal_event(
                             kernel.SPEC.id,
                             "error",
@@ -249,12 +360,21 @@ class Engine:
 
         except Exception as e:
             log.exception("Engine _run error: %s", e)
+            self._set_runtime_state(phase="error", last_error=str(e))
+            self._record_event("engine", "engine_error", error=str(e))
         finally:
             drain_orders_task.cancel()
             drain_fills_task.cancel()
             pool.shutdown(wait=False)
             await self._data_feed.disconnect()
+            self._set_runtime_state(data_connected=False)
             await self._broker.disconnect()
+            phase = "error" if self._last_error else "stopped"
+            self._set_runtime_state(
+                phase=phase,
+                broker_connected=False,
+                stopped_at=datetime.now(tz=timezone.utc),
+            )
 
     def _resolve_adopted_position_map(
         self,
@@ -303,3 +423,49 @@ class Engine:
             "timestamp": timestamp,
             **fields,
         })
+
+    def _set_managers(self, managers: dict[Instrument, DataManager]) -> None:
+        with self._state_lock:
+            self._managers = dict(managers)
+
+    def _set_portfolio(self, portfolio: PortfolioState) -> None:
+        with self._state_lock:
+            self._portfolio = portfolio
+
+    def _set_runtime_state(self, **fields: Any) -> None:
+        with self._state_lock:
+            if "phase" in fields:
+                self._phase = str(fields["phase"])
+            if "broker_connected" in fields:
+                self._broker_connected = bool(fields["broker_connected"])
+            if "data_connected" in fields:
+                self._data_connected = bool(fields["data_connected"])
+            if "started_at" in fields:
+                self._started_at = fields["started_at"]
+            if "stopped_at" in fields:
+                self._stopped_at = fields["stopped_at"]
+            if "last_error" in fields:
+                self._last_error = fields["last_error"]
+        if "phase" in fields:
+            self._record_event("engine", f"phase_{self._phase}", phase=self._phase)
+
+    def _record_bar(self, bar) -> None:
+        with self._state_lock:
+            self._bar_count += 1
+            self._last_bar = {
+                "instrument": bar.instrument,
+                "timeframe": bar.timeframe.label,
+                "timestamp": bar.timestamp,
+                "source": bar.source,
+            }
+
+    def _record_event(self, source: str, message: str, **fields: Any) -> None:
+        event = {
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "source": source,
+            "message": message,
+            **to_jsonable(fields),
+        }
+        with self._state_lock:
+            self._recent_events.append(event)
+            self._recent_events = self._recent_events[-200:]

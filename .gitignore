@@ -52,7 +52,8 @@ docs/starting_guide.md
 docs/*strategy*.md
 docs/internal*.md
 docs/proprietary*.md
-tests/unit/test_phase5_strategies.py
+tests/unit/test_phase5_*.py
+tests/unit/test_*strateg*.py
 configs/local*.yaml
 configs/private*.yaml
 configs/proprietary*.yaml

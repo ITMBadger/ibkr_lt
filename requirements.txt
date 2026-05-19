@@ -5,3 +5,5 @@ pytest
 ruff
 PyYAML
 websockets
+fastapi
+uvicorn

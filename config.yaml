@@ -23,6 +23,13 @@ logging:
   bar_detail: relevant
   runtime_level: INFO
 
+api:
+  enabled: false
+  host: 127.0.0.1
+  port: 8550
+  token_env: IBKR_LT_API_TOKEN
+  log_level: warning
+
 strategies:
   - dax_panic_long
 
