@@ -60,6 +60,16 @@ If a strategy has an owned open position, `Engine` calls `StrategyKernel.on_exit
 
 When `logging.enabled=true`, the runtime creates the configured log directory and writes runtime, strategy decision, signal, order, and fill logs. Full `strategy_decisions.jsonl` traces are owner/dev artifacts and include condition thresholds and indicator values.
 
+### Hermes Control API
+
+The FastAPI control API is read-only in the current framework. It exposes health, metadata, runtime snapshot, positions, recent events, and an event WebSocket for the Hermes agent/operator.
+
+- Public: `/api/v1/health`, `/api/v1/meta`, `/api/v1/meta/capabilities`.
+- Protected when `IBKR_LT_API_TOKEN` is set: `/api/v1/runtime/*`, `/api/v1/positions`, `/api/v1/events`, `/ws/events`.
+- API routes read through `Engine.snapshot_state()`.
+- API routes must not call broker adapters, `OrderManager`, or strategies directly.
+- No manual trade, order cancel, startup approval, or state mutation endpoints are active.
+
 ---
 
 ## What Is Deferred (Phase 7+)
@@ -80,6 +90,7 @@ These controls existed in the archived legacy system and will be ported back onc
 | Runtime close-percent protective stops | strategy/runtime policy | Deferred |
 | JSON state persistence | archived runtime persistence | Deferred |
 | Buying-power check (warning) | archived central runtime | Deferred |
+| Mutating Hermes/API command bus | archived `RuntimeCommandBus` | Deferred; current API is read-only |
 
 ---
 

@@ -33,9 +33,9 @@ Proprietary strategy implementations, detailed strategy docs, research notebooks
 
 To run the project from a fresh public clone, add your own strategy module under `strategies/` or update `config.yaml` to point at an available local strategy.
 
-## Control API
+## Hermes Control API
 
-The project includes a read-only FastAPI control surface for runtime visibility:
+The project includes a read-only FastAPI control surface for the Hermes agent and operator runtime visibility:
 
 ```bash
 python main.py --paper --api
@@ -60,6 +60,8 @@ Protected endpoints require `Authorization: Bearer <token>` when `IBKR_LT_API_TO
 - `GET /api/v1/positions`
 - `GET /api/v1/events`
 - `WS /ws/events`
+
+Hermes should call `GET /api/v1/health` first, then use `next_endpoint` to decide whether to poll health again or read `/api/v1/runtime/snapshot`.
 
 The API is intentionally read-only. Manual trading, order cancellation, and startup approval commands should be added later through a command bus with explicit guardrails.
 
