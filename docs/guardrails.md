@@ -64,11 +64,28 @@ When `logging.enabled=true`, the runtime creates the configured log directory an
 
 The FastAPI control API is read-only in the current framework. It exposes health, metadata, runtime snapshot, positions, recent events, and an event WebSocket for the Hermes agent/operator.
 
+- Enabled by default; use `--no-api` or `api.enabled=false` only when the API should be disabled.
 - Public: `/api/v1/health`, `/api/v1/meta`, `/api/v1/meta/capabilities`.
-- Protected when `IBKR_LT_API_TOKEN` is set: `/api/v1/runtime/*`, `/api/v1/positions`, `/api/v1/events`, `/ws/events`.
+- Local-only hosts (`127.0.0.1`, `localhost`, `::1`) may run without a token.
+- Non-local hosts such as `0.0.0.0` or LAN IPs require `IBKR_LT_API_TOKEN` before startup.
+- Protected when a token is set: `/api/v1/runtime/*`, `/api/v1/positions`, `/api/v1/events`, `/ws/events`.
 - API routes read through `Engine.snapshot_state()`.
 - API routes must not call broker adapters, `OrderManager`, or strategies directly.
 - No manual trade, order cancel, startup approval, or state mutation endpoints are active.
+
+### Heartbeat Monitor
+
+`tools/heartbeat_monitor.py` is a separate read-only process for Hermes/operator liveness monitoring. It is not started inside the engine and does not share the engine process.
+
+- Polls `/api/v1/health` every 5 seconds by default.
+- Keeps `/ws/events` connected and pings it when no runtime events arrive.
+- Writes `var/heartbeat_monitor/status.json` for current monitor state.
+- Appends `var/heartbeat_monitor/alerts.jsonl` for alert events.
+- Alerts when the API is unreachable, the engine enters `error`, the engine is not running when expected, or the WebSocket remains disconnected.
+- `main.py` warns at control API startup if no `heartbeat_monitor.py` process is detected.
+- The missing-monitor warning is built into API startup and is skipped only when `--no-api` disables the API.
+- The missing-monitor warning is non-blocking; the engine still starts and runs when API is enabled.
+- Never calls broker adapters, `OrderManager`, strategies, or mutating endpoints.
 
 ---
 

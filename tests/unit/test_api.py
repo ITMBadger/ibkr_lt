@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from api.app import create_control_api_app
+from api.server import is_local_control_host, resolve_control_api_token
 
 
 class _SnapshotEngine:
@@ -84,3 +86,31 @@ def test_positions_and_events_use_engine_snapshot():
     assert events.status_code == 200
     assert events.json()[0]["message"] == "ready"
 
+
+def test_local_control_hosts_can_run_without_token(monkeypatch):
+    monkeypatch.delenv("IBKR_LT_API_TOKEN", raising=False)
+
+    assert is_local_control_host("127.0.0.1") is True
+    assert is_local_control_host("localhost") is True
+    assert is_local_control_host("::1") is True
+    assert resolve_control_api_token(
+        host="127.0.0.1",
+        token_env="IBKR_LT_API_TOKEN",
+    ) == ""
+
+
+def test_non_local_control_host_requires_token(monkeypatch):
+    monkeypatch.delenv("IBKR_LT_API_TOKEN", raising=False)
+
+    assert is_local_control_host("0.0.0.0") is False
+    with pytest.raises(ValueError, match="non-local host"):
+        resolve_control_api_token(host="0.0.0.0", token_env="IBKR_LT_API_TOKEN")
+
+
+def test_non_local_control_host_accepts_token(monkeypatch):
+    monkeypatch.setenv("IBKR_LT_API_TOKEN", "secret")
+
+    assert resolve_control_api_token(
+        host="0.0.0.0",
+        token_env="IBKR_LT_API_TOKEN",
+    ) == "secret"

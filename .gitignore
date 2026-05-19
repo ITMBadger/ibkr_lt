@@ -20,6 +20,7 @@ dist/
 *.egg-info/
 
 # Local runtime artifacts
+/var/
 logs/
 *.log
 strategy_decisions*.jsonl

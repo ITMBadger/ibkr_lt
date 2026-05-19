@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from core import DataFeed, Engine, Instrument, WallClock, load_strategies
 from core.adapters.dry_run import DryRunBroker
@@ -47,7 +47,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy", default=None, help="Run one strategy by id")
     parser.add_argument("--dry-run", action="store_true", help="Signals only, no native orders")
     parser.add_argument("--lookback-days", type=int, default=None)
-    parser.add_argument("--api", action="store_true", help="Enable read-only control API")
+    api_mode = parser.add_mutually_exclusive_group()
+    api_mode.add_argument(
+        "--api",
+        action="store_true",
+        help="Enable read-only control API (default)",
+    )
+    api_mode.add_argument(
+        "--no-api",
+        action="store_true",
+        help="Disable read-only control API",
+    )
     parser.add_argument("--api-host", default=None, help="Control API host override")
     parser.add_argument("--api-port", type=int, default=None, help="Control API port override")
     parser.add_argument("--api-token-env", default=None, help="Bearer token environment variable")
@@ -142,7 +152,7 @@ def _legacy_cli_config(args: argparse.Namespace) -> dict[str, Any]:
             "live": {"provider": "ibkr"},
         },
         "api": {
-            "enabled": False,
+            "enabled": not bool(getattr(args, "no_api", False)),
             "host": "127.0.0.1",
             "port": 8550,
             "token_env": "IBKR_LT_API_TOKEN",
@@ -169,9 +179,15 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.strategy:
         config["strategies"] = [args.strategy]
-    api = config.setdefault("api", {})
-    if args.api:
+    api = config.get("api")
+    if not isinstance(api, dict):
+        api = {}
+        config["api"] = api
+    api.setdefault("enabled", True)
+    if getattr(args, "api", False):
         api["enabled"] = True
+    if getattr(args, "no_api", False):
+        api["enabled"] = False
     if args.api_host is not None:
         api["host"] = args.api_host
     if args.api_port is not None:
@@ -307,7 +323,7 @@ def _adopted_position_map(config: dict[str, Any]) -> dict[Instrument, str]:
 
 def _start_control_api(config: dict[str, Any], engine: Engine, strategy_ids: list[str]):
     api_cfg = dict(config.get("api") or {})
-    if not bool(api_cfg.get("enabled", False)):
+    if not bool(api_cfg.get("enabled", True)):
         return None
     host = str(api_cfg.get("host", "127.0.0.1"))
     port = int(api_cfg.get("port", 8550))
@@ -320,7 +336,69 @@ def _start_control_api(config: dict[str, Any], engine: Engine, strategy_ids: lis
         metadata=_api_metadata(config, strategy_ids),
     )
     print(f"Control API: http://{host}:{port}")
+    _warn_if_heartbeat_monitor_missing()
     return server
+
+
+def _cmdline_is_heartbeat_monitor(cmdline: Sequence[str]) -> bool:
+    normalized = [str(part).replace("\\", "/") for part in cmdline]
+    for index, part in enumerate(normalized):
+        if part == "-m" and index + 1 < len(normalized):
+            if normalized[index + 1] == "tools.heartbeat_monitor":
+                return True
+        if part == "heartbeat_monitor.py" or part.endswith("/heartbeat_monitor.py"):
+            return True
+    return False
+
+
+def _heartbeat_monitor_process_running(
+    proc_root: Path = Path("/proc"),
+    *,
+    current_pid: int | None = None,
+) -> bool | None:
+    if not proc_root.exists():
+        return None
+    current_pid = os.getpid() if current_pid is None else int(current_pid)
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        cmdline = [
+            part.decode("utf-8", errors="ignore")
+            for part in raw.split(b"\0")
+            if part
+        ]
+        if _cmdline_is_heartbeat_monitor(cmdline):
+            return True
+    return False
+
+
+def _warn_if_heartbeat_monitor_missing(proc_root: Path = Path("/proc")) -> None:
+    running = _heartbeat_monitor_process_running(proc_root)
+    if running is not False:
+        return
+    print(
+        "Warning: Heartbeat Monitor process is not detected. "
+        "Start it in another terminal with: "
+        "~/.venv/bin/python tools/heartbeat_monitor.py",
+        file=sys.stderr,
+    )
 
 
 def _api_metadata(config: dict[str, Any], strategy_ids: list[str]) -> dict[str, Any]:

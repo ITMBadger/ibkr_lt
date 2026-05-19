@@ -33,6 +33,8 @@ def meta() -> dict:
             "positions": True,
             "event_polling": True,
             "event_stream": True,
+            "agent_direct_read": True,
+            "heartbeat_monitor": True,
             "manual_trade": False,
             "manual_trade_reason": "manual trading requires a command bus and explicit guardrails",
         },
@@ -45,4 +47,3 @@ def capabilities() -> dict:
 
 
 __all__ = ["router"]
-

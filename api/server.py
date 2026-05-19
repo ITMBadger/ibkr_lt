@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass, field
+from ipaddress import ip_address
 from typing import Any
 
 import uvicorn
@@ -13,6 +14,37 @@ import uvicorn
 from .app import create_control_api_app
 
 log = logging.getLogger(__name__)
+
+
+def is_local_control_host(host: str) -> bool:
+    normalized = str(host or "").strip().lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def resolve_control_api_token(*, host: str, token_env: str) -> str:
+    token_env = str(token_env or "").strip()
+    token = str(os.environ.get(token_env, "") or "") if token_env else ""
+    if token:
+        return token
+
+    if is_local_control_host(host):
+        if token_env:
+            log.info(
+                "Control API token env var is empty; allowing tokenless localhost access: %s",
+                token_env,
+            )
+        return ""
+
+    if token_env:
+        raise ValueError(
+            f"Control API token env var is empty for non-local host {host!r}: {token_env}"
+        )
+    raise ValueError(f"Control API token is required for non-local host {host!r}")
 
 
 @dataclass
@@ -39,15 +71,7 @@ class ControlApiServer:
         if self._thread is not None:
             return self._thread
 
-        token = ""
-        token_env = str(self.token_env or "").strip()
-        if token_env:
-            token = str(os.environ.get(token_env, "") or "")
-            if not token:
-                log.warning("Control API token env var is configured but empty: %s", token_env)
-        elif str(self.host).strip() not in {"127.0.0.1", "localhost"}:
-            log.warning("Control API has no bearer token and is not bound to localhost: %s", self.host)
-
+        token = resolve_control_api_token(host=self.host, token_env=self.token_env)
         app = create_control_api_app(engine, api_token=token, metadata=self.metadata)
         config = uvicorn.Config(
             app,
@@ -90,5 +114,9 @@ def start_control_api_thread(
     return server
 
 
-__all__ = ["ControlApiServer", "start_control_api_thread"]
-
+__all__ = [
+    "ControlApiServer",
+    "is_local_control_host",
+    "resolve_control_api_token",
+    "start_control_api_thread",
+]

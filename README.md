@@ -35,10 +35,16 @@ To run the project from a fresh public clone, add your own strategy module under
 
 ## Hermes Control API
 
-The project includes a read-only FastAPI control surface for the Hermes agent and operator runtime visibility:
+The project starts a read-only FastAPI control surface by default for the Hermes agent and operator runtime visibility:
 
 ```bash
-python main.py --paper --api
+python main.py --paper
+```
+
+Disable it only when needed:
+
+```bash
+python main.py --paper --no-api
 ```
 
 Default URL:
@@ -47,13 +53,20 @@ Default URL:
 http://127.0.0.1:8550
 ```
 
+API auth policy:
+
+- Local-only hosts (`127.0.0.1`, `localhost`, `::1`) may run without a token for a local Hermes agent.
+- Non-local hosts such as `0.0.0.0` or LAN IPs require `IBKR_LT_API_TOKEN` to be set before startup.
+- When a token is set, protected HTTP endpoints require `Authorization: Bearer <token>`.
+- `WS /ws/events` accepts the same bearer header or `?token=<token>`.
+
 Public endpoints:
 
 - `GET /api/v1/health`
 - `GET /api/v1/meta`
 - `GET /api/v1/meta/capabilities`
 
-Protected endpoints require `Authorization: Bearer <token>` when `IBKR_LT_API_TOKEN` is set:
+Protected endpoints:
 
 - `GET /api/v1/runtime/snapshot`
 - `GET /api/v1/runtime/strategies`
@@ -64,6 +77,37 @@ Protected endpoints require `Authorization: Bearer <token>` when `IBKR_LT_API_TO
 Hermes should call `GET /api/v1/health` first, then use `next_endpoint` to decide whether to poll health again or read `/api/v1/runtime/snapshot`.
 
 The API is intentionally read-only. Manual trading, order cancellation, and startup approval commands should be added later through a command bus with explicit guardrails.
+
+## Heartbeat Monitor
+
+`tools/heartbeat_monitor.py` is the separate Hermes watchdog process. It is a read-only API client, not part of the trading runtime.
+
+```bash
+python tools/heartbeat_monitor.py
+```
+
+Process design:
+
+```text
+Agent -----------> ibkr_lt API -> Engine snapshot
+Heartbeat Monitor -> ibkr_lt API -> Engine snapshot
+Heartbeat Monitor -> Agent/operator alert path
+```
+
+The monitor polls `/api/v1/health` every 5 seconds, keeps `/ws/events` connected, pings the WebSocket if no events arrive, and writes local files for an agent to watch:
+
+- `var/heartbeat_monitor/status.json`
+- `var/heartbeat_monitor/alerts.jsonl`
+
+When the control API starts, `main.py` warns if no `heartbeat_monitor.py` process is detected. This is part of API startup and is only skipped when the API is disabled with `--no-api`.
+
+Useful options:
+
+```bash
+python tools/heartbeat_monitor.py --json
+python tools/heartbeat_monitor.py --once --no-files
+python tools/heartbeat_monitor.py --api-url http://127.0.0.1:8550 --expect-connected
+```
 
 ## Tests
 

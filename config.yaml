@@ -24,7 +24,7 @@ logging:
   runtime_level: INFO
 
 api:
-  enabled: false
+  enabled: true
   host: 127.0.0.1
   port: 8550
   token_env: IBKR_LT_API_TOKEN
