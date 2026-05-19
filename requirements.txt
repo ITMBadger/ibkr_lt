@@ -1,0 +1,7 @@
+pandas
+numpy
+pytz
+pytest
+ruff
+PyYAML
+websockets

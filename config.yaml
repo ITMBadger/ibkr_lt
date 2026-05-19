@@ -1,0 +1,57 @@
+# Deployment config for:
+#   python main.py --paper
+#   python main.py --live
+#
+# Mode is intentionally not stored here. Choose paper/live at runtime with
+# --paper or --live. Use --config only when running an alternate YAML file.
+# This file is dry-run by default: it connects to IBKR for account/position
+# visibility and market data, but DryRunBroker blocks native order placement.
+
+dry_run: true
+lookback_days: 500
+position_size_shares: 1
+max_order_quantity: 2
+thread_pool_workers: 4
+session_timezone: America/New_York
+
+logging:
+  enabled: true
+  log_dir: logs
+  profile: owner
+  strategy_decisions: full
+  decision_scope: every_eval
+  bar_detail: relevant
+  runtime_level: INFO
+
+strategies:
+  - dax_panic_long
+
+execution:
+  provider: ibkr
+  host: 127.0.0.1
+  client_id: 1
+  account: ""
+
+data:
+  historical:
+    provider: ibkr
+  live:
+    provider: ibkr
+
+# Use this when an existing broker position should be owned by a strategy.
+# Required when multiple strategies share the same execution instrument.
+adopted_positions:
+  - symbol: MES
+    asset_class: future
+    multiplier: 5
+    strategy_id: dax_panic_long
+
+# Polygon data example:
+#
+# data:
+#   historical:
+#     provider: polygon
+#     api_key_env: POLYGON_API_KEY
+#   live:
+#     provider: polygon
+#     api_key_env: POLYGON_API_KEY

@@ -1,0 +1,75 @@
+settings.json
+
+# Local/editor/agent state
+.agents/
+.claude/
+.env
+.env.*
+!.env.example
+
+# Python/generated test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local runtime artifacts
+logs/
+*.log
+strategy_decisions*.jsonl
+signals*.jsonl
+orders*.jsonl
+fills*.jsonl
+
+# Proprietary strategy source and derivative artifacts.
+# Keep strategies/__init__.py public so the package exists, but do not commit
+# private strategy implementations or compiled/reverse-engineerable outputs.
+strategies/*.py
+!strategies/__init__.py
+strategies/**/*.py
+!strategies/**/__init__.py
+strategies/**/*.pyc
+strategies/**/*.pyd
+strategies/**/*.so
+strategies/**/*.dll
+strategies/**/*.dylib
+strategies/**/*.json
+strategies/**/*.yaml
+strategies/**/*.yml
+
+# Internal strategy documentation/tests can reveal IDs, instruments,
+# thresholds, scoring formulas, exits, or adopted-position ownership.
+docs/strategies.md
+docs/architecture.md
+docs/architecture_illustration.md
+docs/starting_guide.md
+docs/*strategy*.md
+docs/internal*.md
+docs/proprietary*.md
+tests/unit/test_phase5_strategies.py
+configs/local*.yaml
+configs/private*.yaml
+configs/proprietary*.yaml
+
+# Legacy/research material often contains the original strategy formulas.
+legacy/
+archived/
+archive/
+research/
+notebooks/
+*.ipynb
+
+# Market data and replay corpora can leak signal timing when paired with logs.
+/data/
+/market_data/
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5

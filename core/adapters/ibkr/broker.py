@@ -1,0 +1,251 @@
+"""IBKRBroker — BrokerAdapter backed by IBKRClient.
+
+Ported from:
+  legacy/broker/ibkr_app.py  (order placement, callbacks)
+  legacy/services/execution/order_service.py (thin wrapper folded in here)
+
+Order type normalization:
+  MARKET → MKT, LIMIT → LMT, STOP LIMIT → STP LMT
+
+All IBKR-side I/O goes through the shared IBKRClient instance.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, AsyncIterator
+
+from ...types import (
+    AccountSnapshot,
+    BrokerCapabilities,
+    Fill,
+    Instrument,
+    OrderRequest,
+    OrderStatus,
+    Position,
+    QuantityRules,
+)
+from .contracts import instrument_to_contract
+
+if TYPE_CHECKING:
+    from .client import IBKRClient
+
+try:
+    from ibapi.order import Order as IBOrder
+    _IBAPI_AVAILABLE = True
+except ImportError:
+    _IBAPI_AVAILABLE = False
+    IBOrder = object  # type: ignore[assignment,misc]
+
+log = logging.getLogger(__name__)
+
+_ORDER_TYPE_MAP = {
+    "market": "MKT",
+    "limit": "LMT",
+    "stop": "STP",
+    "stop_limit": "STP LMT",
+}
+
+
+class IBKRBroker:
+    """BrokerAdapter implementation for Interactive Brokers."""
+
+    name = "ibkr"
+    capabilities = BrokerCapabilities(
+        asset_classes=frozenset({"equity", "future", "option", "fx"}),
+        order_types=frozenset({"market", "limit", "stop", "stop_limit"}),
+        quantity_rules={
+            "equity": QuantityRules(min_quantity=1.0, quantity_step=1.0, quantity_precision=0),
+            "future": QuantityRules(min_quantity=1.0, quantity_step=1.0, quantity_precision=0),
+            "option": QuantityRules(min_quantity=1.0, quantity_step=1.0, quantity_precision=0),
+            "fx":     QuantityRules(min_quantity=25_000.0, quantity_step=1.0, quantity_precision=0),
+        },
+    )
+
+    def __init__(
+        self,
+        client: "IBKRClient",
+        account: str = "",
+        host: str = "127.0.0.1",
+        port: int = 7497,
+        client_id: int = 1,
+    ) -> None:
+        self._client = client
+        self._account = account
+        self._host = host
+        self._port = port
+        self._client_id = client_id
+
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
+
+    async def connect(self) -> None:
+        if not self._client.is_ready():
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                self._client.connect_and_run,
+                self._host,
+                self._port,
+                self._client_id,
+                loop,
+            )
+
+    async def disconnect(self) -> None:
+        self._client.disconnect()
+
+    # ------------------------------------------------------------------
+    # Account / positions
+    # ------------------------------------------------------------------
+
+    async def get_account(self) -> AccountSnapshot:
+        req_id = self._client.get_next_order_id()
+        tags = "NetLiquidation,BuyingPower,AvailableFunds,ExcessLiquidity"
+        self._client.reqAccountSummary(req_id, "All", tags)
+        data: dict[str, float] = {}
+        account_id = self._account
+        try:
+            while True:
+                item = await asyncio.wait_for(self._client.account_queue.get(), timeout=15)
+                if item.get("req_id") != req_id:
+                    await self._client.account_queue.put(item)
+                    continue
+                if item.get("done"):
+                    break
+                data[item["tag"]] = item["value"]
+                if not account_id:
+                    account_id = item.get("account", "")
+        except asyncio.TimeoutError:
+            log.warning("account summary timed out")
+        finally:
+            try:
+                self._client.cancelAccountSummary(req_id)
+            except Exception:
+                pass
+        return AccountSnapshot(
+            account_id=account_id,
+            net_liquidation=data.get("NetLiquidation", 0.0),
+            buying_power=data.get("BuyingPower", 0.0),
+            available_funds=data.get("AvailableFunds", 0.0),
+        )
+
+    async def get_positions(self) -> list[Position]:
+        self._client.reqPositions()
+        positions: list[Position] = []
+        try:
+            while True:
+                item = await asyncio.wait_for(self._client.position_queue.get(), timeout=15)
+                if item.get("done"):
+                    break
+                if self._account and item.get("account") != self._account:
+                    continue
+                instr = Instrument(
+                    asset_class=_sec_type_to_asset_class(item.get("sec_type", "STK")),
+                    symbol=item["symbol"],
+                )
+                positions.append(Position(
+                    instrument=instr,
+                    quantity=item["position"],
+                    avg_cost=item["avg_cost"],
+                ))
+        except asyncio.TimeoutError:
+            log.warning("positions request timed out")
+        finally:
+            self._client.cancelPositions()
+        return [p for p in positions if not p.is_flat]
+
+    # ------------------------------------------------------------------
+    # Order submission
+    # ------------------------------------------------------------------
+
+    async def submit_order(self, order: OrderRequest) -> OrderStatus:
+        if not _IBAPI_AVAILABLE:
+            raise ImportError("ibapi required")
+        contract = instrument_to_contract(order.instrument)
+        ib_order = IBOrder()
+        ib_order.action = "BUY" if order.side == "long" else "SELL"
+        ib_order.totalQuantity = order.quantity
+        ib_order.orderType = _ORDER_TYPE_MAP.get(order.order_type, "MKT")
+        if order.limit_price is not None:
+            ib_order.lmtPrice = order.limit_price
+        if order.stop_price is not None:
+            ib_order.auxPrice = order.stop_price
+        if self._account:
+            ib_order.account = self._account
+        ib_order.tif = "DAY"
+        ib_order.transmit = True
+
+        order_id = self._client.get_next_order_id()
+        self._client.placeOrder(order_id, contract, ib_order)
+        log.info(
+            "Placed order %d: %s %s %.0f @ %s",
+            order_id, ib_order.action, order.instrument.symbol,
+            order.quantity, order.order_type,
+        )
+        return OrderStatus(
+            broker_order_id=str(order_id),
+            status="pending",
+            filled_qty=0.0,
+        )
+
+    async def cancel_order(self, broker_order_id: str) -> None:
+        try:
+            self._client.cancelOrder(int(broker_order_id), "")
+        except Exception as e:
+            log.warning("cancel_order failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Streaming updates
+    # ------------------------------------------------------------------
+
+    async def order_updates(self) -> AsyncIterator[OrderStatus]:
+        _STATUS_MAP = {
+            "submitted": "open",
+            "presubmitted": "pending",
+            "filled": "filled",
+            "cancelled": "cancelled",
+            "inactive": "cancelled",
+            "apicancelled": "cancelled",
+        }
+        while True:
+            item = await self._client.order_update_queue.get()
+            raw = item.get("status", "").lower()
+            status = _STATUS_MAP.get(raw, raw)
+            yield OrderStatus(
+                broker_order_id=item["order_id"],
+                status=status,  # type: ignore[arg-type]
+                filled_qty=item.get("filled", 0.0),
+                avg_fill_price=item.get("avg_fill_price"),
+            )
+
+    async def fills(self) -> AsyncIterator[Fill]:
+        while True:
+            item = await self._client.fill_queue.get()
+            side = "long" if item.get("side", "").upper() in ("BOT", "B") else "short"
+            instr = Instrument(
+                asset_class=_sec_type_to_asset_class(item.get("sec_type", "STK")),
+                symbol=item["symbol"],
+            )
+            yield Fill(
+                broker_order_id=item["order_id"],
+                instrument=instr,
+                side=side,
+                quantity=abs(item["shares"]),
+                price=item["price"],
+                timestamp=item.get("timestamp", datetime.now(tz=timezone.utc)),
+            )
+
+
+def _sec_type_to_asset_class(sec_type: str) -> str:
+    mapping = {
+        "STK": "equity",
+        "FUT": "future",
+        "OPT": "option",
+        "CASH": "fx",
+        "IND": "index",
+        "CRYPTO": "crypto_spot",
+    }
+    return mapping.get(sec_type.upper(), "equity")
