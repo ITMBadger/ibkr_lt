@@ -3,7 +3,11 @@ from __future__ import annotations
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
+from core.exceptions import ConfigError
 from main import (
+    _build_broker,
     _cmdline_is_heartbeat_monitor,
     _config_from_args,
     _heartbeat_monitor_process_running,
@@ -74,6 +78,11 @@ def test_yaml_config_api_flag_reenables_explicitly_disabled_api(tmp_path: Path):
     config = _config_from_args(_args(config=str(config_path), api=True))
 
     assert config["api"]["enabled"] is True
+
+
+def test_ibkr_broker_requires_explicit_account():
+    with pytest.raises(ConfigError, match="execution.account"):
+        _build_broker({"execution": {"provider": "ibkr", "account": ""}})
 
 
 def test_no_api_skips_heartbeat_monitor_warning(monkeypatch):

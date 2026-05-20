@@ -20,6 +20,14 @@ from ..types import Instrument, MarketContext, Position, Signal
 
 
 @dataclass(frozen=True)
+class ProtectiveStopSpec:
+    """Broker-side protective stop requested by a strategy."""
+
+    pct: float
+    reference: str = "fill_price"
+
+
+@dataclass(frozen=True)
 class StrategySpec:
     """Declares what data, timeframes, and indicators a strategy needs.
 
@@ -39,6 +47,7 @@ class StrategySpec:
     timeframes: tuple[str, ...] = ("1m",)
     warmup_bars: Mapping[str, int] = field(default_factory=dict)
     indicators: tuple[str, ...] = ()
+    protective_stop: ProtectiveStopSpec | None = None
 
 
 class StrategyKernel:

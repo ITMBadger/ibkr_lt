@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 
 from core import DataFeed, Engine, SimulatedClock
 from core.audit import AuditLogger, DecisionTrace, record_decision
 from core.adapters.dry_run import DryRunBroker
+from core.adapters.ibkr.data import IBKRDataProvider
 from core.adapters.paper.broker import PaperBroker
 from core.adapters.paper.data import ReplayDataProvider
-from core.engine.timeframes import TF_1M
-from core.interfaces.strategy import StrategyKernel, StrategySpec
+from core.engine.timeframes import TF_1M, TF_5S
+from core.interfaces.strategy import ProtectiveStopSpec, StrategyKernel, StrategySpec
 from core.orders.order_manager import OrderManager
 from core.portfolio.state import PortfolioState
 from core.risk.policy import RiskPolicy
@@ -44,9 +47,11 @@ class _CountingBroker(PaperBroker):
     def __init__(self) -> None:
         super().__init__()
         self.submit_calls = 0
+        self.submitted_orders: list[OrderRequest] = []
 
     async def submit_order(self, order: OrderRequest):
         self.submit_calls += 1
+        self.submitted_orders.append(order)
         return await super().submit_order(order)
 
 
@@ -158,6 +163,61 @@ class _StaticLive(ReplayDataProvider):
         self.disconnected = True
 
 
+class _FakeIBKRDataClient:
+    def __init__(self, hist_items: list[dict] | None = None) -> None:
+        self.bar_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.hist_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.hist_items = hist_items or []
+        self.historical_calls: list[dict] = []
+        self.realtime_calls: list[dict] = []
+        self.cancelled_realtime: list[int] = []
+
+    def is_ready(self) -> bool:
+        return True
+
+    def reqHistoricalData(
+        self,
+        req_id,
+        contract,
+        end_str,
+        duration_str,
+        bar_size,
+        what_to_show,
+        use_rth,
+        format_date,
+        keep_up_to_date,
+        chart_options,
+    ) -> None:
+        self.historical_calls.append({
+            "req_id": req_id,
+            "end_str": end_str,
+            "duration_str": duration_str,
+            "bar_size": bar_size,
+            "what_to_show": what_to_show,
+        })
+        for item in self.hist_items:
+            payload = {"req_id": req_id, **item}
+            self.hist_queue.put_nowait(payload)
+
+    def reqRealTimeBars(
+        self,
+        req_id,
+        contract,
+        bar_size,
+        what_to_show,
+        use_rth,
+        realtime_bar_options,
+    ) -> None:
+        self.realtime_calls.append({
+            "req_id": req_id,
+            "bar_size": bar_size,
+            "what_to_show": what_to_show,
+        })
+
+    def cancelRealTimeBars(self, req_id) -> None:
+        self.cancelled_realtime.append(req_id)
+
+
 def test_dry_run_never_calls_native_submit():
     async def run():
         native = _CountingBroker()
@@ -191,6 +251,88 @@ def test_data_feed_splits_historical_and_live():
         assert emitted[0].instrument == SPY
 
     import asyncio
+    asyncio.run(run())
+
+
+def test_ibkr_fetch_caps_1m_duration_and_uses_midpoint_for_fx(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            "core.adapters.ibkr.data.instrument_to_contract",
+            lambda instrument: object(),
+        )
+        client = _FakeIBKRDataClient(hist_items=[{"done": True}])
+        provider = IBKRDataProvider(client)
+        await provider.fetch(
+            Instrument(asset_class="fx", symbol="EUR"),
+            TF_1M,
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 5, 1, tzinfo=timezone.utc),
+        )
+
+        call = client.historical_calls[0]
+        assert call["duration_str"] == "10 D"
+        assert call["bar_size"] == "1 min"
+        assert call["what_to_show"] == "MIDPOINT"
+
+    asyncio.run(run())
+
+
+def test_ibkr_fetch_logs_unparsable_dates(monkeypatch, caplog):
+    async def run():
+        monkeypatch.setattr(
+            "core.adapters.ibkr.data.instrument_to_contract",
+            lambda instrument: object(),
+        )
+        client = _FakeIBKRDataClient(hist_items=[
+            {
+                "date": "not-a-date",
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100.5,
+                "volume": 1000,
+            },
+            {"done": True},
+        ])
+        provider = IBKRDataProvider(client)
+        return await provider.fetch(
+            QQQ,
+            TF_1M,
+            datetime(2026, 5, 1, tzinfo=timezone.utc),
+            datetime(2026, 5, 2, tzinfo=timezone.utc),
+        )
+
+    caplog.set_level(logging.WARNING, logger="core.adapters.ibkr.data")
+    assert asyncio.run(run()) == []
+    assert "unparsable IBKR date" in caplog.text
+
+
+def test_ibkr_bars_uses_live_subscription_lookup(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            "core.adapters.ibkr.data.instrument_to_contract",
+            lambda instrument: object(),
+        )
+        client = _FakeIBKRDataClient()
+        provider = IBKRDataProvider(client)
+        next_bar = asyncio.create_task(anext(provider.bars()))
+        await asyncio.sleep(0)
+
+        await provider.subscribe(QQQ, TF_5S)
+        req_id = client.realtime_calls[0]["req_id"]
+        await client.bar_queue.put({
+            "req_id": req_id,
+            "timestamp": datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 10.0,
+        })
+        bar = await asyncio.wait_for(next_bar, timeout=1)
+        assert bar.instrument == QQQ
+        assert bar.volume == 1000.0
+
     asyncio.run(run())
 
 
@@ -295,6 +437,78 @@ def test_order_manager_writes_order_and_fill_audit(tmp_path):
     assert (tmp_path / "orders.jsonl").exists()
     assert "order_submitted" in (tmp_path / "orders.jsonl").read_text(encoding="utf-8")
     assert (tmp_path / "fills.jsonl").exists()
+
+
+def test_order_manager_submits_fill_price_protective_stop():
+    async def run():
+        broker = _CountingBroker()
+        portfolio = PortfolioState()
+        om = OrderManager(
+            broker,
+            portfolio,
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+            protective_stops={
+                "_phase6": ProtectiveStopSpec(pct=0.015, reference="fill_price"),
+            },
+        )
+        await om._process_signal(Signal(QQQ, "long"), "_phase6")
+
+        task = asyncio.create_task(om.drain_fills())
+        await broker.on_bar(_bars(QQQ, 1)[0])
+        await asyncio.sleep(0)
+
+        assert len(broker.submitted_orders) == 2
+        stop = broker.submitted_orders[1]
+        assert stop.instrument == QQQ
+        assert stop.side == "short"
+        assert stop.order_type == "stop"
+        assert stop.quantity == 1
+        assert stop.stop_price == 98.5
+
+        await broker.on_bar(Bar(
+            instrument=QQQ,
+            timeframe=TF_1M,
+            timestamp=datetime(2026, 5, 1, 13, 31, tzinfo=timezone.utc),
+            open=99.0,
+            high=99.5,
+            low=98.0,
+            close=98.5,
+            volume=1000.0,
+            is_closed=True,
+            source="test",
+        ))
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert portfolio.get_strategy_position("_phase6", QQQ) is None
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_order_manager_drains_order_updates(tmp_path):
+    async def run():
+        broker = PaperBroker()
+        audit = AuditLogger(log_dir=tmp_path)
+        om = OrderManager(broker, PortfolioState(), RiskPolicy(), audit)
+        await om._process_signal(Signal(QQQ, "long"), "_phase6")
+
+        task = asyncio.create_task(om.drain_order_updates())
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert broker._order_update_queue.empty()
+
+    import asyncio
+    asyncio.run(run())
+    assert "order_update" in (tmp_path / "orders.jsonl").read_text(encoding="utf-8")
 
 
 def test_order_manager_rejects_unsupported_short_entry():

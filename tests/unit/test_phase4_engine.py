@@ -187,6 +187,9 @@ class TestFeatureRegistry:
 # ---------------------------------------------------------------------------
 
 class TestRiskPolicy:
+    def test_default_max_order_quantity_is_two(self):
+        assert RiskPolicy().max_order_quantity == 2
+
     def test_sizes_fixed_shares(self):
         rp = RiskPolicy(position_size_shares=2, max_order_quantity=10)
         sig = Signal(instrument=MNQ, side="long")

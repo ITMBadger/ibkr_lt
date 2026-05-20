@@ -8,7 +8,7 @@ router = APIRouter(prefix="/events", tags=["events"], dependencies=[AuthDependen
 
 
 @router.get("")
-def events(
+async def events(
     limit: int = Query(default=100, ge=1, le=500),
     engine=Depends(engine_from_request),
 ) -> list[dict]:
@@ -17,4 +17,3 @@ def events(
 
 
 __all__ = ["router"]
-

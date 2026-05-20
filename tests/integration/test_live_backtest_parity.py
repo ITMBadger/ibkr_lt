@@ -84,10 +84,8 @@ def _run_engine(bars: list[Bar], workers: int) -> list[tuple[str, Signal]]:
     from core.portfolio.state import PortfolioState
 
     captured: list[tuple[str, Signal]] = []
-    original_submit = None
 
     async def _run():
-        nonlocal original_submit
         portfolio = PortfolioState()
         om = OrderManager(broker, portfolio, risk)
 
@@ -97,8 +95,6 @@ def _run_engine(bars: list[Bar], workers: int) -> list[tuple[str, Signal]]:
 
         om.submit = _capture_submit  # type: ignore[method-assign]
 
-        loop = asyncio.get_running_loop()
-        from concurrent.futures import ThreadPoolExecutor
         from core.engine.scheduler import Scheduler
         from core.data.manager import DataManager
         from core.features.registry import FeatureRegistry
@@ -110,19 +106,15 @@ def _run_engine(bars: list[Bar], workers: int) -> list[tuple[str, Signal]]:
         scheduler.register(strategy, state_dict)
         strategy.on_start(state_dict)
 
-        pool = ThreadPoolExecutor(max_workers=workers)
-        try:
-            async for bar in streaming.bars():
-                engine._clock.advance_to(bar.timestamp)
-                managers[bar.instrument].on_bar(bar)
-                await broker.on_bar(bar)
-                features.invalidate(bar.instrument)
-                for k, ctx, st in scheduler.on_bar(bar, managers):
-                    sig = await loop.run_in_executor(pool, k.generate, ctx, st)
-                    if sig:
-                        await _capture_submit(sig, k.SPEC.id)
-        finally:
-            pool.shutdown(wait=False)
+        async for bar in streaming.bars():
+            engine._clock.advance_to(bar.timestamp)
+            managers[bar.instrument].on_bar(bar)
+            await broker.on_bar(bar)
+            features.invalidate(bar.instrument)
+            for k, ctx, st in scheduler.on_bar(bar, managers):
+                sig = k.generate(ctx, st)
+                if sig:
+                    await _capture_submit(sig, k.SPEC.id)
 
     asyncio.run(_run())
     return captured

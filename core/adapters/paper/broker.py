@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from asyncio import QueueEmpty
 from typing import AsyncIterator
 
 from ...types import (
@@ -98,13 +99,17 @@ class PaperBroker:
     # ------------------------------------------------------------------
 
     async def on_bar(self, bar: Bar) -> None:
-        """Resolve all pending orders at bar open price."""
+        """Resolve pending orders on a new bar."""
         if not self._pending:
             return
-        fill_price = bar.open
         to_fill = list(self._pending)
         self._pending.clear()
+        still_pending: list[tuple[OrderRequest, str]] = []
         for order, broker_id in to_fill:
+            should_fill, fill_price = _resolve_fill(order, bar)
+            if not should_fill:
+                still_pending.append((order, broker_id))
+                continue
             fill = Fill(
                 broker_order_id=broker_id,
                 instrument=order.instrument,
@@ -123,6 +128,7 @@ class PaperBroker:
             await self._order_update_queue.put(completed)
             signed = order.quantity if order.side == "long" else -order.quantity
             self._positions[order.instrument] = self._positions.get(order.instrument, 0.0) + signed
+        self._pending.extend(still_pending)
 
     # ------------------------------------------------------------------
     # AsyncIterator streams
@@ -137,3 +143,29 @@ class PaperBroker:
         while True:
             status = await self._order_update_queue.get()
             yield status
+
+    def ready_fills(self) -> list[Fill]:
+        fills: list[Fill] = []
+        while True:
+            try:
+                fills.append(self._fill_queue.get_nowait())
+            except QueueEmpty:
+                return fills
+
+    def ready_order_updates(self) -> list[OrderStatus]:
+        updates: list[OrderStatus] = []
+        while True:
+            try:
+                updates.append(self._order_update_queue.get_nowait())
+            except QueueEmpty:
+                return updates
+
+
+def _resolve_fill(order: OrderRequest, bar: Bar) -> tuple[bool, float]:
+    if order.order_type == "stop":
+        if order.stop_price is None:
+            return False, 0.0
+        if order.side == "short":
+            return bar.low <= order.stop_price, order.stop_price
+        return bar.high >= order.stop_price, order.stop_price
+    return True, bar.open

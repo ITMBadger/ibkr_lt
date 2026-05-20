@@ -8,7 +8,7 @@ router = APIRouter(prefix="/runtime", tags=["runtime"], dependencies=[AuthDepend
 
 
 @router.get("/snapshot")
-def snapshot(
+async def snapshot(
     engine=Depends(engine_from_request),
     metadata: dict = Depends(metadata_from_request),
 ) -> dict:
@@ -18,9 +18,8 @@ def snapshot(
 
 
 @router.get("/strategies")
-def strategies(engine=Depends(engine_from_request)) -> list[dict]:
+async def strategies(engine=Depends(engine_from_request)) -> list[dict]:
     return list(engine.snapshot_state().get("strategies", []))
 
 
 __all__ = ["router"]
-

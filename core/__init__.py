@@ -19,7 +19,7 @@ from .types import (
     BrokerCapabilities,
     StreamCapabilities,
 )
-from .interfaces.strategy import StrategyKernel, StrategySpec
+from .interfaces.strategy import ProtectiveStopSpec, StrategyKernel, StrategySpec
 from .engine.loader import register_strategy, load_strategies
 from .engine.runner import Engine
 from .engine.clock import WallClock, SimulatedClock
@@ -41,6 +41,7 @@ __all__ = [
     "QuantityRules",
     "BrokerCapabilities",
     "StreamCapabilities",
+    "ProtectiveStopSpec",
     "StrategyKernel",
     "StrategySpec",
     "register_strategy",

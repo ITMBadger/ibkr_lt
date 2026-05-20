@@ -7,3 +7,4 @@ PyYAML
 websockets
 fastapi
 uvicorn
+TA-Lib

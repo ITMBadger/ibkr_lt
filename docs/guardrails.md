@@ -40,9 +40,9 @@ This prevents hard venue rejects for crypto step sizes and ensures futures are a
 
 All live strategies enforce a `state["last_signal_date"]` check inside `generate()`. A second signal on the same calendar day is silently dropped. This is strategy-side enforcement (inside each `.py` file), not a framework gate.
 
-### Single-Writer Orders
+### Centralized Order Submission
 
-`OrderManager` drains its internal queue with a single asyncio task. There is no concurrent order submission to the broker. This prevents race conditions between fill callbacks and new order submissions.
+`OrderManager` owns strategy signal submission, strategy close submission, fill application, broker order-status logging, and configured broker-side protective stops.
 
 ### Dry Run
 
@@ -55,6 +55,10 @@ All live strategies enforce a `state["last_signal_date"]` check inside `generate
 ### Strategy-Owned Exits
 
 If a strategy has an owned open position, `Engine` calls `StrategyKernel.on_exit()` on each matching bar. A returned reason submits an opposite-side market close through `OrderManager`.
+
+### Broker-Side Protective Stops
+
+Strategies may declare `StrategySpec.protective_stop`. When an entry fill arrives, `OrderManager` can submit an opposite-side broker-native stop order using the actual fill price as reference. This is order-management protection, not strategy `on_exit()` logic. Because the stop is based on the actual fill, it is submitted after the fill callback rather than pre-attached atomically before entry fill.
 
 ### Audit Logs
 
@@ -104,7 +108,7 @@ These controls existed in the archived legacy system and will be ported back onc
 | Manual startup adoption review workflow | archived adoption workflow | Deferred |
 | Open-order reconciliation | archived open-order workflow | Deferred |
 | Broker-native bracket management | archived execution service | Deferred |
-| Runtime close-percent protective stops | strategy/runtime policy | Deferred |
+| General runtime close-percent protective stops | strategy/runtime policy | Deferred; configured broker-side fill-price stops are active |
 | JSON state persistence | archived runtime persistence | Deferred |
 | Buying-power check (warning) | archived central runtime | Deferred |
 | Mutating Hermes/API command bus | archived `RuntimeCommandBus` | Deferred; current API is read-only |
@@ -117,4 +121,4 @@ These controls existed in the archived legacy system and will be ported back onc
 
 `BarBuilder.flush()` can be called at session end to emit any partial 1-minute bar. The engine does not currently call this automatically — it is available for the lifecycle management phase.
 
-V1 does not place broker-native protective brackets or run close-percent protective stops. If the bot is stopped while a position is open, strategy exits stop running. Check TWS or IBKR Mobile after unplanned shutdown.
+V1 does not place full broker-native brackets. Configured broker-side protective stops are submitted after entry fills; strategy `on_exit()` exits stop running if the bot is stopped. Check TWS or IBKR Mobile after unplanned shutdown.

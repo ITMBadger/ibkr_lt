@@ -1,27 +1,29 @@
-"""OrderManager — single-writer asyncio task for all broker order submissions.
+"""OrderManager — centralized broker order submission and fill handling.
 
-All broker.submit_order calls go through here. Strategies submit signals;
-the OrderManager sizes them, validates capabilities, and drains the queue
-serially so there is never concurrent order submission to the broker.
-
-Single-writer is free: one asyncio task owns the queue drain loop. No locking needed.
+Strategies submit signals; the OrderManager sizes them, validates broker
+capabilities, applies fills to PortfolioState, drains order-status updates,
+and submits configured protective stops.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from ..portfolio.state import PortfolioState
 from ..risk.policy import RiskPolicy
-from ..types import OrderRequest, Position, Signal
+from ..interfaces.strategy import ProtectiveStopSpec
+from ..types import Fill, OrderRequest, OrderStatus, Position, Signal
 from ..audit import AuditLogger
 
 if TYPE_CHECKING:
     from ..interfaces.broker import BrokerAdapter
 
 log = logging.getLogger(__name__)
+
+_BUY_FILL_SIDES = {"BOT", "BUY", "B", "LONG"}
 
 
 class OrderManager:
@@ -33,6 +35,7 @@ class OrderManager:
         portfolio: PortfolioState,
         risk: RiskPolicy,
         audit_logger: AuditLogger | None = None,
+        protective_stops: Mapping[str, ProtectiveStopSpec] | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -41,6 +44,8 @@ class OrderManager:
         self._queue: asyncio.Queue[tuple[Signal, str]] = asyncio.Queue()
         self._signal_log: list[tuple[str, Signal]] = []  # (strategy_id, signal)
         self._order_owner: dict[str, str] = {}  # broker_order_id → strategy_id
+        self._order_role: dict[str, str] = {}  # broker_order_id → entry/close/protective_stop
+        self._protective_stops = dict(protective_stops or {})
 
     async def submit(self, signal: Signal, strategy_id: str) -> None:
         """Enqueue a signal for the order drain loop to process."""
@@ -87,6 +92,7 @@ class OrderManager:
         )
         status = await self._broker.submit_order(order)
         self._order_owner[status.broker_order_id] = strategy_id
+        self._order_role[status.broker_order_id] = "close"
         self._write_order_event(
             "close_submitted",
             strategy_id=strategy_id,
@@ -118,19 +124,52 @@ class OrderManager:
             except Exception as e:
                 log.exception("OrderManager: error processing signal from %s: %s", strategy_id, e)
 
+    async def drain_ready_orders(self) -> None:
+        """Drain currently queued orders without waiting for more."""
+        while not self._queue.empty():
+            signal, strategy_id = self._queue.get_nowait()
+            try:
+                await self._process_signal(signal, strategy_id)
+            except Exception as e:
+                log.exception("OrderManager: error processing signal from %s: %s", strategy_id, e)
+
     async def drain_fills(self) -> None:
         """Continuously drain fills from the broker and update PortfolioState."""
         async for fill in self._broker.fills():
             try:
-                strategy_id = self._order_owner.get(fill.broker_order_id)
-                self._portfolio.apply_fill(fill, strategy_id=strategy_id)
-                self._write_fill_event(fill, strategy_id)
-                log.info(
-                    "Fill: %s %s %.0f @ %.4f",
-                    fill.side, fill.instrument.symbol, fill.quantity, fill.price,
-                )
+                await self._handle_fill(fill)
             except Exception as e:
                 log.exception("OrderManager: error applying fill: %s", e)
+
+    async def drain_ready_fills(self) -> None:
+        """Drain currently ready broker fills from adapters that expose them."""
+        ready_fills = getattr(self._broker, "ready_fills", None)
+        if not callable(ready_fills):
+            return
+        for fill in ready_fills():
+            try:
+                await self._handle_fill(fill)
+            except Exception as e:
+                log.exception("OrderManager: error applying fill: %s", e)
+
+    async def drain_order_updates(self) -> None:
+        """Continuously drain broker order status updates and audit/log them."""
+        async for status in self._broker.order_updates():
+            try:
+                self._handle_order_update(status)
+            except Exception as e:
+                log.exception("OrderManager: error handling order update: %s", e)
+
+    async def drain_ready_order_updates(self) -> None:
+        """Drain currently ready order status updates from adapters that expose them."""
+        ready_order_updates = getattr(self._broker, "ready_order_updates", None)
+        if not callable(ready_order_updates):
+            return
+        for status in ready_order_updates():
+            try:
+                self._handle_order_update(status)
+            except Exception as e:
+                log.exception("OrderManager: error handling order update: %s", e)
 
     # ------------------------------------------------------------------
     # Internals
@@ -147,7 +186,10 @@ class OrderManager:
             return  # exit signals handled separately
 
         if signal.side == "short" and not self._broker.capabilities.supports_short:
-            log.warning("Broker %s does not support short entries; dropping signal", self._broker.name)
+            log.warning(
+                "Broker %s does not support short entries; dropping signal",
+                self._broker.name,
+            )
             self._write_order_event(
                 "signal_dropped",
                 strategy_id=strategy_id,
@@ -210,6 +252,7 @@ class OrderManager:
         )
         status = await self._broker.submit_order(order)
         self._order_owner[status.broker_order_id] = strategy_id
+        self._order_role[status.broker_order_id] = "entry"
         self._write_order_event(
             "order_submitted",
             strategy_id=strategy_id,
@@ -221,6 +264,122 @@ class OrderManager:
             "Submitted %s %s %.0f → order_id=%s status=%s",
             signal.side, signal.instrument.symbol, qty,
             status.broker_order_id, status.status,
+        )
+
+    async def _handle_fill(self, fill: Fill) -> None:
+        strategy_id = self._order_owner.get(fill.broker_order_id)
+        role = self._order_role.get(fill.broker_order_id, "unknown")
+        self._portfolio.apply_fill(fill, strategy_id=strategy_id)
+        self._write_fill_event(fill, strategy_id, role)
+        log.info(
+            "Fill: %s %s %.0f @ %.4f",
+            fill.side, fill.instrument.symbol, fill.quantity, fill.price,
+        )
+        if strategy_id is not None and role == "entry":
+            await self._submit_protective_stop(fill, strategy_id)
+
+    def _handle_order_update(self, status: OrderStatus) -> None:
+        strategy_id = self._order_owner.get(status.broker_order_id)
+        role = self._order_role.get(status.broker_order_id, "unknown")
+        self._write_order_event(
+            "order_update",
+            strategy_id=strategy_id,
+            role=role,
+            status=status,
+        )
+        log.info(
+            "Order update: order_id=%s status=%s filled=%.4f avg_fill_price=%s role=%s",
+            status.broker_order_id,
+            status.status,
+            status.filled_qty,
+            status.avg_fill_price,
+            role,
+        )
+
+    async def _submit_protective_stop(self, fill: Fill, strategy_id: str) -> None:
+        spec = self._protective_stops.get(strategy_id)
+        if spec is None:
+            return
+        if spec.reference != "fill_price":
+            self._write_order_event(
+                "protective_stop_dropped",
+                strategy_id=strategy_id,
+                reason="unsupported_reference",
+                reference=spec.reference,
+                fill=fill,
+            )
+            log.warning(
+                "Protective stop for %s dropped: unsupported reference=%s",
+                strategy_id,
+                spec.reference,
+            )
+            return
+        if spec.pct <= 0 or fill.quantity <= 0 or fill.price <= 0:
+            self._write_order_event(
+                "protective_stop_dropped",
+                strategy_id=strategy_id,
+                reason="invalid_stop_inputs",
+                spec=spec,
+                fill=fill,
+            )
+            return
+
+        is_buy_fill = fill.side.upper() in _BUY_FILL_SIDES
+        stop_side = "short" if is_buy_fill else "long"
+        if is_buy_fill:
+            raw_stop_price = fill.price * (1.0 - spec.pct)
+        else:
+            raw_stop_price = fill.price * (1.0 + spec.pct)
+        stop_price = _round_stop_price(fill.instrument, raw_stop_price)
+        order = OrderRequest(
+            instrument=fill.instrument,
+            side=stop_side,
+            quantity=fill.quantity,
+            order_type="stop",
+            stop_price=stop_price,
+            strategy_id=strategy_id,
+            idempotency_key=(
+                f"{strategy_id}-{fill.instrument.symbol}-protective-stop-"
+                f"{fill.broker_order_id}"
+            ),
+        )
+        if not self._validate_order(order, is_entry=False):
+            self._write_order_event(
+                "protective_stop_dropped",
+                strategy_id=strategy_id,
+                reason="validation_failed",
+                order=order,
+                fill=fill,
+            )
+            return
+
+        self._write_order_event(
+            "protective_stop_intent",
+            strategy_id=strategy_id,
+            fill=fill,
+            order=order,
+            pct=spec.pct,
+            reference=spec.reference,
+        )
+        status = await self._broker.submit_order(order)
+        self._order_owner[status.broker_order_id] = strategy_id
+        self._order_role[status.broker_order_id] = "protective_stop"
+        self._write_order_event(
+            "protective_stop_submitted",
+            strategy_id=strategy_id,
+            fill=fill,
+            order=order,
+            status=status,
+        )
+        log.info(
+            "Submitted protective stop for %s: %s %s %.0f stop=%.4f → order_id=%s status=%s",
+            strategy_id,
+            stop_side,
+            fill.instrument.symbol,
+            fill.quantity,
+            stop_price,
+            status.broker_order_id,
+            status.status,
         )
 
     @property
@@ -246,7 +405,10 @@ class OrderManager:
             )
             return False
         if is_entry and order.side == "short" and not caps.supports_short:
-            log.warning("Broker %s does not support short entries; dropping order", self._broker.name)
+            log.warning(
+                "Broker %s does not support short entries; dropping order",
+                self._broker.name,
+            )
             return False
         if not caps.supports_fractional and not float(order.quantity).is_integer():
             log.warning(
@@ -261,10 +423,17 @@ class OrderManager:
         if self._audit is not None:
             self._audit.order({"event": event, **fields})
 
-    def _write_fill_event(self, fill, strategy_id: str | None) -> None:
+    def _write_fill_event(self, fill, strategy_id: str | None, role: str) -> None:
         if self._audit is not None:
             self._audit.fill({
                 "event": "fill",
                 "strategy_id": strategy_id,
+                "role": role,
                 "fill": fill,
             })
+
+
+def _round_stop_price(instrument, price: float) -> float:
+    if instrument.asset_class in {"equity", "option"}:
+        return round(price, 2)
+    return round(price, 4)

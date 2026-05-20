@@ -4,11 +4,12 @@
 #
 # Mode is intentionally not stored here. Choose paper/live at runtime with
 # --paper or --live. Use --config only when running an alternate YAML file.
-# This file is dry-run by default: it connects to IBKR for account/position
-# visibility and market data, but DryRunBroker blocks native order placement.
+# This file is configured for paper-account order testing. Run with --paper
+# and pass --account, or set execution.account in a private local config.
+# Add --dry-run at runtime when only signal/order-intent logging is desired.
 
-dry_run: true
-lookback_days: 500
+dry_run: false
+lookback_days: 10
 position_size_shares: 1
 max_order_quantity: 2
 thread_pool_workers: 4
@@ -31,12 +32,13 @@ api:
   log_level: warning
 
 strategies:
-  - dax_panic_long
+  - stoch_3m_cross_long
 
 execution:
   provider: ibkr
   host: 127.0.0.1
   client_id: 1
+  # Required for IBKR runs. Keep blank in the shared file; pass --account instead.
   account: ""
 
 data:
@@ -48,10 +50,9 @@ data:
 # Use this when an existing broker position should be owned by a strategy.
 # Required when multiple strategies share the same execution instrument.
 adopted_positions:
-  - symbol: MES
-    asset_class: future
-    multiplier: 5
-    strategy_id: dax_panic_long
+  - symbol: QQQ
+    asset_class: equity
+    strategy_id: stoch_3m_cross_long
 
 # Polygon data example:
 #

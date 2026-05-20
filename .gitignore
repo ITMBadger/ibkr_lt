@@ -35,6 +35,7 @@ strategies/*.py
 !strategies/__init__.py
 strategies/**/*.py
 !strategies/**/__init__.py
+!strategies/stoch_3m_cross_long.py
 strategies/**/*.pyc
 strategies/**/*.pyd
 strategies/**/*.so

@@ -11,15 +11,15 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 _bearer = HTTPBearer(auto_error=False)
 
 
-def engine_from_request(request: Request):
+async def engine_from_request(request: Request):
     return request.app.state.engine
 
 
-def metadata_from_request(request: Request) -> dict:
+async def metadata_from_request(request: Request) -> dict:
     return dict(getattr(request.app.state, "metadata", {}) or {})
 
 
-def require_api_auth(
+async def require_api_auth(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)] = None,
 ) -> None:
@@ -47,4 +47,3 @@ __all__ = [
     "metadata_from_request",
     "require_api_auth",
 ]
-

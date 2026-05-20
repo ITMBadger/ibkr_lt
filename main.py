@@ -18,6 +18,7 @@ from core.adapters.polygon.data import PolygonDataProvider
 from core.adapters.csv.data import CSVDataProvider
 from core.adapters.paper.broker import PaperBroker
 from core.audit import AuditLogger, configure_runtime_logging
+from core.exceptions import ConfigError
 from core.risk.policy import RiskPolicy
 from core.engine.loader import get_registry
 from api.server import start_control_api_thread
@@ -250,11 +251,14 @@ def _build_broker(config: dict[str, Any]):
     provider = execution.get("provider", "ibkr")
     shared: dict[str, Any] = {}
     if provider == "ibkr":
+        account = str(execution.get("account", "")).strip()
+        if not account:
+            raise ConfigError("IBKR execution requires execution.account or --account")
         client = IBKRClient()
         shared["ibkr_client"] = client
         broker = IBKRBroker(
             client,
-            account=str(execution.get("account", "")),
+            account=account,
             host=str(execution.get("host", "127.0.0.1")),
             port=int(execution.get("port", 7497)),
             client_id=int(execution.get("client_id", 1)),

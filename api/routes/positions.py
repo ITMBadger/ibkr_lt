@@ -8,9 +8,8 @@ router = APIRouter(prefix="/positions", tags=["positions"], dependencies=[AuthDe
 
 
 @router.get("")
-def positions(engine=Depends(engine_from_request)) -> dict:
+async def positions(engine=Depends(engine_from_request)) -> dict:
     return dict(engine.snapshot_state().get("positions", {}))
 
 
 __all__ = ["router"]
-

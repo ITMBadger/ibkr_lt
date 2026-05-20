@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
+import httpx
 
 from api.app import create_control_api_app
 from api.server import is_local_control_host, resolve_control_api_token
@@ -34,57 +34,66 @@ class _SnapshotEngine:
         return dict(self.snapshot)
 
 
-def test_health_and_meta_are_public():
-    client = TestClient(
-        create_control_api_app(
-            _SnapshotEngine(),
-            api_token="secret",
-            metadata={"mode": "paper", "dry_run": True},
+async def _client(app):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        yield client
+
+
+@pytest.mark.anyio
+async def test_health_and_meta_are_public():
+    app = create_control_api_app(
+        _SnapshotEngine(),
+        api_token="secret",
+        metadata={"mode": "paper", "dry_run": True},
+    )
+    async for client in _client(app):
+        health = await client.get("/api/v1/health")
+        meta = await client.get("/api/v1/meta")
+        capabilities = await client.get("/api/v1/meta/capabilities")
+
+        assert health.status_code == 200
+        assert health.json()["connected"] is True
+        assert health.json()["mode"] == "paper"
+        assert health.json()["dry_run"] is True
+        assert meta.status_code == 200
+        assert meta.json()["service"] == "ibkr_lt_control_api"
+        assert capabilities.status_code == 200
+        assert capabilities.json()["manual_trade"] is False
+
+
+@pytest.mark.anyio
+async def test_runtime_snapshot_requires_bearer_token_when_configured():
+    app = create_control_api_app(_SnapshotEngine(), api_token="secret")
+    async for client in _client(app):
+        assert (await client.get("/api/v1/runtime/snapshot")).status_code == 401
+        assert (
+            await client.get(
+                "/api/v1/runtime/snapshot",
+                headers={"Authorization": "Bearer wrong"},
+            )
+        ).status_code == 403
+
+        response = await client.get(
+            "/api/v1/runtime/snapshot",
+            headers={"Authorization": "Bearer secret"},
         )
-    )
 
-    health = client.get("/api/v1/health")
-    meta = client.get("/api/v1/meta")
-    capabilities = client.get("/api/v1/meta/capabilities")
-
-    assert health.status_code == 200
-    assert health.json()["connected"] is True
-    assert health.json()["mode"] == "paper"
-    assert health.json()["dry_run"] is True
-    assert meta.status_code == 200
-    assert meta.json()["service"] == "ibkr_lt_control_api"
-    assert capabilities.status_code == 200
-    assert capabilities.json()["manual_trade"] is False
+        assert response.status_code == 200
+        assert response.json()["phase"] == "running"
 
 
-def test_runtime_snapshot_requires_bearer_token_when_configured():
-    client = TestClient(create_control_api_app(_SnapshotEngine(), api_token="secret"))
+@pytest.mark.anyio
+async def test_positions_and_events_use_engine_snapshot():
+    app = create_control_api_app(_SnapshotEngine())
+    async for client in _client(app):
+        positions = await client.get("/api/v1/positions")
+        events = await client.get("/api/v1/events?limit=1")
 
-    assert client.get("/api/v1/runtime/snapshot").status_code == 401
-    assert client.get(
-        "/api/v1/runtime/snapshot",
-        headers={"Authorization": "Bearer wrong"},
-    ).status_code == 403
-
-    response = client.get(
-        "/api/v1/runtime/snapshot",
-        headers={"Authorization": "Bearer secret"},
-    )
-
-    assert response.status_code == 200
-    assert response.json()["phase"] == "running"
-
-
-def test_positions_and_events_use_engine_snapshot():
-    client = TestClient(create_control_api_app(_SnapshotEngine()))
-
-    positions = client.get("/api/v1/positions")
-    events = client.get("/api/v1/events?limit=1")
-
-    assert positions.status_code == 200
-    assert positions.json()["broker"][0]["instrument"]["symbol"] == "MES"
-    assert events.status_code == 200
-    assert events.json()[0]["message"] == "ready"
+        assert positions.status_code == 200
+        assert positions.json()["broker"][0]["instrument"]["symbol"] == "MES"
+        assert events.status_code == 200
+        assert events.json()[0]["message"] == "ready"
 
 
 def test_local_control_hosts_can_run_without_token(monkeypatch):

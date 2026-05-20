@@ -17,7 +17,7 @@ class RiskPolicy:
     """Simple fixed-position sizing. No guardrails at MVP."""
 
     position_size_shares: int = 1
-    max_order_quantity: int = 10
+    max_order_quantity: int = 2
 
     def size_order(self, signal: Signal, portfolio: PortfolioState) -> int:
         """Return the quantity to trade.

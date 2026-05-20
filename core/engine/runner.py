@@ -40,6 +40,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+_ORDER_TASK_YIELD_SECONDS = 0.001
+
 
 class Engine:
     """Parameterised trading engine.
@@ -148,6 +150,7 @@ class Engine:
                         "reference_instruments": to_jsonable(kernel.SPEC.reference_instruments),
                         "timeframes": list(kernel.SPEC.timeframes),
                         "warmup_bars": dict(kernel.SPEC.warmup_bars),
+                        "protective_stop": to_jsonable(kernel.SPEC.protective_stop),
                     }
                     for kernel, _ in self._strategies
                 ],
@@ -219,7 +222,18 @@ class Engine:
                     position.avg_cost,
                     owner,
                 )
-        order_manager = OrderManager(self._broker, portfolio, self._risk, self._audit)
+        protective_stops = {
+            kernel.SPEC.id: kernel.SPEC.protective_stop
+            for kernel, _ in self._strategies
+            if kernel.SPEC.protective_stop is not None
+        }
+        order_manager = OrderManager(
+            self._broker,
+            portfolio,
+            self._risk,
+            self._audit,
+            protective_stops=protective_stops,
+        )
 
         # Backfill historical data. The live session date is excluded so live
         # bars remain authoritative for the current session.
@@ -268,8 +282,13 @@ class Engine:
 
         # Start background tasks
         pool = ThreadPoolExecutor(max_workers=self._pool_workers)
-        drain_orders_task = loop.create_task(order_manager.drain_orders())
-        drain_fills_task = loop.create_task(order_manager.drain_fills())
+        drain_orders_task = None
+        drain_fills_task = None
+        drain_order_updates_task = None
+        if not is_simulated:
+            drain_orders_task = loop.create_task(order_manager.drain_orders())
+            drain_fills_task = loop.create_task(order_manager.drain_fills())
+            drain_order_updates_task = loop.create_task(order_manager.drain_order_updates())
         self._set_runtime_state(phase="running")
 
         try:
@@ -297,7 +316,11 @@ class Engine:
                 # Let PaperBroker resolve pending orders on new bar
                 if hasattr(self._broker, "on_bar"):
                     await self._broker.on_bar(bar_1m)
-                    await asyncio.sleep(0)
+                    if is_simulated:
+                        await order_manager.drain_ready_fills()
+                        await order_manager.drain_ready_order_updates()
+                    else:
+                        await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
 
                 # Invalidate feature caches for this instrument
                 features.invalidate(bar_1m.instrument)
@@ -311,9 +334,12 @@ class Engine:
                             kernel.SPEC.execution_instrument,
                         )
                         if position is not None:
-                            reason: str | None = await loop.run_in_executor(
-                                pool, kernel.on_exit, ctx, position, state
-                            )
+                            if is_simulated:
+                                reason = kernel.on_exit(ctx, position, state)
+                            else:
+                                reason = await loop.run_in_executor(
+                                    pool, kernel.on_exit, ctx, position, state
+                                )
                             self._write_decision_trace(state)
                             if reason:
                                 self._write_signal_event(
@@ -330,9 +356,12 @@ class Engine:
                                     reason,
                                 )
                             continue
-                        signal: Signal | None = await loop.run_in_executor(
-                            pool, kernel.generate, ctx, state
-                        )
+                        if is_simulated:
+                            signal = kernel.generate(ctx, state)
+                        else:
+                            signal = await loop.run_in_executor(
+                                pool, kernel.generate, ctx, state
+                            )
                         self._write_decision_trace(state)
                         if signal is not None:
                             self._write_signal_event(
@@ -342,7 +371,11 @@ class Engine:
                                 signal=signal,
                             )
                             await order_manager.submit(signal, kernel.SPEC.id)
-                            await asyncio.sleep(0)
+                            if is_simulated:
+                                await order_manager.drain_ready_orders()
+                                await order_manager.drain_ready_order_updates()
+                            else:
+                                await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
                     except Exception as e:
                         log.exception("Strategy %s raised: %s", kernel.SPEC.id, e)
                         self._record_event(
@@ -363,8 +396,12 @@ class Engine:
             self._set_runtime_state(phase="error", last_error=str(e))
             self._record_event("engine", "engine_error", error=str(e))
         finally:
-            drain_orders_task.cancel()
-            drain_fills_task.cancel()
+            if drain_orders_task is not None:
+                drain_orders_task.cancel()
+            if drain_fills_task is not None:
+                drain_fills_task.cancel()
+            if drain_order_updates_task is not None:
+                drain_order_updates_task.cancel()
             pool.shutdown(wait=False)
             await self._data_feed.disconnect()
             self._set_runtime_state(data_connected=False)

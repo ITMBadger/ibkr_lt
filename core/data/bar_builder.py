@@ -7,7 +7,7 @@ Only instantiated by DataManager when native_stream < base_tf.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ..types import Bar, Instrument
 from ..engine.timeframes import Timeframe
@@ -101,7 +101,7 @@ class BarBuilder:
         epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
         elapsed = int((ts - epoch).total_seconds())
         floored = (elapsed // self._target_tf.seconds) * self._target_tf.seconds
-        return epoch.replace(tzinfo=timezone.utc) + __import__("datetime").timedelta(seconds=floored)
+        return epoch.replace(tzinfo=timezone.utc) + timedelta(seconds=floored)
 
     def _start_new(self, target_open: datetime, bar: Bar) -> None:
         self._bar_open = target_open

@@ -8,7 +8,16 @@ router = APIRouter(prefix="/meta", tags=["meta"])
 
 
 @router.get("", response_model=ApiMeta)
-def meta() -> dict:
+async def meta() -> dict:
+    return _meta_payload()
+
+
+@router.get("/capabilities")
+async def capabilities() -> dict:
+    return _meta_payload()["capabilities"]
+
+
+def _meta_payload() -> dict:
     return {
         "service": "ibkr_lt_control_api",
         "api_version": "1.0",
@@ -39,11 +48,6 @@ def meta() -> dict:
             "manual_trade_reason": "manual trading requires a command bus and explicit guardrails",
         },
     }
-
-
-@router.get("/capabilities")
-def capabilities() -> dict:
-    return meta()["capabilities"]
 
 
 __all__ = ["router"]

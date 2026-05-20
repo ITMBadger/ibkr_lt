@@ -9,7 +9,7 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/health", response_model=HealthResponse)
-def health(
+async def health(
     engine=Depends(engine_from_request),
     metadata: dict = Depends(metadata_from_request),
 ) -> dict:
@@ -40,4 +40,3 @@ def health(
 
 
 __all__ = ["router"]
-

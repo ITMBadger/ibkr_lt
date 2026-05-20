@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+_MAX_1M_HISTORICAL_DAYS = 10
+
 
 class IBKRDataProvider:
     """Streaming + historical data provider backed by an IBKRClient."""
@@ -45,6 +47,7 @@ class IBKRDataProvider:
         self._port = port
         self._client_id = client_id
         self._subscriptions: dict[Instrument, int] = {}  # instrument → req_id
+        self._req_id_to_instrument: dict[int, Instrument] = {}
         self._next_req_id = 10_000
 
     async def connect(self) -> None:
@@ -79,11 +82,13 @@ class IBKRDataProvider:
         what_to_show = "TRADES" if instrument.asset_class != "fx" else "MIDPOINT"
         self._client.reqRealTimeBars(req_id, contract, 5, what_to_show, True, [])
         self._subscriptions[instrument] = req_id
+        self._req_id_to_instrument[req_id] = instrument
         log.info("Subscribed realtime bars: %s (req_id=%d)", instrument.symbol, req_id)
 
     async def unsubscribe(self, instrument: Instrument) -> None:
         req_id = self._subscriptions.pop(instrument, None)
         if req_id is not None:
+            self._req_id_to_instrument.pop(req_id, None)
             self._client.cancelRealTimeBars(req_id)
 
     async def bars(self) -> AsyncIterator[Bar]:
@@ -91,11 +96,10 @@ class IBKRDataProvider:
 
         Volume scaling: STK ×100 (IBKR normalises to 100-share lots).
         """
-        req_id_to_instrument = {v: k for k, v in self._subscriptions.items()}
         while True:
             item = await self._client.bar_queue.get()
             req_id = item.get("req_id")
-            instrument = req_id_to_instrument.get(req_id)
+            instrument = self._req_id_to_instrument.get(req_id)
             if instrument is None:
                 continue
 
@@ -129,13 +133,13 @@ class IBKRDataProvider:
     ) -> list[Bar]:
         """Request historical 1-min bars from IBKR."""
         duration_days = max(1, (end - start).days + 1)
-        duration_str = f"{min(duration_days, 365)} D"
+        duration_str = f"{min(duration_days, _MAX_1M_HISTORICAL_DAYS)} D"
 
         end_dt = end.astimezone(timezone.utc) if end.tzinfo else end.replace(tzinfo=timezone.utc)
         end_str = end_dt.strftime("%Y%m%d %H:%M:%S UTC")
 
         contract = instrument_to_contract(instrument)
-        what_to_show = "TRADES" if instrument.asset_class not in ("index", "fx") else "TRADES"
+        what_to_show = "MIDPOINT" if instrument.asset_class == "fx" else "TRADES"
 
         req_id = self._next_req_id
         self._next_req_id += 1
@@ -154,8 +158,14 @@ class IBKRDataProvider:
                     continue
                 if item.get("done"):
                     break
-                ts = _parse_ibkr_date(item["date"])
+                raw_date = str(item["date"])
+                ts = _parse_ibkr_date(raw_date)
                 if ts is None:
+                    log.warning(
+                        "Skipping historical bar for %s with unparsable IBKR date %r",
+                        instrument.symbol,
+                        raw_date,
+                    )
                     continue
                 bars.append(Bar(
                     instrument=instrument,
