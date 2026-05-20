@@ -416,6 +416,81 @@ def test_engine_writes_strategy_decision_trace(tmp_path):
     assert '"always_false"' in lines[0]
 
 
+def _full_decision_trace(ts: datetime, decision: str = "no_signal") -> DecisionTrace:
+    trace = DecisionTrace(phase="entry", strategy_id="_phase6_trace", timestamp=ts)
+    trace.add_bar(
+        "qqq_3m_current",
+        QQQ,
+        "3m",
+        {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0},
+    )
+    trace.add_indicator("stoch_d_current", 21.0, instrument=QQQ, timeframe="3m")
+    trace.add_condition(
+        "stoch_d_cross_above_threshold",
+        decision == "signal",
+        lhs={"prior": 18.0, "current": 21.0},
+        op="cross_above",
+        rhs=20.0,
+    )
+    signal = Signal(QQQ, "long") if decision == "signal" else None
+    reason = "stoch_d_crossed_above_threshold" if signal else "stoch_d_not_crossed"
+    trace.set_decision(decision, reason=reason, signal=signal)
+    return trace
+
+
+def test_audit_trigger_and_interval_decision_scope(tmp_path):
+    audit = AuditLogger(
+        log_dir=tmp_path,
+        decision_scope="trigger_and_interval",
+        decision_interval_minutes=30,
+    )
+
+    audit.decision(_full_decision_trace(datetime(2026, 5, 20, 14, 3, tzinfo=timezone.utc)))
+    latest = tmp_path / "strategy_30m_latest__phase6_trace.json"
+    assert latest.exists()
+    first_snapshot = latest.read_text(encoding="utf-8")
+    assert "stoch_d_cross_above_threshold" in first_snapshot
+    assert not (tmp_path / "strategy_decisions.jsonl").exists()
+    assert not (tmp_path / "strategy_trigger_decisions.jsonl").exists()
+
+    audit.decision(_full_decision_trace(datetime(2026, 5, 20, 14, 15, tzinfo=timezone.utc)))
+    assert latest.read_text(encoding="utf-8") == first_snapshot
+
+    audit.decision(_full_decision_trace(
+        datetime(2026, 5, 20, 14, 18, tzinfo=timezone.utc),
+        decision="signal",
+    ))
+    trigger_lines = (tmp_path / "strategy_trigger_decisions.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(trigger_lines) == 1
+    assert '"decision":"signal"' in trigger_lines[0]
+    assert latest.read_text(encoding="utf-8") == first_snapshot
+
+    audit.decision(_full_decision_trace(datetime(2026, 5, 20, 14, 31, tzinfo=timezone.utc)))
+    second_snapshot = latest.read_text(encoding="utf-8")
+    assert second_snapshot != first_snapshot
+    assert '"timestamp":"2026-05-20T14:31:00+00:00"' in second_snapshot
+
+
+def test_audit_trigger_log_appends_without_overwrite(tmp_path):
+    audit = AuditLogger(log_dir=tmp_path, decision_scope="trigger_and_interval")
+    audit.decision(_full_decision_trace(
+        datetime(2026, 5, 20, 14, 3, tzinfo=timezone.utc),
+        decision="signal",
+    ))
+    audit.decision(_full_decision_trace(
+        datetime(2026, 5, 20, 14, 6, tzinfo=timezone.utc),
+        decision="signal",
+    ))
+
+    trigger_lines = (tmp_path / "strategy_trigger_decisions.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(trigger_lines) == 2
+    assert all('"decision":"signal"' in line for line in trigger_lines)
+
+
 def test_order_manager_writes_order_and_fill_audit(tmp_path):
     async def run():
         broker = PaperBroker()

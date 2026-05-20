@@ -12,6 +12,17 @@ Design and update the code in a modular way. Prefer small, focused modules with 
 - Add shared behavior to framework modules only when it is genuinely reusable and does not expose proprietary strategy logic.
 - Keep changes narrowly scoped. Do not mix feature work, refactors, and unrelated cleanup in one change unless the cleanup is required for correctness.
 
+## Broker Test Safety
+
+Tests that connect to a real broker session, including IBKR paper, must stay opt-in and isolated from normal unit and integration tests.
+
+- Put real-session broker tests under `tests/paper/` or another clearly named opt-in folder.
+- Gate them behind explicit environment variables so `pytest tests/` does not place orders by accident.
+- Refuse live ports/accounts when the test intent is paper-only.
+- Use small allowed instruments and quantities.
+- Clean up open test orders and flatten only the test-created position delta.
+- Do not encode proprietary strategy thresholds, identifiers, or private logic into broker smoke tests.
+
 ## Strategy Privacy
 
 All strategy implementations are highly sensitive and proprietary unless explicitly listed as public.

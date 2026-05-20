@@ -252,8 +252,8 @@ def _build_broker(config: dict[str, Any]):
     shared: dict[str, Any] = {}
     if provider == "ibkr":
         account = str(execution.get("account", "")).strip()
-        if not account:
-            raise ConfigError("IBKR execution requires execution.account or --account")
+        if not account and str(config.get("mode", "")).lower() != "paper":
+            raise ConfigError("IBKR live execution requires execution.account or --account")
         client = IBKRClient()
         shared["ibkr_client"] = client
         broker = IBKRBroker(

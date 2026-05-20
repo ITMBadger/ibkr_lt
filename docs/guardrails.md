@@ -62,7 +62,28 @@ Strategies may declare `StrategySpec.protective_stop`. When an entry fill arrive
 
 ### Audit Logs
 
-When `logging.enabled=true`, the runtime creates the configured log directory and writes runtime, strategy decision, signal, order, and fill logs. Full `strategy_decisions.jsonl` traces are owner/dev artifacts and include condition thresholds and indicator values.
+When `logging.enabled=true`, the runtime creates the configured log directory and writes runtime, strategy decision, signal, order, and fill logs. Full decision traces are owner/dev artifacts and include relevant OHLCV, condition thresholds, indicator values, and pass/fail state.
+
+Decision logging is controlled by `logging.decision_scope`:
+
+- `every_eval`: append every strategy decision trace to `strategy_decisions.jsonl`.
+- `trigger_and_interval`: append entry triggers to `strategy_trigger_decisions.jsonl` and overwrite `strategy_30m_latest_<strategy_id>.json` once per configured interval.
+
+The shared deployment config uses `trigger_and_interval` with `decision_interval_minutes: 30` to avoid minute-by-minute live log noise while preserving full trigger traces and a current diagnostic snapshot.
+
+Signal, order, and fill logs remain append-only: `signals.jsonl`, `orders.jsonl`, and `fills.jsonl`.
+
+### IBKR Paper Test Guardrails
+
+Tests under `tests/paper/` are opt-in because they connect to TWS/IB Gateway paper and can place paper orders.
+
+- Skipped unless `IBKR_LT_RUN_PAPER_TESTS=1`.
+- Refuse live IBKR ports `7496` and `4001`.
+- Require paper account IDs to start with `DU` when `IBKR_LT_PAPER_ACCOUNT` is set.
+- Use separate API client IDs from the normal runtime.
+- Limit market-order tests to one share and require `IBKR_LT_ALLOW_PAPER_MARKET_ORDERS=1`.
+- Market-order tests require a guarded US equity RTH window.
+- Cleanup cancels test protective stops and flattens only the position delta created by the test.
 
 ### Hermes Control API
 

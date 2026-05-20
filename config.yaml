@@ -5,7 +5,8 @@
 # Mode is intentionally not stored here. Choose paper/live at runtime with
 # --paper or --live. Use --config only when running an alternate YAML file.
 # This file is configured for paper-account order testing. Run with --paper
-# and pass --account, or set execution.account in a private local config.
+# (account is auto-detected from the TWS paper session). For --live, pass
+# --account or set execution.account in a private local config.
 # Add --dry-run at runtime when only signal/order-intent logging is desired.
 
 dry_run: false
@@ -20,7 +21,8 @@ logging:
   log_dir: logs
   profile: owner
   strategy_decisions: full
-  decision_scope: every_eval
+  decision_scope: trigger_and_interval
+  decision_interval_minutes: 30
   bar_detail: relevant
   runtime_level: INFO
 
@@ -38,7 +40,8 @@ execution:
   provider: ibkr
   host: 127.0.0.1
   client_id: 1
-  # Required for IBKR runs. Keep blank in the shared file; pass --account instead.
+  # Required for --live. Auto-detected from TWS session for --paper.
+  # Keep blank in the shared file; pass --account or set in a private config.
   account: ""
 
 data:

@@ -175,6 +175,12 @@ class IBKRBroker:
             ib_order.auxPrice = order.stop_price
         if self._account:
             ib_order.account = self._account
+        # ibapi defaults these legacy SMART-routing flags to True. Current
+        # TWS paper rejects them for simple stock orders with error 10268.
+        if hasattr(ib_order, "eTradeOnly"):
+            ib_order.eTradeOnly = False
+        if hasattr(ib_order, "firmQuoteOnly"):
+            ib_order.firmQuoteOnly = False
         ib_order.tif = "DAY"
         ib_order.transmit = True
 

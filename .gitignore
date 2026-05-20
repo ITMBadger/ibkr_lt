@@ -24,6 +24,8 @@ dist/
 logs/
 *.log
 strategy_decisions*.jsonl
+strategy_trigger_decisions*.jsonl
+strategy_30m_latest_*.json
 signals*.jsonl
 orders*.jsonl
 fills*.jsonl
@@ -52,6 +54,7 @@ docs/architecture.md
 docs/architecture_illustration.md
 docs/starting_guide.md
 docs/*strategy*.md
+docs/*pre_live*.md
 docs/internal*.md
 docs/proprietary*.md
 tests/unit/test_phase5_*.py

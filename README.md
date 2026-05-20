@@ -78,6 +78,22 @@ Hermes should call `GET /api/v1/health` first, then use `next_endpoint` to decid
 
 The API is intentionally read-only. Manual trading, order cancellation, and startup approval commands should be added later through a command bus with explicit guardrails.
 
+## Audit Logs
+
+When `logging.enabled=true`, runtime output is written under `logs/`.
+
+The default shared config uses quieter owner decision logging:
+
+- `strategy_trigger_decisions.jsonl` appends full decision traces only when a strategy returns an entry signal.
+- `strategy_30m_latest_<strategy_id>.json` is overwritten once per configured interval with the latest full diagnostic trace.
+- `strategy_decisions.jsonl` is still available by setting `logging.decision_scope: every_eval`.
+
+Signal, order, and fill audit files remain append-only:
+
+- `signals.jsonl`
+- `orders.jsonl`
+- `fills.jsonl`
+
 ## Heartbeat Monitor
 
 `tools/heartbeat_monitor.py` is the separate Hermes watchdog process. It is a read-only API client, not part of the trading runtime.
@@ -120,3 +136,14 @@ In this workspace, the test suite is normally run with:
 ```bash
 ~/.venv/bin/python -m pytest tests/
 ```
+
+IBKR paper-account tests are opt-in because they connect to TWS/IB Gateway paper and can place paper orders:
+
+```bash
+IBKR_LT_RUN_PAPER_TESTS=1 \
+IBKR_LT_PAPER_ACCOUNT=DUM408165 \
+IBKR_LT_ALLOW_PAPER_MARKET_ORDERS=1 \
+~/.venv/bin/python -m pytest tests/paper/ -m paper
+```
+
+Without `IBKR_LT_ALLOW_PAPER_MARKET_ORDERS=1`, market-entry tests are skipped. Market-order tests also require the guarded US equity RTH window.
