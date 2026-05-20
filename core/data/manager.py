@@ -1,10 +1,8 @@
 """DataManager — per-instrument 1-min bar store with backfill/stream merge.
 
-Dedup policy (ported exactly from legacy/core/data_manager.py):
-  - Prior sessions: CSV wins (single source of truth for historical data).
-  - Today: live stream is authoritative. When the first live bar for today
-    arrives, today's CSV bars are purged so IBKR volume is the only source
-    for VWAP and intraday indicators.
+Dedup policy:
+  - Offline history wins when timestamps already exist.
+  - Supplemental broker history fills missing timestamps up to startup.
   - Live 1-min bars: latest writer wins (keep='last').
 
 One DataManager per instrument. The engine creates one per unique instrument
@@ -40,7 +38,6 @@ class DataManager:
         self._bars: pd.DataFrame = _empty_frame()
         self._revision: int = 0
         self._lock = threading.RLock()
-        self._today_purged: bool = False  # True once live-today bars evict CSV today-bars
 
         self._resampler = Resampler()
         self._resample_cache: dict[tuple, tuple[int, pd.DataFrame]] = {}  # key → (revision, df)
@@ -82,8 +79,9 @@ class DataManager:
         """Merge IBKR historical backfill bars.
 
         Prior sessions: CSV wins (skip if timestamp already in _bars).
-        If live_session_date is provided, skip that session and later because
-        the live stream is authoritative for the current live session.
+        If live_session_date is provided, skip that session and later. Current
+        runtime startup passes None so supplemental broker history can fill up
+        to the most recent completed bar before the live stream takes over.
         Gap fills: add bars not already present.
         Returns number of new bars added.
         """
@@ -135,19 +133,13 @@ class DataManager:
         Returns the bar if it was new/updated (revision incremented),
         or None if it was duplicate/ignored.
 
-        First live bar for today triggers a purge of today's CSV bars so
-        IBKR volume is the sole source for VWAP.
+        Live bars overwrite matching timestamps and append new timestamps.
         """
         ts = bar.timestamp
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
         with self._lock:
-            # Purge same-session historical bars on first live bar.
-            if not self._today_purged:
-                self._purge_session(ts.date())
-                self._today_purged = True
-
             row = pd.DataFrame(
                 [[bar.open, bar.high, bar.low, bar.close, bar.volume]],
                 index=pd.DatetimeIndex([ts], tz="UTC"),
@@ -202,12 +194,6 @@ class DataManager:
     # Internals
     # ------------------------------------------------------------------
 
-    def _purge_session(self, session_date: date) -> None:
-        """Remove bars for the live bar's UTC session before first live write."""
-        self._bars = self._bars[
-            self._bars.index.normalize().date < session_date
-        ] if len(self._bars) else self._bars
-
     def _trim_lookback(self) -> None:
         if self._lookback_days <= 0 or self._bars.empty:
             return
@@ -228,7 +214,12 @@ def _empty_frame() -> pd.DataFrame:
 def _normalize_index(index: pd.Index, tz: str) -> pd.DatetimeIndex:
     """Ensure DatetimeIndex is tz-aware UTC."""
     import pytz
-    dti = pd.DatetimeIndex(index)
+    try:
+        dti = pd.DatetimeIndex(index)
+    except ValueError as exc:
+        if "Mixed timezones" not in str(exc):
+            raise
+        return pd.DatetimeIndex(pd.to_datetime(index, utc=True))
     if dti.tz is None:
         # Assume the timestamps are in `tz` (local session time)
         local_tz = pytz.timezone(tz)

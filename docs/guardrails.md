@@ -6,15 +6,16 @@ This document lists the safety controls currently active in the MVP framework, a
 
 ### DataManager Dedup Policy
 
-The most critical safety control at the data layer. Prevents corrupted VWAP and indicator values from mixed data sources.
+The most critical safety control at the data layer. It keeps startup backfill and live updates deterministic.
 
 | Scenario | Rule |
 |---|---|
-| Bar is for a prior session | Historical source wins if duplicate |
-| Bar is for the live session | Live stream is authoritative — historical bars for that session are purged on first live bar |
+| Offline CSV has a timestamp | CSV/offline historical source wins during startup backfill |
+| Offline CSV is stale | Live provider historical fetch fills the missing gap up to startup |
+| Live stream emits a timestamp that already exists | Live stream overwrites that timestamp |
 | Duplicate 1-min timestamp | Latest writer wins (`keep='last'`) |
 
-This ensures VWAP and volume-weighted indicators are never computed from a mix of historical and live data for the same session.
+The shared runtime config uses regular-hours CSV files for offline history and IBKR for both gap backfill and live streaming. CSV, IBKR historical, and IBKR live data are expected to be regular trading hours only (`09:30` to `16:00` America/New_York).
 
 ### QuantityRules Validation
 

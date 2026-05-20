@@ -15,6 +15,7 @@ from core.engine.timeframes import TF_5S, TF_1M, TF_3M, TF_30M
 from core.data.bar_builder import BarBuilder
 from core.data.resampler import Resampler
 from core.data.manager import DataManager
+from core.adapters.csv.data import CSVDataProvider
 from core.adapters.paper.data import ReplayDataProvider
 
 QQQ = Instrument(asset_class="equity", symbol="QQQ")
@@ -227,6 +228,71 @@ class TestDataManager:
             assert df.iloc[0]["open"] == pytest.approx(100.0)
         finally:
             os.unlink(path)
+
+    def test_live_bar_does_not_purge_current_session_backfill(self):
+        dm = DataManager(QQQ)
+        dm.merge_backfill([
+            _1m_bar(QQQ, "2026-05-01 13:30:00", c=100.5),
+            _1m_bar(QQQ, "2026-05-01 13:31:00", c=101.5),
+        ])
+
+        dm.on_bar(_1m_bar(QQQ, "2026-05-01 13:32:00", c=102.5))
+
+        df = dm.bars_1m()
+        assert len(df) == 3
+        assert list(df["close"]) == [100.5, 101.5, 102.5]
+
+    def test_live_bar_overwrites_same_timestamp(self):
+        dm = DataManager(QQQ)
+        dm.merge_backfill([_1m_bar(QQQ, "2026-05-01 13:30:00", c=100.5)])
+
+        dm.on_bar(_1m_bar(QQQ, "2026-05-01 13:30:00", c=101.5))
+
+        df = dm.bars_1m()
+        assert len(df) == 1
+        assert df.iloc[0]["close"] == pytest.approx(101.5)
+
+
+# ---------------------------------------------------------------------------
+# CSVDataProvider
+# ---------------------------------------------------------------------------
+
+class TestCSVDataProvider:
+    def test_directory_resolves_symbol_file_and_filters_rth(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "BATS_QQQ, 1.csv.gz")
+                pd.DataFrame(
+                    [
+                        ["2026-03-06 09:30:00-05:00", 95, 96, 94, 95.5, 900],
+                        ["2026-05-01 09:29:00-04:00", 99, 100, 98, 99.5, 100],
+                        ["2026-05-01 09:30:00-04:00", 100, 101, 99, 100.5, 1000],
+                        ["2026-05-01 15:59:00-04:00", 101, 102, 100, 101.5, 1200],
+                        ["2026-05-01 16:00:00-04:00", 102, 103, 101, 102.5, 200],
+                    ],
+                    columns=["time", "open", "high", "low", "close", "volume"],
+                ).to_csv(path, index=False, compression="gzip")
+
+                provider = CSVDataProvider(tmpdir)
+                bars = await provider.fetch(
+                    QQQ,
+                    TF_1M,
+                    datetime(2026, 3, 1, 13, 0, tzinfo=timezone.utc),
+                    datetime(2026, 5, 1, 21, 0, tzinfo=timezone.utc),
+                )
+
+                assert [bar.timestamp.hour * 60 + bar.timestamp.minute for bar in bars] == [
+                    14 * 60 + 30,
+                    13 * 60 + 30,
+                    19 * 60 + 59,
+                ]
+                assert all(bar.source == "csv" for bar in bars)
+
+        asyncio.run(run())
+
+    def test_windows_directory_path_is_normalized_under_wsl(self):
+        provider = CSVDataProvider(r"D:\data_s\regular_hour")
+        assert str(provider._path).replace("\\", "/") == "/mnt/d/data_s/regular_hour"
 
 
 # ---------------------------------------------------------------------------

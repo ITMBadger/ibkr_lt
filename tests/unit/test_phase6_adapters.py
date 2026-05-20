@@ -254,6 +254,28 @@ def test_data_feed_splits_historical_and_live():
     asyncio.run(run())
 
 
+def test_data_feed_supplements_historical_gap_from_live_provider():
+    async def run():
+        bars = _bars(QQQ, 4)
+        hist = _StaticHistorical([bars[0]])
+        live = _StaticLive(bars[1:])
+        feed = DataFeed(hist, live)
+
+        fetched = await feed.fetch(
+            QQQ,
+            TF_1M,
+            bars[0].timestamp,
+            bars[-1].timestamp,
+        )
+
+        assert [bar.timestamp for bar in fetched] == [bar.timestamp for bar in bars]
+        assert fetched[0].source == "test"
+        assert fetched[-1].source == "test"
+
+    import asyncio
+    asyncio.run(run())
+
+
 def test_ibkr_fetch_caps_1m_duration_and_uses_midpoint_for_fx(monkeypatch):
     async def run():
         monkeypatch.setattr(

@@ -235,8 +235,8 @@ class Engine:
             protective_stops=protective_stops,
         )
 
-        # Backfill historical data. The live session date is excluded so live
-        # bars remain authoritative for the current session.
+        # Backfill historical data. Split feeds may load offline history first
+        # and supplement the gap with broker historical bars before live starts.
         end = self._clock.now()
         if isinstance(self._clock, SimulatedClock) and end.year == 1:
             end = datetime.now(tz=timezone.utc)
@@ -244,7 +244,7 @@ class Engine:
         for instr, dm in managers.items():
             try:
                 bars = await self._data_feed.fetch(instr, TF_1M, start, end)
-                dm.merge_backfill(bars, live_session_date=end.date())
+                dm.merge_backfill(bars)
                 log.info("Backfilled %d bars for %s", len(bars), instr.symbol)
                 self._record_event(
                     "data",

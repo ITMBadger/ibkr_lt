@@ -15,6 +15,8 @@ The core idea is simple: the engine is stable, while broker and market-data prov
 - `DataManager` owns bar storage, deduplication, revisioning, and resampling.
 - `FeatureRegistry` computes shared indicators once per instrument/timeframe/revision.
 
+The shared paper config uses local regular-hours CSV files for offline historical data and IBKR for both supplemental historical gap fill and 5-second live bars. At startup the engine loads CSV history, fills any recent gap from IBKR historical bars, then subscribes to IBKR live streaming.
+
 ## Cartridge Boundaries
 
 Broker cartridges implement `core/interfaces/broker.py`.

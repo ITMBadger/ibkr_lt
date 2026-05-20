@@ -301,6 +301,9 @@ def _build_data_provider(cfg: dict[str, Any], shared: dict[str, Any]):
         return CSVDataProvider(
             cfg["path"],
             session_tz=str(cfg.get("timezone", "America/New_York")),
+            rth_only=bool(cfg.get("rth_only", True)),
+            market_open=str(cfg.get("market_open", "09:30")),
+            market_close=str(cfg.get("market_close", "16:00")),
         )
     raise ValueError(f"Unknown data provider: {provider!r}")
 

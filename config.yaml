@@ -46,7 +46,12 @@ execution:
 
 data:
   historical:
-    provider: ibkr
+    provider: csv
+    path: 'D:\data_s\regular_hour'
+    timezone: America/New_York
+    rth_only: true
+    market_open: "09:30"
+    market_close: "16:00"
   live:
     provider: ibkr
 

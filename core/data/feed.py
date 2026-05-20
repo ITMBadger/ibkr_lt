@@ -6,7 +6,7 @@ providers for backfill and live bars, such as CSV historical plus Polygon live.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator
 
 from ..engine.timeframes import Timeframe
@@ -50,7 +50,11 @@ class DataFeed:
     ) -> list[Bar]:
         if self._historical is None:
             return []
-        return await self._historical.fetch(instrument, timeframe, start, end)
+        bars = await self._historical.fetch(instrument, timeframe, start, end)
+        supplemental = await self._fetch_live_gap(instrument, timeframe, start, end, bars)
+        if not supplemental:
+            return bars
+        return sorted([*bars, *supplemental], key=lambda bar: bar.timestamp)
 
     async def subscribe(self, instrument: Instrument, timeframe: Timeframe) -> None:
         await self._live.subscribe(instrument, timeframe)
@@ -61,3 +65,30 @@ class DataFeed:
     async def bars(self) -> AsyncIterator[Bar]:
         async for bar in self._live.bars():
             yield bar
+
+    async def _fetch_live_gap(
+        self,
+        instrument: Instrument,
+        timeframe: Timeframe,
+        start: datetime,
+        end: datetime,
+        existing: list[Bar],
+    ) -> list[Bar]:
+        """Use a live provider's historical API to supplement stale offline data."""
+        if self._historical is self._live:
+            return []
+        if not isinstance(self._live, HistoricalDataProvider):
+            return []
+        gap_start = start
+        if existing:
+            latest = max(_ensure_aware(bar.timestamp) for bar in existing)
+            gap_start = latest + timedelta(seconds=timeframe.seconds)
+        if gap_start > end:
+            return []
+        return await self._live.fetch(instrument, timeframe, gap_start, end)
+
+
+def _ensure_aware(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts
