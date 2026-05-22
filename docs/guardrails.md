@@ -63,14 +63,14 @@ Strategies may declare `StrategySpec.protective_stop`. When an entry fill arrive
 
 ### Audit Logs
 
-When `logging.enabled=true`, the runtime creates the configured log directory and writes runtime, strategy decision, signal, order, and fill logs. Full decision traces are owner/dev artifacts and include relevant OHLCV, condition thresholds, indicator values, and pass/fail state.
+When `logging.enabled=true`, the runtime creates a per-run folder under the configured log directory, named with minute-level ET time such as `logs/20260522_1047_et/`, and writes runtime, strategy decision, signal, order, and fill logs there. Full decision traces are owner/dev artifacts and include relevant OHLCV, condition thresholds, indicator values, and pass/fail state.
 
 Decision logging is controlled by `logging.decision_scope`:
 
-- `every_eval`: append every strategy decision trace to `strategy_decisions.jsonl`.
-- `trigger_and_interval`: append entry triggers to `strategy_trigger_decisions.jsonl` and overwrite `strategy_30m_latest_<strategy_id>.json` once per configured interval.
+- `every_eval`: write each strategy decision trace to `strategy_eval_<strategy_id>_<YYYYMMDD_HHMM>_et.csv`.
+- `trigger_and_interval`: write per-trigger CSV files named `strategy_trigger_<strategy_id>_<YYYYMMDD_HHMM>_et.csv` and per-interval CSV files named `strategy_<N>m_<strategy_id>_<YYYYMMDD_HHMM>_et.csv`.
 
-The shared deployment config uses `trigger_and_interval` with `decision_interval_minutes: 30` to avoid minute-by-minute live log noise while preserving full trigger traces and a current diagnostic snapshot.
+The shared deployment config uses `trigger_and_interval` with `decision_interval_minutes: 30` to avoid minute-by-minute live log noise while preserving full trigger traces and one historical diagnostic snapshot per 30-minute wall-clock bucket. Duplicate files in the same minute receive a numeric suffix rather than overwriting.
 
 Signal, order, and fill logs remain append-only: `signals.jsonl`, `orders.jsonl`, and `fills.jsonl`.
 

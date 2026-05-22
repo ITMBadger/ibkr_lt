@@ -82,13 +82,15 @@ The API is intentionally read-only. Manual trading, order cancellation, and star
 
 ## Audit Logs
 
-When `logging.enabled=true`, runtime output is written under `logs/`.
+When `logging.enabled=true`, runtime output is written under a per-run folder:
+`logs/<YYYYMMDD_HHMM>_et/`. If two app runs start in the same minute, the later
+folder receives a numeric suffix such as `_2`.
 
 The default shared config uses quieter owner decision logging:
 
-- `strategy_trigger_decisions.jsonl` appends full decision traces only when a strategy returns an entry signal.
-- `strategy_30m_latest_<strategy_id>.json` is overwritten once per configured interval with the latest full diagnostic trace.
-- `strategy_decisions.jsonl` is still available by setting `logging.decision_scope: every_eval`.
+- `strategy_trigger_<strategy_id>_<YYYYMMDD_HHMM>_et.csv` stores each trigger trace as a separate CSV file.
+- `strategy_30m_<strategy_id>_<YYYYMMDD_HHMM>_et.csv` stores one diagnostic trace per 30-minute wall-clock bucket.
+- `strategy_eval_<strategy_id>_<YYYYMMDD_HHMM>_et.csv` stores each evaluation when `logging.decision_scope: every_eval`.
 
 Signal, order, and fill audit files remain append-only:
 

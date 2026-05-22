@@ -6,16 +6,21 @@ import json
 import logging
 import threading
 import uuid
+import csv
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from .decision_csv import flatten_decision_event
 from .serialize import to_jsonable
 from .trace import DecisionTrace
 
+_FILENAME_TZ = ZoneInfo("America/New_York")
+
 
 class AuditLogger:
-    """Synchronous JSONL audit writer with a small thread lock."""
+    """Synchronous audit writer with a small thread lock."""
 
     def __init__(
         self,
@@ -27,6 +32,8 @@ class AuditLogger:
         decision_scope: str = "every_eval",
         decision_interval_minutes: int = 30,
         run_id: str | None = None,
+        run_subdir: bool = False,
+        run_started_at: datetime | None = None,
     ) -> None:
         self.enabled = enabled
         self.profile = profile
@@ -34,11 +41,16 @@ class AuditLogger:
         self.decision_scope = decision_scope
         self.decision_interval_minutes = max(1, int(decision_interval_minutes))
         self.run_id = run_id or uuid.uuid4().hex
-        self.log_dir = Path(log_dir)
+        self.base_log_dir = Path(log_dir)
+        self.run_subdir = run_subdir
+        self.log_dir = self.base_log_dir
         self._lock = threading.RLock()
         self._last_decision_interval: dict[tuple[str, str], datetime] = {}
         if self.enabled:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
+            if self.run_subdir:
+                self.log_dir = _allocate_run_log_dir(self.base_log_dir, run_started_at)
+            else:
+                self.log_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AuditLogger | None":
@@ -53,6 +65,7 @@ class AuditLogger:
             strategy_decisions=str(cfg.get("strategy_decisions", "full")),
             decision_scope=str(cfg.get("decision_scope", "every_eval")),
             decision_interval_minutes=int(cfg.get("decision_interval_minutes", 30)),
+            run_subdir=bool(cfg.get("run_subdir", True)),
         )
 
     def write(self, filename: str, event: dict[str, Any]) -> None:
@@ -68,36 +81,60 @@ class AuditLogger:
             with (self.log_dir / filename).open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
 
-    def overwrite(self, filename: str, event: dict[str, Any]) -> None:
+    def write_unique_csv(self, filename: str, row: dict[str, Any]) -> None:
         if not self.enabled:
             return
         payload = {
-            "run_id": self.run_id,
+            **to_jsonable(row),
             "logged_at": datetime.now(tz=timezone.utc).isoformat(),
-            **to_jsonable(event),
+            "run_id": self.run_id,
         }
-        text = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
         with self._lock:
-            (self.log_dir / filename).write_text(text + "\n", encoding="utf-8")
+            path = self._unique_path(filename)
+            with path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(payload))
+                writer.writeheader()
+                writer.writerow(payload)
+
+    def _unique_path(self, filename: str) -> Path:
+        path = self.log_dir / filename
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        for index in range(2, 10_000):
+            candidate = path.with_name(f"{stem}_{index}{suffix}")
+            if not candidate.exists():
+                return candidate
+        raise RuntimeError(f"Could not allocate unique audit filename for {filename!r}")
 
     def decision(self, trace: DecisionTrace) -> None:
         if self.profile != "owner" or self.strategy_decisions in {"off", "none", "false"}:
             return
         event = trace.to_event()
         scope = self.decision_scope.lower()
+        strategy_id = _safe_filename_part(str(event.get("strategy_id", "unknown")))
         if scope in {"every_eval", "all", "full"}:
-            self.write("strategy_decisions.jsonl", event)
+            eval_stem = _decision_file_stem("strategy_eval", strategy_id, event)
+            self.write_unique_csv(f"{eval_stem}.csv", flatten_decision_event(event))
             return
         if scope in {"trigger_and_interval", "trigger_and_30m", "signal_and_interval"}:
             if _is_entry_signal(event):
-                self.write("strategy_trigger_decisions.jsonl", event)
+                trigger_stem = _decision_file_stem("strategy_trigger", strategy_id, event)
+                self.write_unique_csv(f"{trigger_stem}.csv", flatten_decision_event(event))
             if self._should_write_interval_decision(event):
-                strategy_id = _safe_filename_part(str(event.get("strategy_id", "unknown")))
-                self.overwrite(f"strategy_30m_latest_{strategy_id}.json", event)
+                interval_stem = _decision_file_stem(
+                    f"strategy_{self.decision_interval_minutes}m",
+                    strategy_id,
+                    event,
+                    interval_minutes=self.decision_interval_minutes,
+                )
+                self.write_unique_csv(f"{interval_stem}.csv", flatten_decision_event(event))
             return
         log = logging.getLogger(__name__)
-        log.warning("Unknown decision_scope=%r; writing every evaluation", self.decision_scope)
-        self.write("strategy_decisions.jsonl", event)
+        log.warning("Unknown decision_scope=%r; writing every evaluation to CSV", self.decision_scope)
+        eval_stem = _decision_file_stem("strategy_eval", strategy_id, event)
+        self.write_unique_csv(f"{eval_stem}.csv", flatten_decision_event(event))
 
     def signal(self, event: dict[str, Any]) -> None:
         self.write("signals.jsonl", event)
@@ -180,6 +217,41 @@ def _parse_event_timestamp(value: Any) -> datetime | None:
 def _floor_to_interval(ts: datetime, minutes: int) -> datetime:
     minute = (ts.minute // minutes) * minutes
     return ts.replace(minute=minute, second=0, microsecond=0)
+
+
+def _decision_file_stem(
+    prefix: str,
+    strategy_id: str,
+    event: dict[str, Any],
+    *,
+    interval_minutes: int | None = None,
+) -> str:
+    ts = _parse_event_timestamp(event.get("timestamp")) or datetime.now(tz=timezone.utc)
+    if interval_minutes is not None:
+        ts = _floor_to_interval(ts, interval_minutes)
+    ts_et = ts.astimezone(_FILENAME_TZ)
+    return f"{prefix}_{strategy_id}_{ts_et.strftime('%Y%m%d_%H%M')}_et"
+
+
+def _allocate_run_log_dir(base_log_dir: Path, started_at: datetime | None = None) -> Path:
+    base_log_dir.mkdir(parents=True, exist_ok=True)
+    stem = _run_dir_stem(started_at or datetime.now(tz=timezone.utc))
+    for index in range(1, 10_000):
+        suffix = "" if index == 1 else f"_{index}"
+        candidate = base_log_dir / f"{stem}{suffix}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError(f"Could not allocate unique run log directory under {base_log_dir}")
+
+
+def _run_dir_stem(ts: datetime) -> str:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ts_et = ts.astimezone(_FILENAME_TZ)
+    return ts_et.strftime("%Y%m%d_%H%M_et")
 
 
 def _safe_filename_part(value: str) -> str:

@@ -19,6 +19,7 @@ session_timezone: America/New_York
 logging:
   enabled: true
   log_dir: logs
+  run_subdir: true
   profile: owner
   strategy_decisions: full
   decision_scope: trigger_and_interval
