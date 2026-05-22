@@ -116,6 +116,24 @@ strategy_modes:
 `dry_run` strategies still see real account, position, and market data, but
 `OrderManager` logs order intent without calling the broker submit API.
 
+## Event Backtesting
+
+Backtests use the same `Engine`, strategy modules, `DataManager`,
+`FeatureRegistry`, `OrderManager`, and `PaperBroker` path as paper/live runtime:
+
+```bash
+python -m backtest.run --strategy stoch_3m_cross_long --start 2025-01-01 --end 2025-03-31
+```
+
+The runner reads CSV data from `data.historical.path` in `config.yaml`, or from
+`--csv`. Use a directory when selected strategies require more than one symbol.
+It backfills warmup bars before the start timestamp, then replays test-window
+bars event by event. Results are written under `backtest_runs/`.
+
+Configured `strategy_modes` are respected. Use `--all-live` when you want a
+simulation fill path for strategies that are marked `dry_run` in live/paper
+config.
+
 ## Heartbeat Monitor
 
 `tools/heartbeat_monitor.py` is the separate Hermes watchdog process. It is a read-only API client, not part of the trading runtime.

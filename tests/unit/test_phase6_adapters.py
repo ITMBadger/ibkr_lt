@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from core import DataFeed, Engine, SimulatedClock
+from core import DataFeed, Engine, SimulatedClock, WallClock
 from core.audit import AuditLogger, DecisionTrace, record_decision
 from core.adapters.ibkr.data import IBKRDataProvider
 from core.adapters.paper.broker import PaperBroker
@@ -346,8 +346,8 @@ def test_ibkr_bars_uses_live_subscription_lookup(monkeypatch):
     asyncio.run(run())
 
 
-def test_engine_does_not_subscribe_execution_instrument_as_data():
-    provider = _RecordingReplay(_bars(QQQ, 1))
+def test_simulated_engine_subscribes_execution_instrument_for_paper_fills():
+    provider = _RecordingReplay([*_bars(QQQ, 1), *_bars(MNQ, 1)])
     broker = PaperBroker()
     engine = Engine(
         broker=broker,
@@ -361,11 +361,29 @@ def test_engine_does_not_subscribe_execution_instrument_as_data():
     )
     engine.run_backtest()
     assert QQQ in provider.subscriptions
+    assert MNQ in provider.subscriptions
+
+
+def test_non_simulated_engine_does_not_subscribe_execution_instrument_as_data():
+    provider = _RecordingReplay(_bars(QQQ, 1))
+    broker = PaperBroker()
+    engine = Engine(
+        broker=broker,
+        streaming=provider,
+        historical=None,
+        clock=WallClock(),
+        strategies=[(_OneShotStrategy(), {})],
+        risk=RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        thread_pool_workers=1,
+        lookback_days=10,
+    )
+    engine.run_live()
+    assert QQQ in provider.subscriptions
     assert MNQ not in provider.subscriptions
 
 
 def test_engine_on_exit_submits_market_close():
-    provider = ReplayDataProvider(_bars(QQQ, 4))
+    provider = ReplayDataProvider([*_bars(QQQ, 4), *_bars(MNQ, 4)])
     broker = PaperBroker()
     engine = Engine(
         broker=broker,

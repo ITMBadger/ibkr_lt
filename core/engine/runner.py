@@ -191,11 +191,17 @@ class Engine:
         loop = asyncio.get_running_loop()
         is_simulated = isinstance(self._clock, SimulatedClock)
 
-        # Build DataManagers for every instrument requested as strategy data.
-        all_instruments: set[Instrument] = set()
+        # Build DataManagers for strategy data. Simulated paper replay also
+        # needs execution-instrument bars so PaperBroker can resolve fills.
+        strategy_data_instruments: set[Instrument] = set()
+        execution_instruments: set[Instrument] = set()
         for kernel, _ in self._strategies:
-            all_instruments.add(kernel.SPEC.primary_instrument)
-            all_instruments.update(kernel.SPEC.reference_instruments)
+            strategy_data_instruments.add(kernel.SPEC.primary_instrument)
+            strategy_data_instruments.update(kernel.SPEC.reference_instruments)
+            execution_instruments.add(kernel.SPEC.execution_instrument)
+        all_instruments = set(strategy_data_instruments)
+        if is_simulated and hasattr(self._broker, "on_bar"):
+            all_instruments.update(execution_instruments)
 
         managers: dict[Instrument, DataManager] = {
             instr: DataManager(instr, self._lookback_days, self._session_tz)

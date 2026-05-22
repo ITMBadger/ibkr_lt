@@ -63,6 +63,12 @@ If a strategy has an owned open position, `Engine` calls `StrategyKernel.on_exit
 
 Strategies may declare `StrategySpec.protective_stop`. When an entry fill arrives, `OrderManager` can submit an opposite-side broker-native stop order using the actual fill price as reference. This is order-management protection, not strategy `on_exit()` logic. Because the stop is based on the actual fill, it is submitted after the fill callback rather than pre-attached atomically before entry fill.
 
+### Event Backtests
+
+`python -m backtest.run` uses the production `Engine` with `SimulatedClock`, `ReplayDataProvider`, `PaperBroker`, and real strategy modules. The runner loads warmup data from CSV before the replay start timestamp, then executes strategy logic only on replay bars inside the requested window.
+
+Backtest market orders fill at the next replay bar open. Stop orders fill at `stop_price` when crossed by a replay bar. These assumptions are deterministic and close to the live event flow, but they are not a guarantee of identical IBKR live fills, partial fills, slippage, or gap-through stop behavior.
+
 ### Audit Logs
 
 When `logging.enabled=true`, the runtime creates a per-run folder under the configured log directory, named with minute-level ET time such as `logs/20260522_1047_et/`, and writes runtime, strategy decision, signal, order, and fill logs there. Full decision traces are owner/dev artifacts and include relevant OHLCV, condition thresholds, indicator values, and pass/fail state.

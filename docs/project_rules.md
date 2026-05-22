@@ -32,3 +32,19 @@ All strategy implementations are highly sensitive and proprietary unless explici
 - All other strategy source files, compiled artifacts, configs, docs, tests, formulas, thresholds, identifiers, logs, and derivative materials must remain hidden from git and public documentation.
 - Do not move proprietary strategy details into public docs, tests, config examples, comments, or shared framework modules.
 - When adding a new public/demo strategy, add an explicit `.gitignore` exception for that file only.
+
+## Strategy Authoring Style
+
+New strategies should follow the existing `strategies/stoch_3m_cross_long.py` shape unless there is a specific reason to deviate.
+
+- Put one strategy class per strategy file under `strategies/`; use module-level `Instrument` and timezone constants for shared objects.
+- Decorate the class with `@register_strategy`, subclass `StrategyKernel`, and define a class-level `SPEC = StrategySpec(...)`.
+- Treat `StrategySpec.id` as the stable runtime identity used by config, logs, API metadata, and adopted-position ownership. Do not rely on the filename as the strategy id.
+- Keep `SPEC` minimal: declare only instruments, required timeframes, warmup bars, and broker-side protective stops the engine must know before runtime.
+- For protected/private strategies, prefer `ctx.features.get(...)` inside `generate()` or `on_exit()` for common indicators instead of listing every feature in `StrategySpec.indicators`. Example: `ctx.features.get("ema", QQQ, "3m", period=20)`.
+- Keep proprietary formulas, thresholds, scoring, entry/exit conditions, and condition names inside the private strategy file. Do not copy them into shared framework modules, config examples, public docs, or tests.
+- Keep `generate()` and `on_exit()` pure: no broker calls, file I/O, network I/O, thread management, or framework mutation outside the provided `state` dict.
+- Initialize strategy state in `on_start()` and use the provided `state` dict for runtime memory such as last signal date, last evaluated bar, or dedup keys.
+- Use deterministic pandas/numpy operations on `ctx.bars` or `ctx.features`; guard against insufficient bars before reading latest/prior rows.
+- Use `DecisionTrace` with a local `finish()` helper when decision logging is needed, and record the trace with `record_decision(state, trace)` before every return path.
+- Keep decision traces owner/dev oriented. Include only the bars, metrics, tables, indicators, and conditions needed to debug the strategy, because these logs can reveal behavior if shared.

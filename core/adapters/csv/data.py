@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
-import re
 from datetime import datetime, time
 from pathlib import Path
 
 import pandas as pd
 import pytz
 
+from ...path_utils import normalize_local_path
 from ...types import Bar, Instrument
 from ...engine.timeframes import Timeframe, TF_1M
 
@@ -32,7 +31,7 @@ class CSVDataProvider:
         market_open: str = "09:30",
         market_close: str = "16:00",
     ) -> None:
-        self._path = _normalize_path(csv_path)
+        self._path = normalize_local_path(csv_path)
         self._session_tz = session_tz
         self._rth_only = rth_only
         self._market_open = _parse_hhmm(market_open)
@@ -107,17 +106,6 @@ def _ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=pytz.utc)
     return dt.astimezone(pytz.utc)
-
-
-def _normalize_path(path: str | Path) -> Path:
-    raw = str(path)
-    if os.name != "nt":
-        match = re.match(r"^([A-Za-z]):[\\/](.*)$", raw)
-        if match:
-            drive = match.group(1).lower()
-            rest = match.group(2).replace("\\", "/")
-            return Path("/mnt") / drive / rest
-    return Path(raw)
 
 
 def _resolve_csv_path(path: Path, instrument: Instrument) -> Path | None:

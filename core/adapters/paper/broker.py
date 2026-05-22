@@ -11,6 +11,8 @@ import asyncio
 import logging
 import uuid
 from asyncio import QueueEmpty
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import AsyncIterator
 
 from ...types import (
@@ -50,13 +52,14 @@ class PaperBroker:
 
     def __init__(self, slippage_ticks: int = 0) -> None:
         self._slippage_ticks = slippage_ticks
-        self._pending: list[tuple[OrderRequest, str]] = []  # (order, broker_id)
+        self._pending: list[_PendingOrder] = []
         self._fill_queue: asyncio.Queue[Fill] = asyncio.Queue()
         self._order_update_queue: asyncio.Queue[OrderStatus] = asyncio.Queue()
         self._positions: dict[Instrument, float] = {}
         self._cash: float = 100_000.0
         self._net_liq: float = 100_000.0
         self._account_id: str = "PAPER-001"
+        self._last_seen_timestamp: datetime | None = None
 
     async def connect(self) -> None:
         pass
@@ -82,7 +85,13 @@ class PaperBroker:
     async def submit_order(self, order: OrderRequest) -> OrderStatus:
         """Queue order for fill at next bar. Returns pending status immediately."""
         broker_id = order.idempotency_key or str(uuid.uuid4())
-        self._pending.append((order, broker_id))
+        self._pending.append(
+            _PendingOrder(
+                order=order,
+                broker_id=broker_id,
+                submitted_after=self._last_seen_timestamp,
+            )
+        )
         status = OrderStatus(
             broker_order_id=broker_id,
             status="pending",
@@ -92,7 +101,10 @@ class PaperBroker:
         return status
 
     async def cancel_order(self, broker_order_id: str) -> None:
-        self._pending = [(o, bid) for o, bid in self._pending if bid != broker_order_id]
+        self._pending = [
+            pending for pending in self._pending
+            if pending.broker_id != broker_order_id
+        ]
 
     # ------------------------------------------------------------------
     # Called by Engine on each new bar — resolves pending orders
@@ -100,15 +112,26 @@ class PaperBroker:
 
     async def on_bar(self, bar: Bar) -> None:
         """Resolve pending orders on a new bar."""
+        bar_ts = _ensure_aware(bar.timestamp)
+        if self._last_seen_timestamp is None or bar_ts > self._last_seen_timestamp:
+            self._last_seen_timestamp = bar_ts
         if not self._pending:
             return
         to_fill = list(self._pending)
         self._pending.clear()
-        still_pending: list[tuple[OrderRequest, str]] = []
-        for order, broker_id in to_fill:
+        still_pending: list[_PendingOrder] = []
+        for pending in to_fill:
+            order = pending.order
+            broker_id = pending.broker_id
+            if order.instrument != bar.instrument:
+                still_pending.append(pending)
+                continue
+            if pending.submitted_after is not None and bar_ts <= pending.submitted_after:
+                still_pending.append(pending)
+                continue
             should_fill, fill_price = _resolve_fill(order, bar)
             if not should_fill:
-                still_pending.append((order, broker_id))
+                still_pending.append(pending)
                 continue
             fill = Fill(
                 broker_order_id=broker_id,
@@ -169,3 +192,16 @@ def _resolve_fill(order: OrderRequest, bar: Bar) -> tuple[bool, float]:
             return bar.low <= order.stop_price, order.stop_price
         return bar.high >= order.stop_price, order.stop_price
     return True, bar.open
+
+
+@dataclass(frozen=True)
+class _PendingOrder:
+    order: OrderRequest
+    broker_id: str
+    submitted_after: datetime | None
+
+
+def _ensure_aware(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)

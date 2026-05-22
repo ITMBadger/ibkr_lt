@@ -252,6 +252,20 @@ class TestDataManager:
         assert len(df) == 1
         assert df.iloc[0]["close"] == pytest.approx(101.5)
 
+    def test_lookback_trim_uses_latest_bar_not_wall_clock(self):
+        dm = DataManager(QQQ, lookback_days=2)
+        added = dm.merge_backfill([
+            _1m_bar(QQQ, "2024-01-01 13:30:00", c=100.5),
+            _1m_bar(QQQ, "2024-01-02 13:30:00", c=101.5),
+            _1m_bar(QQQ, "2024-01-04 13:30:00", c=102.5),
+        ])
+
+        df = dm.bars_1m()
+        assert added == 3
+        assert len(df) == 2
+        assert list(df["close"]) == [101.5, 102.5]
+        assert len(dm.bars_1m(lookback_days=1)) == 1
+
 
 # ---------------------------------------------------------------------------
 # CSVDataProvider

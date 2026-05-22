@@ -5,8 +5,8 @@ Dedup policy:
   - Supplemental broker history fills missing timestamps up to startup.
   - Live 1-min bars: latest writer wins (keep='last').
 
-One DataManager per instrument. The engine creates one per unique instrument
-in all registered strategies' primary+reference sets.
+One DataManager per instrument. The engine creates managers for strategy data
+instruments and, during simulated replay, execution instruments needed for fills.
 """
 
 from __future__ import annotations
@@ -151,6 +151,7 @@ class DataManager:
             )
             self._bars = self._bars[~self._bars.index.duplicated(keep="last")]
             self._revision += 1
+            self._trim_lookback()
             return bar
 
     # ------------------------------------------------------------------
@@ -160,7 +161,7 @@ class DataManager:
     def bars_1m(self, lookback_days: int = 0) -> pd.DataFrame:
         with self._lock:
             if lookback_days > 0:
-                cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+                cutoff = self._lookback_cutoff(lookback_days)
                 return self._bars[self._bars.index >= cutoff].copy()
             return self._bars.copy()
 
@@ -197,8 +198,16 @@ class DataManager:
     def _trim_lookback(self) -> None:
         if self._lookback_days <= 0 or self._bars.empty:
             return
-        cutoff = datetime.now(timezone.utc) - timedelta(days=self._lookback_days)
+        cutoff = self._lookback_cutoff(self._lookback_days)
         self._bars = self._bars[self._bars.index >= cutoff]
+
+    def _lookback_cutoff(self, lookback_days: int) -> datetime:
+        if self._bars.empty:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        latest = self._bars.index[-1]
+        if latest.tzinfo is None:
+            latest = latest.tz_localize(timezone.utc)
+        return latest.to_pydatetime() - timedelta(days=lookback_days)
 
 
 # ---------------------------------------------------------------------------

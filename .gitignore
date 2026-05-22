@@ -22,6 +22,7 @@ dist/
 # Local runtime artifacts
 /var/
 logs/
+backtest_runs/
 *.log
 strategy_decisions*.jsonl
 strategy_trigger_decisions*.jsonl

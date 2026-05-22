@@ -19,10 +19,10 @@ MES = Instrument(asset_class="future", symbol="MES", multiplier=5.0)
 BTC = Instrument(asset_class="crypto_perp", symbol="BTC")
 
 
-def _bar(instrument=QQQ, price=100.0):
+def _bar(instrument=QQQ, price=100.0, timestamp=None):
     return Bar(
         instrument=instrument, timeframe=TF_1M,
-        timestamp=datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc),
+        timestamp=timestamp or datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc),
         open=price, high=price + 1, low=price - 1, close=price,
         volume=1000.0, is_closed=True, source="paper",
     )
@@ -149,6 +149,43 @@ class TestPaperBroker:
             assert fill.quantity == pytest.approx(2.0)
             assert fill.price == pytest.approx(105.0)
             assert fill.side == "long"
+
+        asyncio.run(run())
+
+    def test_pending_order_waits_for_matching_instrument_bar(self):
+        broker = PaperBroker()
+
+        async def run():
+            await broker.submit_order(_order(MES, "long", 1.0))
+            await broker.on_bar(_bar(QQQ, price=105.0))
+            assert broker._fill_queue.empty()
+
+            await broker.on_bar(_bar(MES, price=5000.0))
+            fill = await asyncio.wait_for(broker._fill_queue.get(), timeout=1)
+            assert fill.instrument == MES
+            assert fill.price == pytest.approx(5000.0)
+
+        asyncio.run(run())
+
+    def test_pending_order_waits_for_later_timestamp(self):
+        broker = PaperBroker()
+        ts = datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc)
+
+        async def run():
+            await broker.on_bar(_bar(QQQ, price=105.0, timestamp=ts))
+            await broker.submit_order(_order(MES, "long", 1.0))
+
+            await broker.on_bar(_bar(MES, price=5000.0, timestamp=ts))
+            assert broker._fill_queue.empty()
+
+            await broker.on_bar(_bar(
+                MES,
+                price=5001.0,
+                timestamp=datetime(2026, 5, 1, 13, 31, tzinfo=timezone.utc),
+            ))
+            fill = await asyncio.wait_for(broker._fill_queue.get(), timeout=1)
+            assert fill.instrument == MES
+            assert fill.price == pytest.approx(5001.0)
 
         asyncio.run(run())
 

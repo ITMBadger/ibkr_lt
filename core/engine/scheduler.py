@@ -27,7 +27,7 @@ class Scheduler:
 
     def __init__(self, features: FeatureRegistry | None = None) -> None:
         self._by_primary: dict[Instrument, list[tuple[StrategyKernel, dict]]] = {}
-        # All instruments that need DataManagers: primary + all reference instruments
+        # All instruments that need strategy MarketContext data.
         self._all_instruments: set[Instrument] = set()
         self._features = features
 

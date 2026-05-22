@@ -49,7 +49,7 @@ class AuditLogger:
         self._last_decision_interval: dict[tuple[str, str], datetime] = {}
         if self.enabled:
             if self.run_subdir:
-                self.log_dir = _allocate_run_log_dir(self.base_log_dir, run_started_at)
+                self.log_dir = allocate_run_log_dir(self.base_log_dir, run_started_at)
             else:
                 self.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -253,7 +253,7 @@ def _decision_file_stem(
     return f"{prefix}_{strategy_id}_{ts_et.strftime('%Y%m%d_%H%M')}_et"
 
 
-def _allocate_run_log_dir(base_log_dir: Path, started_at: datetime | None = None) -> Path:
+def allocate_run_log_dir(base_log_dir: Path, started_at: datetime | None = None) -> Path:
     base_log_dir.mkdir(parents=True, exist_ok=True)
     stem = _run_dir_stem(started_at or datetime.now(tz=timezone.utc))
     for index in range(1, 10_000):
@@ -265,6 +265,9 @@ def _allocate_run_log_dir(base_log_dir: Path, started_at: datetime | None = None
             continue
         return candidate
     raise RuntimeError(f"Could not allocate unique run log directory under {base_log_dir}")
+
+
+_allocate_run_log_dir = allocate_run_log_dir
 
 
 def _run_dir_stem(ts: datetime) -> str:
