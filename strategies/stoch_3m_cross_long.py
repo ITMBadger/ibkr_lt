@@ -77,6 +77,51 @@ class Stoch3mCrossLong(StrategyKernel):
         if len(bars_3m) >= 2:
             trace.add_bar("qqq_3m_prior", QQQ, "3m", bars_3m.iloc[-2])
 
+        fastk_period = int(p.get("fastk_period", self._FASTK_PERIOD))
+        slowk_period = int(p.get("slowk_period", self._SLOWK_PERIOD))
+        slowd_period = int(p.get("slowd_period", self._SLOWD_PERIOD))
+        threshold = float(p.get("threshold", self._THRESHOLD))
+
+        _, slowd = talib.STOCH(
+            bars_3m["high"].astype(float).to_numpy(),
+            bars_3m["low"].astype(float).to_numpy(),
+            bars_3m["close"].astype(float).to_numpy(),
+            fastk_period=fastk_period,
+            slowk_period=slowk_period,
+            slowk_matype=0,
+            slowd_period=slowd_period,
+            slowd_matype=0,
+        )
+
+        if len(slowd) < 2:
+            trace.add_metric("slowd_count", len(slowd))
+            return finish("no_signal", "insufficient_slowd")
+
+        slowd_series = bars_3m["close"].copy()
+        slowd_series[:] = slowd
+        cross_series = (
+            np.isfinite(slowd_series.shift(1))
+            & np.isfinite(slowd_series)
+            & (slowd_series.shift(1) < threshold)
+            & (slowd_series > threshold)
+        )
+        table_3m = bars_3m.tail(5).copy()
+        table_3m["stoch_d"] = slowd_series.reindex(table_3m.index)
+        table_3m["threshold"] = threshold
+        table_3m["condition_stoch_d_cross_above_threshold"] = cross_series.reindex(table_3m.index).fillna(False)
+        trace.add_table("qqq_3m", QQQ, "3m", table_3m)
+
+        prev_d = float(slowd[-2])
+        current_d = float(slowd[-1])
+        trace.add_indicator("stoch_d_prior", prev_d, instrument=QQQ, timeframe="3m")
+        trace.add_indicator("stoch_d_current", current_d, instrument=QQQ, timeframe="3m")
+        trace.add_metric("fastk_period", fastk_period)
+        trace.add_metric("slowk_period", slowk_period)
+        trace.add_metric("slowd_period", slowd_period)
+        trace.add_metric("threshold", threshold)
+
+        crossed_up = bool(cross_series.iloc[-1])
+
         entry_start = int(p.get("entry_start_hhmm", self._ENTRY_START_HHMM))
         entry_end = int(p.get("entry_end_hhmm", self._ENTRY_END_HHMM))
         market_hhmm = market_now.hour * 100 + market_now.minute
@@ -116,44 +161,9 @@ class Stoch3mCrossLong(StrategyKernel):
             return finish("no_signal", "already_evaluated_3m_bar")
         state["last_evaluated_3m_bar"] = current_3m_bar
 
-        fastk_period = int(p.get("fastk_period", self._FASTK_PERIOD))
-        slowk_period = int(p.get("slowk_period", self._SLOWK_PERIOD))
-        slowd_period = int(p.get("slowd_period", self._SLOWD_PERIOD))
-        threshold = float(p.get("threshold", self._THRESHOLD))
-
-        _, slowd = talib.STOCH(
-            bars_3m["high"].astype(float).to_numpy(),
-            bars_3m["low"].astype(float).to_numpy(),
-            bars_3m["close"].astype(float).to_numpy(),
-            fastk_period=fastk_period,
-            slowk_period=slowk_period,
-            slowk_matype=0,
-            slowd_period=slowd_period,
-            slowd_matype=0,
-        )
-
-        if len(slowd) < 2:
-            trace.add_metric("slowd_count", len(slowd))
-            return finish("no_signal", "insufficient_slowd")
-
-        prev_d = float(slowd[-2])
-        current_d = float(slowd[-1])
-        trace.add_indicator("stoch_d_prior", prev_d, instrument=QQQ, timeframe="3m")
-        trace.add_indicator("stoch_d_current", current_d, instrument=QQQ, timeframe="3m")
-        trace.add_metric("fastk_period", fastk_period)
-        trace.add_metric("slowk_period", slowk_period)
-        trace.add_metric("slowd_period", slowd_period)
-        trace.add_metric("threshold", threshold)
-
-        crossed_up = (
-            np.isfinite(prev_d)
-            and np.isfinite(current_d)
-            and prev_d < threshold
-            and current_d > threshold
-        )
         trace.add_condition(
             "stoch_d_cross_above_threshold",
-            bool(crossed_up),
+            crossed_up,
             lhs={"prior": prev_d, "current": current_d},
             op="cross_above",
             rhs=threshold,

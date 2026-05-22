@@ -88,9 +88,13 @@ folder receives a numeric suffix such as `_2`.
 
 The default shared config uses quieter owner decision logging:
 
-- `strategy_trigger_<strategy_id>_<YYYYMMDD_HHMM>_et.csv` stores each trigger trace as a separate CSV file.
-- `strategy_30m_<strategy_id>_<YYYYMMDD_HHMM>_et.csv` stores one diagnostic trace per 30-minute wall-clock bucket.
-- `strategy_eval_<strategy_id>_<YYYYMMDD_HHMM>_et.csv` stores each evaluation when `logging.decision_scope: every_eval`.
+- `strategy_trigger_<strategy_id>_<YYYYMMDD_HHMM>_et/` stores each trigger trace as a folder of CSV files.
+- `strategy_30m_<strategy_id>_<YYYYMMDD_HHMM>_et/` stores one diagnostic trace per 30-minute wall-clock bucket.
+- `strategy_eval_<strategy_id>_<YYYYMMDD_HHMM>_et/` stores each evaluation when `logging.decision_scope: every_eval`.
+
+Each decision trace folder contains `decision.csv` plus optional per-timeframe
+table CSVs such as `qqq_3m.csv`. Strategy table CSVs use one row per bar,
+typically current bar plus the previous four bars.
 
 Signal, order, and fill audit files remain append-only:
 

@@ -7,6 +7,8 @@ import csv
 import logging
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
+
 from core import DataFeed, Engine, SimulatedClock
 from core.audit import AuditLogger, DecisionTrace, record_decision
 from core.adapters.dry_run import DryRunBroker
@@ -433,10 +435,9 @@ def test_engine_writes_strategy_decision_trace(tmp_path):
         audit_logger=audit,
     )
     engine.run_backtest()
-    csv_files = sorted(tmp_path.glob("strategy_eval__phase6_trace_*.csv"))
-    assert len(csv_files) == 2
-    assert not (tmp_path / "strategy_decisions.jsonl").exists()
-    with csv_files[0].open("r", encoding="utf-8", newline="") as fh:
+    decision_files = sorted(tmp_path.glob("strategy_eval__phase6_trace_*_et/decision.csv"))
+    assert len(decision_files) == 2
+    with decision_files[0].open("r", encoding="utf-8", newline="") as fh:
         row = next(csv.DictReader(fh))
     assert row["strategy_id"] == "_phase6_trace"
     assert row["condition_always_false"] == "False"
@@ -494,35 +495,27 @@ def test_audit_trigger_and_interval_decision_scope(tmp_path):
     )
 
     audit.decision(_full_decision_trace(datetime(2026, 5, 20, 14, 3, tzinfo=timezone.utc)))
-    first_interval_csv = tmp_path / "strategy_30m__phase6_trace_20260520_1000_et.csv"
-    assert first_interval_csv.exists()
-    first_csv = first_interval_csv.read_text(encoding="utf-8")
+    first_interval_dir = tmp_path / "strategy_30m__phase6_trace_20260520_1000_et"
+    assert first_interval_dir.exists()
+    first_csv = (first_interval_dir / "decision.csv").read_text(encoding="utf-8")
     assert "condition_stoch_d_cross_above_threshold" in first_csv
-    assert not list(tmp_path.glob("strategy_30m__phase6_trace_*.json"))
-    assert not list(tmp_path.glob("strategy_trigger__phase6_trace_*.json"))
-    assert not (tmp_path / "strategy_30m_latest__phase6_trace.json").exists()
-    assert not (tmp_path / "strategy_30m_latest__phase6_trace.csv").exists()
-    assert not (tmp_path / "strategy_decisions.jsonl").exists()
-    assert not (tmp_path / "strategy_trigger_decisions.jsonl").exists()
 
     audit.decision(_full_decision_trace(datetime(2026, 5, 20, 14, 15, tzinfo=timezone.utc)))
-    assert len(list(tmp_path.glob("strategy_30m__phase6_trace_*.csv"))) == 1
-    assert first_interval_csv.read_text(encoding="utf-8") == first_csv
+    assert len(list(tmp_path.glob("strategy_30m__phase6_trace_*_et"))) == 1
+    assert (first_interval_dir / "decision.csv").read_text(encoding="utf-8") == first_csv
 
     audit.decision(_full_decision_trace(
         datetime(2026, 5, 20, 14, 18, tzinfo=timezone.utc),
         decision="signal",
     ))
-    trigger_csv = tmp_path / "strategy_trigger__phase6_trace_20260520_1018_et.csv"
-    assert trigger_csv.exists()
-    assert not (tmp_path / "strategy_trigger_decisions.jsonl").exists()
-    assert not list(tmp_path.glob("strategy_trigger__phase6_trace_*.json"))
-    assert first_interval_csv.read_text(encoding="utf-8") == first_csv
+    trigger_dir = tmp_path / "strategy_trigger__phase6_trace_20260520_1018_et"
+    assert trigger_dir.exists()
+    assert (first_interval_dir / "decision.csv").read_text(encoding="utf-8") == first_csv
 
     audit.decision(_full_decision_trace(datetime(2026, 5, 20, 14, 31, tzinfo=timezone.utc)))
-    second_interval_csv = tmp_path / "strategy_30m__phase6_trace_20260520_1030_et.csv"
-    assert second_interval_csv.exists()
-    second_csv = second_interval_csv.read_text(encoding="utf-8")
+    second_interval_dir = tmp_path / "strategy_30m__phase6_trace_20260520_1030_et"
+    assert second_interval_dir.exists()
+    second_csv = (second_interval_dir / "decision.csv").read_text(encoding="utf-8")
     assert second_csv != first_csv
     assert "2026-05-20T10:31:00-04:00" in second_csv
 
@@ -586,9 +579,9 @@ def test_audit_interval_csv_flattens_multitimeframe_trace(tmp_path):
 
     audit.decision(trace)
 
-    csv_path = tmp_path / "strategy_30m__phase6_multi_tf_20260520_1000_et.csv"
-    assert csv_path.exists()
-    with csv_path.open("r", encoding="utf-8", newline="") as fh:
+    trace_dir = tmp_path / "strategy_30m__phase6_multi_tf_20260520_1000_et"
+    assert trace_dir.exists()
+    with (trace_dir / "decision.csv").open("r", encoding="utf-8", newline="") as fh:
         row = next(csv.DictReader(fh))
 
     assert list(row)[:5] == ["eval_datetime_et", "strategy_id", "phase", "decision", "reason"]
@@ -609,7 +602,124 @@ def test_audit_interval_csv_flattens_multitimeframe_trace(tmp_path):
     assert row["reason"] == "mtf_alignment_failed"
 
 
-def test_audit_trigger_csv_files_do_not_overwrite(tmp_path):
+def test_audit_decision_trace_writes_5_row_table_snapshot(tmp_path):
+    audit = AuditLogger(
+        log_dir=tmp_path,
+        decision_scope="trigger_and_interval",
+        decision_interval_minutes=30,
+    )
+    trace = DecisionTrace(
+        phase="entry",
+        strategy_id="_phase6_table",
+        timestamp=datetime(2026, 5, 20, 14, 15, tzinfo=timezone.utc),
+    )
+    index = pd.date_range("2026-05-20T14:03:00+00:00", periods=5, freq="3min")
+    frame = pd.DataFrame(
+        {
+            "open": [100.11111, 101.0, 102.0, 103.0, 104.0],
+            "high": [101.0, 102.0, 103.0, 104.0, 105.0],
+            "low": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "close": [100.5, 101.5, 102.5, 103.5, 104.5],
+            "volume": [1000, 1100, 1200, 1300, 1400],
+            "stoch_d": [18.0, 19.0, 19.5, 20.5, 21.123456],
+            "condition_stoch_d_cross_above_threshold": [False, False, False, True, False],
+        },
+        index=index,
+    )
+    trace.add_bar("qqq_3m_current", QQQ, "3m", frame.iloc[-1])
+    trace.add_table("qqq_3m", QQQ, "3m", frame)
+    trace.add_indicator("stoch_d_current", 21.123456, instrument=QQQ, timeframe="3m")
+    trace.add_condition("stoch_d_cross_above_threshold", False)
+    trace.set_decision("no_signal", reason="stoch_d_not_crossed")
+
+    audit.decision(trace)
+
+    trace_dir = tmp_path / "strategy_30m__phase6_table_20260520_1000_et"
+    with (trace_dir / "qqq_3m.csv").open("r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+
+    assert len(rows) == 5
+    assert rows[0]["time"] == "2026-05-20T10:03:00-04:00"
+    assert rows[0]["bar_offset"] == "-4"
+    assert rows[-1]["bar_offset"] == "0"
+    assert rows[-1]["stoch_d"] == "21.1235"
+    assert rows[-2]["condition_stoch_d_cross_above_threshold"] == "True"
+
+
+def test_audit_interval_accepts_table_only_decision_detail(tmp_path):
+    audit = AuditLogger(
+        log_dir=tmp_path,
+        decision_scope="trigger_and_interval",
+        decision_interval_minutes=30,
+    )
+    trace = DecisionTrace(
+        phase="entry",
+        strategy_id="_phase6_table_only",
+        timestamp=datetime(2026, 5, 20, 14, 15, tzinfo=timezone.utc),
+    )
+    trace.add_table(
+        "qqq_3m",
+        QQQ,
+        "3m",
+        [
+            {
+                "timestamp": "2026-05-20T14:15:00+00:00",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "condition_entry": False,
+            }
+        ],
+    )
+    trace.add_condition("entry", False)
+    trace.set_decision("no_signal", reason="entry_failed")
+
+    audit.decision(trace)
+
+    trace_dir = tmp_path / "strategy_30m__phase6_table_only_20260520_1000_et"
+    assert (trace_dir / "decision.csv").exists()
+    assert (trace_dir / "qqq_3m.csv").exists()
+
+
+def test_audit_csv_naive_datetimes_are_marked_et(tmp_path):
+    audit = AuditLogger(log_dir=tmp_path, decision_scope="every_eval")
+    trace = DecisionTrace(
+        phase="entry",
+        strategy_id="_phase6_naive_time",
+        timestamp=datetime(2026, 5, 20, 10, 15),
+    )
+    trace.add_bar(
+        "qqq_3m_current",
+        QQQ,
+        "3m",
+        {
+            "timestamp": datetime(2026, 5, 20, 10, 15),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1000.0,
+        },
+    )
+    trace.add_condition("entry", False)
+    trace.set_decision("no_signal", reason="entry_failed")
+
+    audit.decision(trace)
+
+    with (tmp_path / "strategy_eval__phase6_naive_time_20260520_1015_et" / "decision.csv").open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as fh:
+        row = next(csv.DictReader(fh))
+
+    assert row["eval_datetime_et"] == "2026-05-20T10:15:00-04:00"
+    assert row["qqq_3m_current_datetime_et"] == "2026-05-20T10:15:00-04:00"
+
+
+def test_audit_trigger_trace_dirs_do_not_overwrite(tmp_path):
     audit = AuditLogger(log_dir=tmp_path, decision_scope="trigger_and_interval")
     audit.decision(_full_decision_trace(
         datetime(2026, 5, 20, 14, 3, tzinfo=timezone.utc),
@@ -620,10 +730,8 @@ def test_audit_trigger_csv_files_do_not_overwrite(tmp_path):
         decision="signal",
     ))
 
-    assert not (tmp_path / "strategy_trigger_decisions.jsonl").exists()
-    assert not list(tmp_path.glob("strategy_trigger__phase6_trace_*.json"))
-    assert (tmp_path / "strategy_trigger__phase6_trace_20260520_1003_et.csv").exists()
-    assert (tmp_path / "strategy_trigger__phase6_trace_20260520_1003_et_2.csv").exists()
+    assert (tmp_path / "strategy_trigger__phase6_trace_20260520_1003_et").exists()
+    assert (tmp_path / "strategy_trigger__phase6_trace_20260520_1003_et_2").exists()
 
 
 def test_order_manager_writes_order_and_fill_audit(tmp_path):

@@ -33,6 +33,7 @@ class DecisionTrace:
             "strategy_id": strategy_id,
             "timestamp": timestamp,
             "bars": {},
+            "tables": {},
             "indicators": {},
             "conditions": [],
             "metrics": {},
@@ -73,6 +74,23 @@ class DecisionTrace:
             "instrument": to_jsonable(instrument),
             "timeframe": timeframe,
             "ohlcv": data,
+        }
+
+    def add_table(
+        self,
+        label: str,
+        instrument: Instrument,
+        timeframe: str,
+        frame: pd.DataFrame | list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    ) -> None:
+        if isinstance(frame, pd.DataFrame):
+            rows = [series_to_record(row) for _, row in frame.iterrows()]
+        else:
+            rows = [to_jsonable(row) for row in frame]
+        self._event["tables"][label] = {
+            "instrument": to_jsonable(instrument),
+            "timeframe": timeframe,
+            "rows": rows,
         }
 
     def add_indicator(

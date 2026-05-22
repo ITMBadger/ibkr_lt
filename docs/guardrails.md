@@ -67,10 +67,10 @@ When `logging.enabled=true`, the runtime creates a per-run folder under the conf
 
 Decision logging is controlled by `logging.decision_scope`:
 
-- `every_eval`: write each strategy decision trace to `strategy_eval_<strategy_id>_<YYYYMMDD_HHMM>_et.csv`.
-- `trigger_and_interval`: write per-trigger CSV files named `strategy_trigger_<strategy_id>_<YYYYMMDD_HHMM>_et.csv` and per-interval CSV files named `strategy_<N>m_<strategy_id>_<YYYYMMDD_HHMM>_et.csv`.
+- `every_eval`: write each strategy decision trace folder as `strategy_eval_<strategy_id>_<YYYYMMDD_HHMM>_et/`.
+- `trigger_and_interval`: write per-trigger trace folders named `strategy_trigger_<strategy_id>_<YYYYMMDD_HHMM>_et/` and per-interval trace folders named `strategy_<N>m_<strategy_id>_<YYYYMMDD_HHMM>_et/`.
 
-The shared deployment config uses `trigger_and_interval` with `decision_interval_minutes: 30` to avoid minute-by-minute live log noise while preserving full trigger traces and one historical diagnostic snapshot per 30-minute wall-clock bucket. Duplicate files in the same minute receive a numeric suffix rather than overwriting.
+The shared deployment config uses `trigger_and_interval` with `decision_interval_minutes: 30` to avoid minute-by-minute live log noise while preserving full trigger traces and one historical diagnostic snapshot per 30-minute wall-clock bucket. Duplicate trace folders in the same minute receive a numeric suffix rather than overwriting. Each trace folder contains `decision.csv` plus optional per-timeframe table CSVs, typically current bar plus the previous four bars.
 
 Signal, order, and fill logs remain append-only: `signals.jsonl`, `orders.jsonl`, and `fills.jsonl`.
 

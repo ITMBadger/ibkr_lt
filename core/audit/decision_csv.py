@@ -1,9 +1,10 @@
-"""Flatten decision events into one-row CSV records."""
+"""Convert decision events into CSV records."""
 
 from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -87,8 +88,63 @@ def flatten_decision_event(event: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def decision_table_csvs(event: dict[str, Any]) -> list[tuple[str, list[dict[str, Any]]]]:
+    tables = event.get("tables")
+    if not isinstance(tables, dict):
+        return []
+    out: list[tuple[str, list[dict[str, Any]]]] = []
+    for label, table in tables.items():
+        if not isinstance(table, dict):
+            continue
+        rows = table.get("rows")
+        if not isinstance(rows, list):
+            continue
+        instrument = table.get("instrument")
+        symbol = instrument.get("symbol") if isinstance(instrument, dict) else None
+        timeframe = table.get("timeframe")
+        csv_rows = _table_rows(rows, symbol=symbol, timeframe=timeframe)
+        if csv_rows:
+            out.append((f"{_token(label)}.csv", csv_rows))
+    return out
+
+
+def csv_fieldnames(rows: Iterable[dict[str, Any]]) -> list[str]:
+    fields: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
+    return fields
+
+
 def _set(row: dict[str, Any], key: str, value: Any) -> None:
     row[key] = _csv_cell(value)
+
+
+def _table_rows(rows: list[Any], *, symbol: Any, timeframe: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    last_index = len(rows) - 1
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        csv_row: dict[str, Any] = {}
+        timestamp = row.get("timestamp", row.get("time"))
+        _set(csv_row, "time", _format_datetime_et(timestamp))
+        _set(csv_row, "symbol", row.get("symbol", symbol))
+        _set(csv_row, "timeframe", row.get("timeframe", timeframe))
+        _set(csv_row, "bar_offset", row.get("bar_offset", idx - last_index))
+        for key in ("open", "high", "low", "close", "volume"):
+            if key in row:
+                _set(csv_row, key, row.get(key))
+        for key, value in row.items():
+            norm_key = _token(key)
+            if norm_key in {"timestamp", "time", "symbol", "timeframe", "bar_offset", "open", "high", "low", "close", "volume"}:
+                continue
+            _set(csv_row, norm_key, value)
+        out.append(csv_row)
+    return out
 
 
 def _csv_cell(value: Any) -> Any:
@@ -119,6 +175,7 @@ def _format_datetime_et(value: Any) -> Any:
     else:
         return value
     if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_CSV_TZ)
         return dt.isoformat()
     return dt.astimezone(_CSV_TZ).isoformat()
 
