@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from core.engine.timeframes import Timeframe
 from core.exceptions import ConfigError
 from core.path_utils import normalize_local_path
 from core.orders.strategy_modes import (
@@ -39,6 +40,11 @@ class BacktestSettings:
     rth_only: bool
     market_open: str
     market_close: str
+    mode: str = "event"
+    evaluation_timeframe: str | None = None
+    progress_enabled: bool = True
+    progress_interval_bars: int = 1000
+    progress_interval_seconds: float = 30.0
 
 
 def load_yaml_config(path: str | Path) -> dict[str, Any]:
@@ -92,6 +98,22 @@ def resolve_settings(
         )
 
     backtest_cfg = dict(config.get("backtest") or {})
+    progress_cfg = dict(backtest_cfg.get("progress") or {})
+    mode = normalize_backtest_mode(
+        getattr(args, "mode", None)
+        or backtest_cfg.get("mode", "event")
+    )
+    evaluation_timeframe = (
+        getattr(args, "eval_timeframe", None)
+        or backtest_cfg.get("evaluation_timeframe")
+    )
+    if evaluation_timeframe:
+        try:
+            evaluation_timeframe = Timeframe.parse(str(evaluation_timeframe)).label
+        except ValueError as exc:
+            raise ConfigError(
+                f"Invalid backtest evaluation timeframe: {evaluation_timeframe!r}"
+            ) from exc
     logging_cfg = dict(config.get("logging") or {})
     audit_enabled = bool(logging_cfg.get("enabled", True))
     output_dir = normalize_local_path(
@@ -126,7 +148,33 @@ def resolve_settings(
         rth_only=bool(historical_cfg.get("rth_only", True)),
         market_open=str(historical_cfg.get("market_open", "09:30")),
         market_close=str(historical_cfg.get("market_close", "16:00")),
+        mode=mode,
+        evaluation_timeframe=evaluation_timeframe,
+        progress_enabled=(
+            not bool(getattr(args, "no_progress", False))
+            and bool(progress_cfg.get("enabled", True))
+        ),
+        progress_interval_bars=int(
+            getattr(args, "progress_interval_bars", None)
+            if getattr(args, "progress_interval_bars", None) is not None
+            else progress_cfg.get("interval_bars", 1000)
+        ),
+        progress_interval_seconds=float(
+            getattr(args, "progress_interval_seconds", None)
+            if getattr(args, "progress_interval_seconds", None) is not None
+            else progress_cfg.get("interval_seconds", 30.0)
+        ),
     )
+
+
+def normalize_backtest_mode(value: str) -> str:
+    normalized = str(value or "event").strip().lower().replace("_", "-")
+    if normalized not in {"event", "fast-event"}:
+        raise ConfigError(
+            "Backtest mode must be 'event' or 'fast-event'; "
+            f"got {value!r}"
+        )
+    return normalized
 
 
 def resolve_strategy_ids(

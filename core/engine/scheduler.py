@@ -9,13 +9,14 @@ strategies whose primary_instrument matches, builds a MarketContext
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import pandas as pd
 
 from ..data.manager import DataManager
 from ..features.registry import FeatureRegistry
-from .timeframes import Timeframe
+from .timeframes import TF_1D, TF_1M, Timeframe
 from ..interfaces.strategy import StrategyKernel, StrategySpec
 from ..types import Bar, Instrument, MarketContext
 
@@ -53,6 +54,7 @@ class Scheduler:
         self,
         bar: Bar,
         managers: dict[Instrument, DataManager],
+        include: Callable[[StrategyKernel, dict], bool] | None = None,
     ) -> list[tuple[StrategyKernel, MarketContext, dict]]:
         """Return (kernel, ctx, state) for all strategies matching bar.instrument."""
         matching = self._by_primary.get(bar.instrument, [])
@@ -62,6 +64,8 @@ class Scheduler:
         result = []
         for kernel, state in matching:
             spec = kernel.SPEC
+            if include is not None and not include(kernel, state):
+                continue
             if not self._warmup_satisfied(spec, managers):
                 continue
             ctx = self._build_context(bar, spec, managers)
@@ -77,16 +81,28 @@ class Scheduler:
         spec: StrategySpec,
         managers: dict[Instrument, DataManager],
     ) -> bool:
+        dm = managers.get(spec.primary_instrument)
+        if dm is None:
+            return False
+        one_minute_count = dm.bar_count()
+        session_count = None
         for tf_label, min_bars in spec.warmup_bars.items():
-            dm = managers.get(spec.primary_instrument)
-            if dm is None:
-                return False
+            if min_bars <= 0:
+                continue
             try:
                 tf = Timeframe.parse(tf_label)
-                bars = dm.resampled(tf)
             except Exception:
-                bars = dm.bars_1m()
-            if len(bars) < min_bars:
+                tf = TF_1M
+            if tf.seconds <= TF_1M.seconds:
+                available = max(0, one_minute_count - 1)
+            elif tf.seconds >= TF_1D.seconds:
+                if session_count is None:
+                    session_count = dm.session_count()
+                available = session_count
+            else:
+                bars_per_window = max(1, (tf.seconds + TF_1M.seconds - 1) // TF_1M.seconds)
+                available = max(0, one_minute_count - 1) // bars_per_window
+            if available < min_bars:
                 return False
         return True
 
@@ -105,24 +121,15 @@ class Scheduler:
             if dm is None:
                 bars_map[instr] = {}
                 continue
-            tf_map: dict[str, pd.DataFrame] = {}
-            tf_map["1m"] = dm.bars_1m()
-            for tf_label in spec.timeframes:
-                if tf_label == "1m":
-                    continue
-                try:
-                    tf = Timeframe.parse(tf_label)
-                    tf_map[tf_label] = dm.resampled(tf)
-                except Exception:
-                    pass
-            bars_map[instr] = tf_map
+            bars_map[instr] = _LazyTimeframeBars(dm, spec.timeframes)
 
         # Pre-compute declared indicators
         indicators: dict[str, Any] = {}
+        feature_view = self._features.as_of(bar.timestamp) if self._features is not None else None
         if self._features is not None:
             for indicator_id in spec.indicators:
                 try:
-                    indicators[indicator_id] = self._features.get_id(indicator_id)
+                    indicators[indicator_id] = feature_view.get_id(indicator_id)
                 except Exception as e:
                     log.debug("Could not compute indicator %s: %s", indicator_id, e)
 
@@ -131,5 +138,43 @@ class Scheduler:
             timestamp=bar.timestamp,
             bars=bars_map,
             indicators=indicators,
-            features=self._features,
+            features=feature_view,
         )
+
+
+class _LazyTimeframeBars(dict):
+    """Mapping that loads timeframe DataFrames only when a strategy asks."""
+
+    def __init__(self, manager: DataManager, declared_timeframes: tuple[str, ...]) -> None:
+        super().__init__()
+        self._manager = manager
+        self._allowed = {"1m", *declared_timeframes}
+
+    def __contains__(self, key: object) -> bool:
+        return str(key) in self._allowed
+
+    def __getitem__(self, key: str) -> pd.DataFrame:
+        label = str(key)
+        if label not in self._allowed:
+            raise KeyError(label)
+        if not dict.__contains__(self, label):
+            dict.__setitem__(self, label, self._load(label))
+        return dict.__getitem__(self, label)
+
+    def get(self, key: str, default=None):
+        label = str(key)
+        if label not in self._allowed:
+            return default
+        try:
+            return self[label]
+        except Exception:
+            return default
+
+    def keys(self):
+        return self._allowed
+
+    def _load(self, label: str) -> pd.DataFrame:
+        if label == "1m":
+            return self._manager.bars_1m()
+        tf = Timeframe.parse(label)
+        return self._manager.resampled(tf)

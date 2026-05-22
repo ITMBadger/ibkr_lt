@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from core.adapters.csv.data import CSVDataProvider
-from core.engine.timeframes import TF_1M
+from core.engine.timeframes import TF_1D, TF_1M, Timeframe
 from core.exceptions import ConfigError
 from core.interfaces.strategy import StrategyKernel
 from core.types import Bar, Instrument
@@ -34,6 +34,46 @@ def required_instruments(
         for ref in spec.reference_instruments:
             instruments.setdefault(ref, None)
     return sorted(instruments, key=lambda item: (item.symbol, item.asset_class))
+
+
+def resolve_evaluation_timeframes(
+    strategies: Iterable[tuple[StrategyKernel, dict]],
+    override: str | None = None,
+) -> dict[str, str]:
+    """Pick the bar interval used to throttle fast-event entry evaluations."""
+    if override:
+        parsed = Timeframe.parse(str(override))
+        return {
+            kernel.SPEC.id: parsed.label
+            for kernel, _ in strategies
+        }
+
+    resolved: dict[str, str] = {}
+    for kernel, _ in strategies:
+        spec = kernel.SPEC
+        strategy_bar_size = getattr(kernel, "_BAR_SIZE", None)
+        strategy_timeframe = None
+        if isinstance(strategy_bar_size, str):
+            try:
+                strategy_timeframe = Timeframe.parse(strategy_bar_size)
+            except ValueError:
+                strategy_timeframe = None
+        if (
+            strategy_timeframe is not None
+            and strategy_bar_size in spec.timeframes
+            and strategy_timeframe.seconds > TF_1M.seconds
+        ):
+            resolved[spec.id] = strategy_timeframe.label
+            continue
+
+        candidates: list[tuple[int, str]] = []
+        for label in spec.timeframes:
+            timeframe = Timeframe.parse(label)
+            if TF_1M.seconds < timeframe.seconds < TF_1D.seconds:
+                candidates.append((timeframe.seconds, timeframe.label))
+        if candidates:
+            resolved[spec.id] = min(candidates)[1]
+    return resolved
 
 
 def validate_csv_path(csv_path: Path, instruments: Iterable[Instrument]) -> None:

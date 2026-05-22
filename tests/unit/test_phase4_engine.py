@@ -7,8 +7,9 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
 
-from core.types import Fill, Instrument, Signal
+from core.types import Bar, Fill, Instrument, Signal
 from core.engine.timeframes import TF_1M
+from core.engine.scheduler import Scheduler
 from core.data.manager import DataManager
 from core.features.indicators import (
     ema, sma, rsi, macd, stoch, atr, bollinger_bands,
@@ -19,7 +20,13 @@ from core.features.registry import FeatureRegistry
 from core.risk.policy import RiskPolicy
 from core.portfolio.state import PortfolioState
 from core.engine.loader import register_strategy, get_registry, _registry
-from core.interfaces.strategy import StrategyKernel, StrategySpec
+from core.interfaces.strategy import (
+    ENTRY_FREQUENCY_UNLIMITED,
+    POSITION_MODE_SINGLE,
+    PositionPolicy,
+    StrategyKernel,
+    StrategySpec,
+)
 
 QQQ = Instrument(asset_class="equity", symbol="QQQ")
 SPY = Instrument(asset_class="equity", symbol="SPY")
@@ -120,7 +127,7 @@ class TestFeatureRegistry:
     def setup_method(self):
         self.qqq_dm = DataManager(QQQ, lookback_days=10)
         self.spy_dm = DataManager(SPY, lookback_days=10)
-        base = datetime(2026, 4, 29, 13, 30, tzinfo=timezone.utc)
+        self.base = datetime(2026, 4, 29, 13, 30, tzinfo=timezone.utc)
         from core.types import Bar
         for i in range(60):
             for instrument, manager, offset in (
@@ -130,7 +137,7 @@ class TestFeatureRegistry:
                 manager.on_bar(Bar(
                     instrument=instrument,
                     timeframe=TF_1M,
-                    timestamp=base + timedelta(minutes=i),
+                    timestamp=self.base + timedelta(minutes=i),
                     open=100.0 + offset + i * 0.01,
                     high=101.0 + offset + i * 0.01,
                     low=99.0 + offset + i * 0.01,
@@ -181,6 +188,126 @@ class TestFeatureRegistry:
         assert len(result) == 61
         assert self.registry.compute_count("ema", QQQ, "1m", period=20) == 2
 
+    def test_preloaded_source_slices_1m_without_recompute(self):
+        self.registry.preload_from_managers()
+
+        first = self.registry.as_of(
+            self.base + timedelta(minutes=10)
+        ).get("ema", QQQ, "1m", period=20)
+        second = self.registry.as_of(
+            self.base + timedelta(minutes=20)
+        ).get("ema", QQQ, "1m", period=20)
+
+        assert len(first) == 11
+        assert len(second) == 21
+        assert self.registry.compute_count("ema", QQQ, "1m", period=20) == 1
+
+    def test_preloaded_source_slices_resampled_bars_without_lookahead(self):
+        self.registry.preload_from_managers()
+
+        at_first_complete = self.registry.as_of(
+            self.base + timedelta(minutes=3)
+        ).get("ema", QQQ, "3m", period=2)
+        before_next_complete = self.registry.as_of(
+            self.base + timedelta(minutes=5)
+        ).get("ema", QQQ, "3m", period=2)
+        at_next_complete = self.registry.as_of(
+            self.base + timedelta(minutes=6)
+        ).get("ema", QQQ, "3m", period=2)
+
+        assert len(at_first_complete) == 1
+        assert len(before_next_complete) == 1
+        assert len(at_next_complete) == 2
+        assert self.registry.compute_count("ema", QQQ, "3m", period=2) == 1
+
+    def test_preloaded_source_merges_new_stream_bar(self):
+        self.registry.preload_from_managers()
+        self.registry.as_of(
+            self.base + timedelta(minutes=59)
+        ).get("ema", QQQ, "1m", period=20)
+
+        from core.types import Bar
+        self.registry.on_bar(Bar(
+            instrument=QQQ,
+            timeframe=TF_1M,
+            timestamp=self.base + timedelta(minutes=60),
+            open=102.0,
+            high=103.0,
+            low=101.0,
+            close=102.5,
+            volume=1200.0,
+            is_closed=True,
+            source="test",
+        ))
+        result = self.registry.as_of(
+            self.base + timedelta(minutes=60)
+        ).get("ema", QQQ, "1m", period=20)
+
+        assert len(result) == 61
+        assert self.registry.compute_count("ema", QQQ, "1m", period=20) == 2
+
+    def test_preloaded_replay_bar_keeps_vectorized_cache(self):
+        self.registry.preload_from_managers()
+        self.registry.as_of(
+            self.base + timedelta(minutes=10)
+        ).get("ema", QQQ, "1m", period=20)
+
+        from core.types import Bar
+        self.registry.on_bar(Bar(
+            instrument=QQQ,
+            timeframe=TF_1M,
+            timestamp=self.base + timedelta(minutes=11),
+            open=100.11,
+            high=101.11,
+            low=99.11,
+            close=100.61,
+            volume=1000.0,
+            is_closed=True,
+            source="replay",
+        ))
+        self.registry.as_of(
+            self.base + timedelta(minutes=20)
+        ).get("ema", QQQ, "1m", period=20)
+
+        assert self.registry.compute_count("ema", QQQ, "1m", period=20) == 1
+
+    def test_scheduler_legacy_indicators_use_timestamp_bound_features(self):
+        self.registry.preload_from_managers()
+
+        class _IndicatorStrategy(StrategyKernel):
+            SPEC = StrategySpec(
+                id="_indicator_slice",
+                primary_instrument=QQQ,
+                execution_instrument=MNQ,
+                indicators=("ema_20@QQQ.1m",),
+            )
+
+            def generate(self, ctx, state):
+                return None
+
+        scheduler = Scheduler(self.registry)
+        scheduler.register(_IndicatorStrategy(), {})
+        results = scheduler.on_bar(
+            Bar(
+                instrument=QQQ,
+                timeframe=TF_1M,
+                timestamp=self.base + timedelta(minutes=10),
+                open=100.1,
+                high=101.1,
+                low=99.1,
+                close=100.6,
+                volume=1000.0,
+                is_closed=True,
+                source="test",
+            ),
+            {QQQ: self.qqq_dm},
+        )
+
+        assert len(results) == 1
+        _, ctx, _ = results[0]
+        assert len(ctx.indicators["ema_20@QQQ.1m"]) == 11
+        assert len(ctx.features.get("ema", QQQ, "1m", period=20)) == 11
+
 
 # ---------------------------------------------------------------------------
 # RiskPolicy
@@ -223,6 +350,29 @@ class TestRiskPolicy:
 # ---------------------------------------------------------------------------
 # Strategy loader
 # ---------------------------------------------------------------------------
+
+class TestStrategySpecPolicy:
+    def test_default_position_policy_is_single_unlimited(self):
+        spec = StrategySpec(
+            id="_policy_default",
+            primary_instrument=QQQ,
+            execution_instrument=MNQ,
+        )
+
+        assert spec.position_policy.position_mode == POSITION_MODE_SINGLE
+        assert spec.position_policy.entry_frequency == ENTRY_FREQUENCY_UNLIMITED
+        assert spec.position_policy.max_concurrent_positions == 1
+
+    def test_position_policy_rejects_invalid_values(self):
+        with pytest.raises(ValueError):
+            PositionPolicy(position_mode="bad")  # type: ignore[arg-type]
+
+        with pytest.raises(ValueError):
+            PositionPolicy(entry_frequency="bad")  # type: ignore[arg-type]
+
+        with pytest.raises(ValueError):
+            PositionPolicy(max_concurrent_positions=0)
+
 
 class TestStrategyLoader:
     def test_register_strategy_decorator(self):

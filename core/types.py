@@ -77,6 +77,7 @@ class Signal:
 
     instrument: Instrument  # execution instrument
     side: Literal["long", "short", "flat"]
+    trade_id: str | None = None  # optional logical lot id for multi-position use
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,7 @@ class Position:
     instrument: Instrument
     quantity: float
     avg_cost: float
+    trade_id: str | None = None
 
     @property
     def side(self) -> str:

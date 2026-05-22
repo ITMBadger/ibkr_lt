@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import defaultdict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 from ..audit.serialize import to_jsonable
 from ..data.bar_builder import BarBuilder
@@ -28,11 +31,17 @@ from ..orders.order_manager import OrderManager
 from ..orders.strategy_modes import strategy_mode_map
 from ..features.registry import FeatureRegistry
 from ..audit import AuditLogger, pop_decision
-from .timeframes import TF_1M, TF_5S
+from .timeframes import TF_1M, TF_5S, Timeframe
 from ..portfolio.state import PortfolioState
-from ..interfaces.strategy import StrategyKernel
+from ..interfaces.strategy import (
+    ENTRY_FREQUENCY_ONE_PER_DAY,
+    ENTRY_FREQUENCY_ONE_PER_SESSION,
+    ENTRY_FREQUENCY_UNLIMITED,
+    POSITION_MODE_MULTI,
+    StrategyKernel,
+)
 from ..risk.policy import RiskPolicy
-from ..types import Instrument, Position, Signal
+from ..types import Bar, Instrument, Position
 from .clock import Clock, SimulatedClock, WallClock
 from .scheduler import Scheduler
 
@@ -43,6 +52,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _ORDER_TASK_YIELD_SECONDS = 0.001
+_DISPATCH_MODE_EVENT = "event"
+_DISPATCH_MODE_FAST_EVENT = "fast_event"
 
 
 class Engine:
@@ -66,6 +77,13 @@ class Engine:
         adopted_position_map: dict[Instrument, str] | None = None,
         audit_logger: AuditLogger | None = None,
         strategy_modes: Mapping[str, str] | None = None,
+        dispatch_mode: str = _DISPATCH_MODE_EVENT,
+        evaluation_timeframes: Mapping[str, str] | None = None,
+        feature_preload_bars: list[Bar] | None = None,
+        progress_enabled: bool = False,
+        progress_total_bars: int | None = None,
+        progress_interval_bars: int = 1000,
+        progress_interval_seconds: float = 30.0,
     ) -> None:
         self._broker = broker
         if data_feed is not None:
@@ -78,6 +96,17 @@ class Engine:
         self._strategies = strategies or []
         strategy_ids = [kernel.SPEC.id for kernel, _ in self._strategies]
         self._strategy_modes = strategy_mode_map(strategy_modes, strategy_ids)
+        self._dispatch_mode = _normalize_dispatch_mode(dispatch_mode)
+        self._evaluation_timeframes = _normalize_evaluation_timeframes(
+            evaluation_timeframes
+        )
+        self._feature_preload_bars = list(feature_preload_bars or [])
+        self._progress = _EngineProgress(
+            enabled=progress_enabled,
+            total_bars=progress_total_bars,
+            interval_bars=progress_interval_bars,
+            interval_seconds=progress_interval_seconds,
+        )
         self._risk = risk or RiskPolicy()
         self._pool_workers = thread_pool_workers
         self._lookback_days = lookback_days
@@ -156,10 +185,17 @@ class Engine:
                         "timeframes": list(kernel.SPEC.timeframes),
                         "warmup_bars": dict(kernel.SPEC.warmup_bars),
                         "protective_stop": to_jsonable(kernel.SPEC.protective_stop),
+                        "position_policy": to_jsonable(kernel.SPEC.position_policy),
                         "mode": self._strategy_modes.get(kernel.SPEC.id, "live"),
+                        "evaluation_timeframe": (
+                            self._evaluation_timeframes[kernel.SPEC.id].label
+                            if kernel.SPEC.id in self._evaluation_timeframes
+                            else None
+                        ),
                     }
                     for kernel, _ in self._strategies
                 ],
+                "dispatch_mode": self._dispatch_mode,
                 "risk": {
                     "position_size_shares": self._risk.position_size_shares,
                     "max_order_quantity": self._risk.max_order_quantity,
@@ -173,8 +209,15 @@ class Engine:
                 {"strategy_id": sid, "position": to_jsonable(position)}
                 for sid, position in portfolio.strategy_positions()
             ] if portfolio is not None else [],
+            "strategy_lots": [
+                {"strategy_id": sid, "position": to_jsonable(position)}
+                for sid, position in portfolio.strategy_position_lots()
+            ] if portfolio is not None else [],
             "net_liquidation": portfolio.net_liquidation() if portfolio is not None else 0.0,
         }
+        progress = self._progress.snapshot()
+        if progress:
+            state["progress"] = progress
         return state
 
     # ------------------------------------------------------------------
@@ -188,6 +231,7 @@ class Engine:
             stopped_at=None,
             last_error=None,
         )
+        self._progress.start()
         loop = asyncio.get_running_loop()
         is_simulated = isinstance(self._clock, SimulatedClock)
 
@@ -211,11 +255,20 @@ class Engine:
         features = FeatureRegistry(managers)
         bar_builders: dict[Instrument, BarBuilder] = {}
 
+        self._progress.info(
+            "Engine setup starting strategies=%s dispatch_mode=%s progress_total_bars=%s",
+            [kernel.SPEC.id for kernel, _ in self._strategies],
+            self._dispatch_mode,
+            self._progress.total_bars,
+        )
+
         # Connect broker
+        setup_t0 = time.perf_counter()
         await self._broker.connect()
         self._set_runtime_state(broker_connected=True)
         await self._data_feed.connect()
         self._set_runtime_state(data_connected=True)
+        self._progress.add_timing("setup_connect", time.perf_counter() - setup_t0)
 
         # Portfolio state and order manager
         portfolio = PortfolioState()
@@ -239,6 +292,10 @@ class Engine:
             for kernel, _ in self._strategies
             if kernel.SPEC.protective_stop is not None
         }
+        position_policies = {
+            kernel.SPEC.id: kernel.SPEC.position_policy
+            for kernel, _ in self._strategies
+        }
         order_manager = OrderManager(
             self._broker,
             portfolio,
@@ -246,6 +303,7 @@ class Engine:
             self._audit,
             protective_stops=protective_stops,
             strategy_modes=self._strategy_modes,
+            position_policies=position_policies,
         )
 
         # Backfill historical data. Split feeds may load offline history first
@@ -256,8 +314,19 @@ class Engine:
         start = end - timedelta(days=self._lookback_days)
         for instr, dm in managers.items():
             try:
+                fetch_t0 = time.perf_counter()
+                self._progress.info(
+                    "Backfill fetch starting instrument=%s lookback_days=%d start=%s end=%s",
+                    instr.symbol,
+                    self._lookback_days,
+                    start.isoformat(),
+                    end.isoformat(),
+                )
                 bars = await self._data_feed.fetch(instr, TF_1M, start, end)
+                self._progress.add_timing("setup_backfill_fetch", time.perf_counter() - fetch_t0)
+                merge_t0 = time.perf_counter()
                 dm.merge_backfill(bars)
+                self._progress.add_timing("setup_backfill_merge", time.perf_counter() - merge_t0)
                 log.info("Backfilled %d bars for %s", len(bars), instr.symbol)
                 self._record_event(
                     "data",
@@ -274,8 +343,21 @@ class Engine:
                     error=str(e),
                 )
 
+        preload_t0 = time.perf_counter()
+        features.preload_from_managers()
+        self._progress.add_timing("setup_feature_preload_managers", time.perf_counter() - preload_t0)
+        if self._feature_preload_bars:
+            preload_t0 = time.perf_counter()
+            features.preload_bars(self._feature_preload_bars)
+            self._progress.add_timing("setup_feature_preload_replay", time.perf_counter() - preload_t0)
+            self._progress.info(
+                "Feature replay preload complete bars=%d",
+                len(self._feature_preload_bars),
+            )
+
         # Subscribe streaming
         for instr in all_instruments:
+            subscribe_t0 = time.perf_counter()
             native_tfs = self._data_feed.capabilities.native_timeframes
             if native_tfs and TF_5S in native_tfs:
                 # IBKR: subscribe at 5s, build 1m
@@ -285,6 +367,7 @@ class Engine:
                 # Replay / moomoo: subscribe at 1m directly
                 await self._data_feed.subscribe(instr, TF_1M)
             self._record_event("data", "subscribed", instrument=instr.symbol)
+            self._progress.add_timing("setup_subscribe", time.perf_counter() - subscribe_t0)
 
         # Register strategies in scheduler
         scheduler = Scheduler(features)
@@ -292,6 +375,7 @@ class Engine:
             state: dict = dict(initial_state)
             scheduler.register(kernel, state)
             kernel.on_start(state)
+        last_evaluation_bars: dict[str, datetime] = {}
 
         # Start background tasks
         pool = ThreadPoolExecutor(max_workers=self._pool_workers)
@@ -304,8 +388,88 @@ class Engine:
             drain_order_updates_task = loop.create_task(order_manager.drain_order_updates())
         self._set_runtime_state(phase="running")
 
+        async def evaluate_exit(
+            kernel: StrategyKernel,
+            ctx,
+            state: dict,
+            position: Position,
+        ) -> None:
+            self._progress.count("exit_evals")
+            strategy_t0 = time.perf_counter()
+            if is_simulated:
+                reason = kernel.on_exit(ctx, position, state)
+            else:
+                reason = await loop.run_in_executor(
+                    pool, kernel.on_exit, ctx, position, state
+                )
+            elapsed = time.perf_counter() - strategy_t0
+            self._progress.add_strategy_timing(kernel.SPEC.id, "exit", elapsed)
+            audit_t0 = time.perf_counter()
+            self._write_decision_trace(state)
+            self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
+            if not reason:
+                return
+
+            self._progress.count("exit_signals")
+            order_t0 = time.perf_counter()
+            self._write_signal_event(
+                kernel.SPEC.id,
+                "exit",
+                ctx.timestamp,
+                reason=reason,
+                instrument=position.instrument,
+                side=position.side,
+                trade_id=position.trade_id,
+            )
+            await order_manager.submit_close(
+                kernel.SPEC.id,
+                position,
+                reason,
+            )
+            self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
+
+        async def evaluate_entry(kernel: StrategyKernel, ctx, state: dict) -> None:
+            if not self._entry_frequency_allows(kernel, state, ctx.timestamp):
+                self._progress.count("entry_frequency_skips")
+                return
+
+            self._progress.count("entry_evals")
+            strategy_t0 = time.perf_counter()
+            if is_simulated:
+                signal = kernel.generate(ctx, state)
+            else:
+                signal = await loop.run_in_executor(
+                    pool, kernel.generate, ctx, state
+                )
+            elapsed = time.perf_counter() - strategy_t0
+            self._progress.add_strategy_timing(kernel.SPEC.id, "entry", elapsed)
+            audit_t0 = time.perf_counter()
+            self._write_decision_trace(state)
+            self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
+            if signal is None:
+                return
+
+            self._mark_entry_frequency(kernel, state, ctx.timestamp)
+            self._progress.count("entry_signals")
+            order_t0 = time.perf_counter()
+            self._write_signal_event(
+                kernel.SPEC.id,
+                "entry",
+                ctx.timestamp,
+                signal=signal,
+                trade_id=signal.trade_id,
+            )
+            await order_manager.submit(signal, kernel.SPEC.id)
+            if is_simulated:
+                await order_manager.drain_ready_orders()
+                await order_manager.drain_ready_order_updates()
+            else:
+                await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+            self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
+
         try:
             async for raw_bar in self._data_feed.bars():
+                bar_t0 = time.perf_counter()
                 # Advance simulated clock before any processing
                 if is_simulated:
                     self._clock.advance_to(raw_bar.timestamp)
@@ -318,78 +482,111 @@ class Engine:
                         continue
                 else:
                     bar_1m = raw_bar
+                self._progress.add_timing("bar_prepare", time.perf_counter() - bar_t0)
 
                 # Update DataManager
                 dm = managers.get(bar_1m.instrument)
                 if dm is None:
                     continue
+                stage_t0 = time.perf_counter()
                 dm.on_bar(bar_1m)
                 self._record_bar(bar_1m)
+                features.on_bar(bar_1m)
+                self._progress.add_timing("data_update", time.perf_counter() - stage_t0)
 
                 # Let PaperBroker resolve pending orders on new bar
                 if hasattr(self._broker, "on_bar"):
+                    stage_t0 = time.perf_counter()
                     await self._broker.on_bar(bar_1m)
                     if is_simulated:
                         await order_manager.drain_ready_fills()
                         await order_manager.drain_ready_order_updates()
                     else:
                         await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+                    self._progress.add_timing("broker_on_bar", time.perf_counter() - stage_t0)
 
                 # Invalidate feature caches for this instrument
+                stage_t0 = time.perf_counter()
                 features.invalidate(bar_1m.instrument)
+                self._progress.add_timing("feature_invalidate", time.perf_counter() - stage_t0)
 
-                # Dispatch to strategies via thread pool
-                dispatch_results = scheduler.on_bar(bar_1m, managers)
+                # Dispatch to strategies via thread pool. Fast-event mode still
+                # evaluates open-position exits on every primary bar, but it
+                # skips flat entry context builds until the evaluation bar rolls.
+                include_strategy = None
+                if self._dispatch_mode == _DISPATCH_MODE_FAST_EVENT:
+
+                    def include_strategy(
+                        kernel: StrategyKernel,
+                        _state: dict,
+                    ) -> bool:
+                        if kernel.SPEC.position_policy.position_mode == POSITION_MODE_MULTI:
+                            positions = portfolio.get_strategy_positions(
+                                kernel.SPEC.id,
+                                kernel.SPEC.execution_instrument,
+                            )
+                        else:
+                            position = portfolio.get_strategy_position(
+                                kernel.SPEC.id,
+                                kernel.SPEC.execution_instrument,
+                            )
+                            positions = [position] if position is not None else []
+                        if positions:
+                            self._progress.count("fast_event_exit_contexts")
+                            return True
+                        should_generate = self._should_generate_entry(
+                            kernel,
+                            managers,
+                            last_evaluation_bars,
+                        )
+                        if should_generate:
+                            self._progress.count("fast_event_entry_contexts")
+                        else:
+                            self._progress.count("fast_event_entry_skips")
+                        return should_generate
+
+                stage_t0 = time.perf_counter()
+                dispatch_results = scheduler.on_bar(
+                    bar_1m,
+                    managers,
+                    include=include_strategy,
+                )
+                self._progress.add_timing("scheduler_context", time.perf_counter() - stage_t0)
+                self._progress.count("dispatch_contexts", len(dispatch_results))
                 for kernel, ctx, state in dispatch_results:
                     try:
+                        policy = kernel.SPEC.position_policy
+                        if policy.position_mode == POSITION_MODE_MULTI:
+                            positions = portfolio.get_strategy_positions(
+                                kernel.SPEC.id,
+                                kernel.SPEC.execution_instrument,
+                            )
+                            had_positions = bool(positions)
+                            for position in positions:
+                                await evaluate_exit(kernel, ctx, state, position)
+                            if not self._has_entry_capacity(kernel, len(positions)):
+                                self._progress.count("entry_capacity_skips")
+                                continue
+                            if had_positions and not self._should_generate_entry(
+                                kernel,
+                                managers,
+                                last_evaluation_bars,
+                            ):
+                                self._progress.count("fast_event_entry_skips")
+                                continue
+                            await evaluate_entry(kernel, ctx, state)
+                            continue
+
                         position = portfolio.get_strategy_position(
                             kernel.SPEC.id,
                             kernel.SPEC.execution_instrument,
                         )
                         if position is not None:
-                            if is_simulated:
-                                reason = kernel.on_exit(ctx, position, state)
-                            else:
-                                reason = await loop.run_in_executor(
-                                    pool, kernel.on_exit, ctx, position, state
-                                )
-                            self._write_decision_trace(state)
-                            if reason:
-                                self._write_signal_event(
-                                    kernel.SPEC.id,
-                                    "exit",
-                                    ctx.timestamp,
-                                    reason=reason,
-                                    instrument=position.instrument,
-                                    side=position.side,
-                                )
-                                await order_manager.submit_close(
-                                    kernel.SPEC.id,
-                                    position,
-                                    reason,
-                                )
+                            await evaluate_exit(kernel, ctx, state, position)
                             continue
-                        if is_simulated:
-                            signal = kernel.generate(ctx, state)
-                        else:
-                            signal = await loop.run_in_executor(
-                                pool, kernel.generate, ctx, state
-                            )
-                        self._write_decision_trace(state)
-                        if signal is not None:
-                            self._write_signal_event(
-                                kernel.SPEC.id,
-                                "entry",
-                                ctx.timestamp,
-                                signal=signal,
-                            )
-                            await order_manager.submit(signal, kernel.SPEC.id)
-                            if is_simulated:
-                                await order_manager.drain_ready_orders()
-                                await order_manager.drain_ready_order_updates()
-                            else:
-                                await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+                        await evaluate_entry(kernel, ctx, state)
                     except Exception as e:
+                        self._progress.count("strategy_errors")
                         log.exception("Strategy %s raised: %s", kernel.SPEC.id, e)
                         self._record_event(
                             "strategy",
@@ -403,6 +600,8 @@ class Engine:
                             ctx.timestamp,
                             error=str(e),
                         )
+                self._progress.count_bar(bar_1m.timestamp)
+                self._progress.maybe_report()
 
         except Exception as e:
             log.exception("Engine _run error: %s", e)
@@ -419,6 +618,7 @@ class Engine:
             await self._data_feed.disconnect()
             self._set_runtime_state(data_connected=False)
             await self._broker.disconnect()
+            self._progress.finish()
             phase = "error" if self._last_error else "stopped"
             self._set_runtime_state(
                 phase=phase,
@@ -450,6 +650,88 @@ class Engine:
                     matches,
                 )
         return resolved
+
+    def _should_generate_entry(
+        self,
+        kernel: StrategyKernel,
+        managers: Mapping[Instrument, DataManager],
+        last_evaluation_bars: dict[str, datetime],
+    ) -> bool:
+        if self._dispatch_mode != _DISPATCH_MODE_FAST_EVENT:
+            return True
+
+        timeframe = self._evaluation_timeframes.get(kernel.SPEC.id)
+        if timeframe is None or timeframe.seconds <= TF_1M.seconds:
+            return True
+
+        manager = managers.get(kernel.SPEC.primary_instrument)
+        if manager is None:
+            return True
+
+        latest_ts = manager.latest_timestamp()
+        if latest_ts is None:
+            return False
+
+        latest_bar = _completed_timeframe_bar_start(latest_ts, timeframe)
+        if latest_bar == last_evaluation_bars.get(kernel.SPEC.id):
+            return False
+
+        last_evaluation_bars[kernel.SPEC.id] = latest_bar
+        return True
+
+    def _has_entry_capacity(self, kernel: StrategyKernel, open_positions: int) -> bool:
+        limit = kernel.SPEC.position_policy.max_concurrent_positions
+        if limit is None:
+            return True
+        return open_positions < limit
+
+    def _entry_frequency_allows(
+        self,
+        kernel: StrategyKernel,
+        state: dict,
+        timestamp: datetime,
+    ) -> bool:
+        frequency = kernel.SPEC.position_policy.entry_frequency
+        if frequency == ENTRY_FREQUENCY_UNLIMITED:
+            return True
+
+        key = self._entry_frequency_key(frequency, timestamp)
+        return state.get("_policy_last_entry_frequency_key") != key
+
+    def _mark_entry_frequency(
+        self,
+        kernel: StrategyKernel,
+        state: dict,
+        timestamp: datetime,
+    ) -> None:
+        frequency = kernel.SPEC.position_policy.entry_frequency
+        if frequency == ENTRY_FREQUENCY_UNLIMITED:
+            return
+        state["_policy_last_entry_frequency_key"] = self._entry_frequency_key(
+            frequency,
+            timestamp,
+        )
+
+    def _entry_frequency_key(self, frequency: str, timestamp: datetime) -> str:
+        ts = timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        market_tz = getattr(
+            getattr(self._broker, "capabilities", None),
+            "market_timezone",
+            self._session_tz,
+        )
+        try:
+            local_ts = ts.astimezone(ZoneInfo(str(market_tz)))
+        except Exception:
+            local_ts = ts.astimezone(ZoneInfo(self._session_tz))
+
+        if frequency == ENTRY_FREQUENCY_ONE_PER_DAY:
+            return f"day:{local_ts.date().isoformat()}"
+        if frequency == ENTRY_FREQUENCY_ONE_PER_SESSION:
+            return f"session:{local_ts.date().isoformat()}"
+        return "unlimited"
 
     def _write_decision_trace(self, state: dict) -> None:
         if self._audit is None:
@@ -519,3 +801,244 @@ class Engine:
         with self._state_lock:
             self._recent_events.append(event)
             self._recent_events = self._recent_events[-200:]
+
+
+class _EngineProgress:
+    """Lightweight timing reporter for long simulated engine runs."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        total_bars: int | None,
+        interval_bars: int,
+        interval_seconds: float,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.total_bars = total_bars if total_bars and total_bars > 0 else None
+        self.interval_bars = max(1, int(interval_bars or 1000))
+        self.interval_seconds = max(1.0, float(interval_seconds or 30.0))
+        self.started_perf: float | None = None
+        self.finished_perf: float | None = None
+        self.last_report_perf: float | None = None
+        self.last_report_bar = 0
+        self.bars = 0
+        self.last_replay_ts: datetime | None = None
+        self.timings: dict[str, float] = defaultdict(float)
+        self.timing_counts: dict[str, int] = defaultdict(int)
+        self.last_report_timings: dict[str, float] = defaultdict(float)
+        self.last_report_counts: dict[str, int] = defaultdict(int)
+        self.counts: dict[str, int] = defaultdict(int)
+        self.strategy_timings: dict[tuple[str, str], float] = defaultdict(float)
+        self.strategy_counts: dict[tuple[str, str], int] = defaultdict(int)
+        self.strategy_max: dict[tuple[str, str], float] = defaultdict(float)
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        self.started_perf = now
+        self.last_report_perf = now
+        log.info(
+            "Backtest progress enabled total_bars=%s interval_bars=%d interval_seconds=%.1f",
+            self.total_bars,
+            self.interval_bars,
+            self.interval_seconds,
+        )
+
+    def finish(self) -> None:
+        if not self.enabled:
+            return
+        self.finished_perf = time.perf_counter()
+        self.report(force=True, final=True)
+
+    def info(self, message: str, *args: Any) -> None:
+        if self.enabled:
+            log.info(message, *args)
+
+    def add_timing(self, stage: str, seconds: float) -> None:
+        if not self.enabled:
+            return
+        self.timings[stage] += max(0.0, float(seconds))
+        self.timing_counts[stage] += 1
+
+    def add_strategy_timing(self, strategy_id: str, phase: str, seconds: float) -> None:
+        if not self.enabled:
+            return
+        key = (str(strategy_id), str(phase))
+        elapsed = max(0.0, float(seconds))
+        self.strategy_timings[key] += elapsed
+        self.strategy_counts[key] += 1
+        self.strategy_max[key] = max(self.strategy_max[key], elapsed)
+        self.add_timing(f"strategy_{phase}", elapsed)
+
+    def count(self, name: str, amount: int = 1) -> None:
+        if self.enabled:
+            self.counts[name] += int(amount)
+
+    def count_bar(self, replay_ts: datetime) -> None:
+        if not self.enabled:
+            return
+        self.bars += 1
+        self.last_replay_ts = replay_ts
+
+    def maybe_report(self) -> None:
+        if not self.enabled or self.started_perf is None:
+            return
+        now = time.perf_counter()
+        by_bars = (self.bars - self.last_report_bar) >= self.interval_bars
+        by_time = self.last_report_perf is None or (now - self.last_report_perf) >= self.interval_seconds
+        if by_bars or by_time:
+            self.report()
+
+    def report(self, *, force: bool = False, final: bool = False) -> None:
+        if not self.enabled or self.started_perf is None:
+            return
+        now = self.finished_perf or time.perf_counter()
+        if not force and self.bars == self.last_report_bar:
+            return
+
+        elapsed = max(now - self.started_perf, 1e-9)
+        interval_elapsed = (
+            max(now - self.last_report_perf, 1e-9)
+            if self.last_report_perf is not None
+            else elapsed
+        )
+        interval_bars = self.bars - self.last_report_bar
+        pct = (self.bars / self.total_bars * 100.0) if self.total_bars else None
+        rate = self.bars / elapsed
+        interval_rate = interval_bars / interval_elapsed
+        slow_total = self._format_top_stages(self.timings)
+        slow_interval = self._format_top_interval_stages()
+        prefix = "Backtest final progress" if final else "Backtest progress"
+        pct_text = f" {pct:.1f}%" if pct is not None else ""
+        log.info(
+            (
+                "%s bars=%d/%s%s replay_ts=%s elapsed=%.1fs rate=%.1f bars/s "
+                "interval=%d bars %.1f bars/s dispatch=%d entry_evals=%d exit_evals=%d "
+                "entry_signals=%d exit_signals=%d fast_skips=%d slow_total=%s slow_interval=%s"
+            ),
+            prefix,
+            self.bars,
+            self.total_bars or "?",
+            pct_text,
+            self.last_replay_ts.isoformat() if self.last_replay_ts else None,
+            elapsed,
+            rate,
+            interval_bars,
+            interval_rate,
+            self.counts.get("dispatch_contexts", 0),
+            self.counts.get("entry_evals", 0),
+            self.counts.get("exit_evals", 0),
+            self.counts.get("entry_signals", 0),
+            self.counts.get("exit_signals", 0),
+            self.counts.get("fast_event_entry_skips", 0),
+            slow_total,
+            slow_interval,
+        )
+        strategy_line = self._format_strategy_timings()
+        if strategy_line:
+            log.info("Backtest strategy timing %s", strategy_line)
+
+        self.last_report_bar = self.bars
+        self.last_report_perf = now
+        self.last_report_timings = defaultdict(float, self.timings)
+        self.last_report_counts = defaultdict(int, self.timing_counts)
+
+    def snapshot(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {}
+        elapsed = None
+        if self.started_perf is not None:
+            end = self.finished_perf or time.perf_counter()
+            elapsed = end - self.started_perf
+        return {
+            "enabled": True,
+            "bars": self.bars,
+            "total_bars": self.total_bars,
+            "elapsed_seconds": elapsed,
+            "last_replay_ts": self.last_replay_ts,
+            "counts": dict(self.counts),
+            "timings_seconds": dict(self.timings),
+            "timing_counts": dict(self.timing_counts),
+            "strategy_timings": [
+                {
+                    "strategy_id": strategy_id,
+                    "phase": phase,
+                    "calls": self.strategy_counts[(strategy_id, phase)],
+                    "total_seconds": total,
+                    "avg_seconds": total / max(self.strategy_counts[(strategy_id, phase)], 1),
+                    "max_seconds": self.strategy_max[(strategy_id, phase)],
+                }
+                for (strategy_id, phase), total in sorted(self.strategy_timings.items())
+            ],
+        }
+
+    def _format_top_stages(self, values: Mapping[str, float], limit: int = 4) -> str:
+        if not values:
+            return "none"
+        top = sorted(values.items(), key=lambda item: item[1], reverse=True)[:limit]
+        return ",".join(f"{name}:{seconds:.1f}s" for name, seconds in top)
+
+    def _format_top_interval_stages(self, limit: int = 4) -> str:
+        deltas = {
+            name: seconds - self.last_report_timings.get(name, 0.0)
+            for name, seconds in self.timings.items()
+        }
+        deltas = {name: seconds for name, seconds in deltas.items() if seconds > 0}
+        return self._format_top_stages(deltas, limit=limit)
+
+    def _format_strategy_timings(self, limit: int = 6) -> str:
+        if not self.strategy_timings:
+            return ""
+        rows: list[tuple[float, str]] = []
+        for key, total in self.strategy_timings.items():
+            strategy_id, phase = key
+            calls = self.strategy_counts[key]
+            avg = total / max(calls, 1)
+            max_seconds = self.strategy_max[key]
+            rows.append(
+                (
+                    total,
+                    (
+                        f"{strategy_id}.{phase}:calls={calls},"
+                        f"total={total:.1f}s,avg={avg:.3f}s,max={max_seconds:.3f}s"
+                    ),
+                )
+            )
+        rows.sort(reverse=True)
+        return " ".join(text for _, text in rows[:limit])
+
+
+def _normalize_dispatch_mode(mode: str) -> str:
+    normalized = str(mode or _DISPATCH_MODE_EVENT).strip().lower().replace("-", "_")
+    if normalized not in {_DISPATCH_MODE_EVENT, _DISPATCH_MODE_FAST_EVENT}:
+        raise ValueError(
+            "dispatch_mode must be 'event' or 'fast-event'; "
+            f"got {mode!r}"
+        )
+    return normalized
+
+
+def _normalize_evaluation_timeframes(
+    evaluation_timeframes: Mapping[str, str] | None,
+) -> dict[str, Timeframe]:
+    result: dict[str, Timeframe] = {}
+    for strategy_id, label in dict(evaluation_timeframes or {}).items():
+        result[str(strategy_id)] = Timeframe.parse(str(label))
+    return result
+
+
+def _completed_timeframe_bar_start(latest_ts: datetime, timeframe: Timeframe) -> datetime:
+    """Return the start of the latest completed resample bucket.
+
+    This mirrors the engine resampler's left-labeled, left-closed buckets with
+    the last in-progress bucket dropped, without rebuilding a full DataFrame on
+    every fast-event skip check.
+    """
+    latest = latest_ts.astimezone(timezone.utc) if latest_ts.tzinfo else latest_ts.replace(tzinfo=timezone.utc)
+    candidate = latest - timedelta(seconds=timeframe.seconds)
+    anchor = candidate.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed = int((candidate - anchor).total_seconds())
+    bucket = (elapsed // timeframe.seconds) * timeframe.seconds
+    return anchor + timedelta(seconds=bucket)

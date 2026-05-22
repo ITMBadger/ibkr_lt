@@ -3,6 +3,8 @@
 Usage:
     python -m backtest.run --start 2025-01-01 --end 2025-03-31
     python -m backtest.run --strategy stoch_3m_cross_long --start 2025-01-01 --end 2025-03-31
+    python -m backtest.run --mode fast-event \
+        --strategy stoch_3m_cross_long --start 2025-01-01 --end 2025-03-31
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +34,7 @@ from .loaders import (
     instantiate_strategies,
     load_replay_bars,
     required_instruments,
+    resolve_evaluation_timeframes,
     validate_csv_path,
 )
 from .reporting import audit_file_stats, write_summary
@@ -65,6 +69,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lookback-days", type=int, default=None)
     parser.add_argument("--output-dir", default=None, help="Backtest run output directory")
     parser.add_argument(
+        "--mode",
+        choices=("event", "fast-event"),
+        default=None,
+        help=(
+            "Backtest dispatch mode. event evaluates each primary 1-minute bar; "
+            "fast-event evaluates flat entries only when the evaluation bar changes."
+        ),
+    )
+    parser.add_argument(
+        "--eval-timeframe",
+        default=None,
+        help=(
+            "Evaluation timeframe for --mode fast-event, e.g. 3m. "
+            "Defaults to each strategy's bar size when detectable."
+        ),
+    )
+    parser.add_argument(
         "--all-live",
         action="store_true",
         help="Simulate all selected strategies as live, ignoring dry_run strategy modes.",
@@ -74,6 +95,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Backtest strategy worker count. Default is 1 for deterministic replay.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable periodic backtest progress and timing output.",
+    )
+    parser.add_argument(
+        "--progress-interval-bars",
+        type=int,
+        default=None,
+        help="Emit progress after this many processed replay bars.",
+    )
+    parser.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=None,
+        help="Emit progress after this many wall-clock seconds.",
     )
     return parser.parse_args(argv)
 
@@ -110,14 +148,29 @@ def run_backtest(
     settings: BacktestSettings,
     strategies,
 ) -> BacktestResult:
+    run_started = time.perf_counter()
+    strategies = list(strategies)
     instruments = required_instruments(strategies)
     validate_csv_path(settings.csv_path, instruments)
+    evaluation_timeframes = (
+        resolve_evaluation_timeframes(strategies, settings.evaluation_timeframe)
+        if settings.mode == "fast-event"
+        else {}
+    )
     csv_provider = build_csv_provider(
         csv_path=settings.csv_path,
         session_tz=settings.session_tz,
         rth_only=settings.rth_only,
         market_open=settings.market_open,
         market_close=settings.market_close,
+    )
+    load_started = time.perf_counter()
+    log.info(
+        "Loading replay bars instruments=%s start=%s end=%s csv_path=%s",
+        [instrument.symbol for instrument in instruments],
+        settings.start.isoformat(),
+        settings.end.isoformat(),
+        settings.csv_path,
     )
     replay_bars = asyncio.run(
         load_replay_bars(
@@ -126,6 +179,12 @@ def run_backtest(
             start=settings.start,
             end=settings.end,
         )
+    )
+    replay_load_seconds = time.perf_counter() - load_started
+    log.info(
+        "Loaded replay bars count=%d seconds=%.2f",
+        len(replay_bars),
+        replay_load_seconds,
     )
 
     audit_logger, run_dir = _build_audit_logger(settings)
@@ -152,17 +211,33 @@ def run_backtest(
         session_tz=settings.session_tz,
         audit_logger=audit_logger,
         strategy_modes=settings.strategy_modes,
+        dispatch_mode=settings.mode,
+        evaluation_timeframes=evaluation_timeframes,
+        feature_preload_bars=replay_bars,
+        progress_enabled=settings.progress_enabled,
+        progress_total_bars=len(replay_bars),
+        progress_interval_bars=settings.progress_interval_bars,
+        progress_interval_seconds=settings.progress_interval_seconds,
     )
 
     log.info(
-        "Running backtest strategies=%s instruments=%s bars=%d start=%s end=%s",
+        "Running backtest mode=%s strategies=%s instruments=%s bars=%d start=%s end=%s",
+        settings.mode,
         settings.strategy_ids,
         [instrument.symbol for instrument in instruments],
         len(replay_bars),
         settings.start.isoformat(),
         settings.end.isoformat(),
     )
+    engine_started = time.perf_counter()
     engine.run_backtest()
+    engine_run_seconds = time.perf_counter() - engine_started
+    total_seconds = time.perf_counter() - run_started
+    log.info(
+        "Backtest engine completed engine_seconds=%.2f total_seconds=%.2f",
+        engine_run_seconds,
+        total_seconds,
+    )
     snapshot = engine.snapshot_state()
     summary = {
         "run_type": "event_backtest",
@@ -175,8 +250,20 @@ def run_backtest(
         "session_timezone": settings.session_tz,
         "strategies": settings.strategy_ids,
         "strategy_modes": settings.strategy_modes,
+        "mode": settings.mode,
+        "evaluation_timeframes": evaluation_timeframes,
         "instruments": instruments,
         "replay_bars": len(replay_bars),
+        "timings": {
+            "replay_load_seconds": replay_load_seconds,
+            "engine_run_seconds": engine_run_seconds,
+            "total_seconds": total_seconds,
+        },
+        "progress": {
+            "enabled": settings.progress_enabled,
+            "interval_bars": settings.progress_interval_bars,
+            "interval_seconds": settings.progress_interval_seconds,
+        },
         "audit_enabled": settings.audit_enabled,
         "audit_stats": audit_file_stats(run_dir),
         "engine_snapshot": snapshot,

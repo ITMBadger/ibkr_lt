@@ -18,6 +18,10 @@ class PortfolioState:
         self._lock = threading.RLock()
         self._positions: dict[Instrument, Position] = {}
         self._strategy_positions: dict[tuple[str, Instrument], Position] = {}
+        self._strategy_position_lots: dict[
+            tuple[str, Instrument, str],
+            Position,
+        ] = {}
         self._net_liquidation: float = 0.0
         self._account_id: str = ""
 
@@ -25,14 +29,21 @@ class PortfolioState:
     # Fill application
     # ------------------------------------------------------------------
 
-    def apply_fill(self, fill: Fill, strategy_id: str | None = None) -> None:
+    def apply_fill(
+        self,
+        fill: Fill,
+        strategy_id: str | None = None,
+        trade_id: str | None = None,
+    ) -> None:
         """Update position from a broker fill.
 
         Fills are signed: positive quantity = bought, negative = sold.
         """
         with self._lock:
             buy_sides = {"BOT", "BUY", "B", "LONG"}
-            signed_qty = fill.quantity if fill.side.upper() in buy_sides else -fill.quantity
+            signed_qty = (
+                fill.quantity if fill.side.upper() in buy_sides else -fill.quantity
+            )
             self._positions[fill.instrument] = _apply_signed_qty(
                 self._positions.get(fill.instrument),
                 fill.instrument,
@@ -47,6 +58,15 @@ class PortfolioState:
                     signed_qty,
                     fill.price,
                 )
+                if trade_id:
+                    lot_key = (strategy_id, fill.instrument, trade_id)
+                    self._strategy_position_lots[lot_key] = _apply_signed_qty(
+                        self._strategy_position_lots.get(lot_key),
+                        fill.instrument,
+                        signed_qty,
+                        fill.price,
+                        trade_id=trade_id,
+                    )
 
     def adopt_position(self, position: Position, strategy_id: str | None = None) -> None:
         """Seed state from broker positions discovered at startup."""
@@ -91,11 +111,37 @@ class PortfolioState:
                 return None
             return pos
 
+    def get_strategy_positions(
+        self,
+        strategy_id: str,
+        instrument: Instrument,
+    ) -> list[Position]:
+        with self._lock:
+            lots = [
+                pos
+                for (sid, inst, _), pos in self._strategy_position_lots.items()
+                if sid == strategy_id and inst == instrument and not pos.is_flat
+            ]
+            if lots:
+                return lots
+            pos = self._strategy_positions.get((strategy_id, instrument))
+            if pos is None or pos.is_flat:
+                return []
+            return [pos]
+
     def strategy_positions(self) -> list[tuple[str, Position]]:
         with self._lock:
             return [
                 (sid, pos)
                 for (sid, _), pos in self._strategy_positions.items()
+                if not pos.is_flat
+            ]
+
+    def strategy_position_lots(self) -> list[tuple[str, Position]]:
+        with self._lock:
+            return [
+                (sid, pos)
+                for (sid, _, _), pos in self._strategy_position_lots.items()
                 if not pos.is_flat
             ]
 
@@ -118,24 +164,27 @@ def _apply_signed_qty(
     instrument: Instrument,
     signed_qty: float,
     price: float,
+    trade_id: str | None = None,
 ) -> Position:
     if existing is None or existing.is_flat:
         return Position(
             instrument=instrument,
             quantity=signed_qty,
             avg_cost=price,
+            trade_id=trade_id,
         )
 
     old_qty = existing.quantity
     old_cost = existing.avg_cost
     new_qty = old_qty + signed_qty
     if new_qty == 0:
-        return Position(instrument, 0.0, 0.0)
+        return Position(instrument, 0.0, 0.0, trade_id=trade_id)
     if (old_qty > 0) == (signed_qty > 0):
         new_cost = (old_qty * old_cost + signed_qty * price) / new_qty
-        return Position(instrument, new_qty, new_cost)
+        return Position(instrument, new_qty, new_cost, trade_id=trade_id)
     return Position(
         instrument,
         new_qty,
         old_cost if new_qty * old_qty > 0 else price,
+        trade_id,
     )

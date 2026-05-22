@@ -9,6 +9,7 @@ The core idea is simple: the engine is stable, while broker and market-data prov
 ## Architecture
 
 - Strategies produce intent only: `Signal` or exit reason.
+- Strategies declare position ownership and entry throttling through `StrategySpec.position_policy`.
 - The engine owns scheduling, market context construction, risk routing, and execution flow.
 - `OrderManager` is the only framework component that submits orders to broker adapters and enforces per-strategy dry-run.
 - `DataFeed` composes historical and live data providers.
@@ -34,6 +35,29 @@ This repository contains the framework, adapters, tests, and public runtime skel
 Proprietary strategy implementations, detailed strategy docs, research notebooks, market data, and decision logs are intentionally excluded from Git.
 
 To run the project from a fresh public clone, add your own strategy module under `strategies/` or update `config.yaml` to point at an available local strategy.
+
+## Strategy Authoring
+
+Start from the copy-only scaffold:
+
+```text
+strategies/_sample_strategy.py
+```
+
+The leading underscore keeps it out of automatic strategy loading. Copy it to a new non-underscore file, rename the class, and give it a stable `StrategySpec.id`.
+
+Every real strategy declares a `PositionPolicy`:
+
+```python
+position_policy=PositionPolicy(
+    position_mode=POSITION_MODE_SINGLE,
+    entry_frequency=ENTRY_FREQUENCY_ONE_PER_DAY,
+)
+```
+
+`single_position` means one open strategy position per execution instrument. `multi_position` is for independent logical lots and should use deterministic `Signal.trade_id` values when per-lot exit state matters.
+
+Entry frequency is enforced by the engine with `one_per_day`, `one_per_session`, or `unlimited`. Do not duplicate date-throttle checks inside strategies unless a private strategy needs a stricter rule than the declared framework policy.
 
 ## Hermes Control API
 
@@ -123,12 +147,20 @@ Backtests use the same `Engine`, strategy modules, `DataManager`,
 
 ```bash
 python -m backtest.run --strategy stoch_3m_cross_long --start 2025-01-01 --end 2025-03-31
+python -m backtest.run --mode fast-event --strategy stoch_3m_cross_long --start 2025-01-01 --end 2025-03-31
 ```
 
 The runner reads CSV data from `data.historical.path` in `config.yaml`, or from
 `--csv`. Use a directory when selected strategies require more than one symbol.
 It backfills warmup bars before the start timestamp, then replays test-window
 bars event by event. Results are written under `backtest_runs/`.
+
+Use `--mode fast-event` for faster research replays. It still feeds every
+1-minute bar through the production data, broker, order, and exit path, but it
+only calls flat-entry strategy logic when the strategy evaluation timeframe
+changes. Pass `--eval-timeframe 3m` to override the auto-detected bar size.
+The backtest runner also preloads replay bars into the shared feature registry
+so common indicators are vectorized once and sliced to each replay timestamp.
 
 Configured `strategy_modes` are respected. Use `--all-live` when you want a
 simulation fill path for strategies that are marked `dry_run` in live/paper

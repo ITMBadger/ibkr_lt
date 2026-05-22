@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from backtest.config import BacktestSettings, parse_boundary, resolve_strategy_ids
-from backtest.loaders import required_instruments
+from backtest.loaders import required_instruments, resolve_evaluation_timeframes
 from backtest.run import run_backtest
 from core.interfaces.strategy import StrategyKernel, StrategySpec
 from core.types import Instrument, MarketContext, Signal
@@ -31,6 +32,24 @@ class _CrossInstrumentStrategy(StrategyKernel):
         return Signal(instrument=MES, side="long")
 
 
+class _ThreeMinuteCountingStrategy(StrategyKernel):
+    _BAR_SIZE = "3m"
+    SPEC = StrategySpec(
+        id="_bt_3m_count",
+        primary_instrument=SPY,
+        execution_instrument=SPY,
+        timeframes=("1m", "3m"),
+        warmup_bars={},
+    )
+
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
+        self.generate_calls += 1
+        return None
+
+
 def test_parse_boundary_date_only_uses_session_timezone():
     start = parse_boundary("2026-05-01", "America/New_York", is_end=False)
     end = parse_boundary("2026-05-01", "America/New_York", is_end=True)
@@ -50,6 +69,13 @@ def test_resolve_strategy_ids_supports_repeated_and_comma_values():
 def test_required_instruments_includes_execution_instrument():
     instruments = required_instruments([(_CrossInstrumentStrategy(), {})])
     assert instruments == [MES, SPY]
+
+
+def test_resolve_evaluation_timeframes_uses_strategy_bar_size():
+    strategies = [(_ThreeMinuteCountingStrategy(), {})]
+
+    assert resolve_evaluation_timeframes(strategies) == {"_bt_3m_count": "3m"}
+    assert resolve_evaluation_timeframes(strategies, "5m") == {"_bt_3m_count": "5m"}
 
 
 def test_run_backtest_uses_execution_instrument_bars_for_paper_fills(tmp_path):
@@ -88,10 +114,50 @@ def test_run_backtest_uses_execution_instrument_bars_for_paper_fills(tmp_path):
     assert fill["fill"]["price"] == 5003.0
 
 
-def _write_csv(path, base_price: float) -> None:
+def test_fast_event_mode_throttles_flat_entry_generation(tmp_path):
+    csv_dir = tmp_path / "csv"
+    csv_dir.mkdir()
+    _write_csv(csv_dir / "SPY.csv", 100.0, minutes=10)
+
+    settings = BacktestSettings(
+        config_path=tmp_path / "config.yaml",
+        csv_path=csv_dir,
+        start=datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 1, 13, 39, tzinfo=timezone.utc),
+        lookback_days=0,
+        session_tz="UTC",
+        strategy_ids=["_bt_3m_count"],
+        strategy_modes={"_bt_3m_count": "live"},
+        position_size_shares=1,
+        max_order_quantity=2,
+        thread_pool_workers=1,
+        output_dir=tmp_path / "event_runs",
+        audit_enabled=False,
+        logging={},
+        rth_only=False,
+        market_open="00:00",
+        market_close="23:59",
+    )
+
+    event_strategy = _ThreeMinuteCountingStrategy()
+    fast_strategy = _ThreeMinuteCountingStrategy()
+
+    event_result = run_backtest(settings, [(event_strategy, {})])
+    fast_result = run_backtest(
+        replace(settings, output_dir=tmp_path / "fast_runs", mode="fast-event"),
+        [(fast_strategy, {})],
+    )
+
+    assert event_result.processed_bars == 10
+    assert fast_result.processed_bars == 10
+    assert event_strategy.generate_calls == 10
+    assert 0 < fast_strategy.generate_calls < event_strategy.generate_calls
+
+
+def _write_csv(path, base_price: float, minutes: int = 4) -> None:
     base = datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc)
     lines = ["timestamp,open,high,low,close,volume"]
-    for index in range(4):
+    for index in range(minutes):
         ts = base + timedelta(minutes=index)
         price = base_price + index
         lines.append(

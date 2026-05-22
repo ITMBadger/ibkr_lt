@@ -22,7 +22,14 @@ except ImportError as exc:
 
 from core import register_strategy
 from core.audit import DecisionTrace, record_decision
-from core.interfaces.strategy import ProtectiveStopSpec, StrategyKernel, StrategySpec
+from core.interfaces.strategy import (
+    ENTRY_FREQUENCY_ONE_PER_DAY,
+    POSITION_MODE_SINGLE,
+    PositionPolicy,
+    ProtectiveStopSpec,
+    StrategyKernel,
+    StrategySpec,
+)
 from core.types import Instrument, MarketContext, Signal
 
 
@@ -41,6 +48,10 @@ class Stoch3mCrossLong(StrategyKernel):
         timeframes=("1m", "3m"),
         warmup_bars={"3m": 30},
         protective_stop=ProtectiveStopSpec(pct=0.015, reference="fill_price"),
+        position_policy=PositionPolicy(
+            position_mode=POSITION_MODE_SINGLE,
+            entry_frequency=ENTRY_FREQUENCY_ONE_PER_DAY,
+        ),
     )
 
     _FASTK_PERIOD = 14
@@ -51,7 +62,6 @@ class Stoch3mCrossLong(StrategyKernel):
     _ENTRY_END_HHMM = 1530
 
     def on_start(self, state: dict) -> None:
-        state["last_signal_date"] = None
         state["last_evaluated_3m_bar"] = None
 
     def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
@@ -72,7 +82,6 @@ class Stoch3mCrossLong(StrategyKernel):
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         market_now = now.astimezone(MARKET_TZ)
-        today = market_now.date()
         trace.add_bar("qqq_3m_current", QQQ, "3m", bars_3m.iloc[-1])
         if len(bars_3m) >= 2:
             trace.add_bar("qqq_3m_prior", QQQ, "3m", bars_3m.iloc[-2])
@@ -137,17 +146,6 @@ class Stoch3mCrossLong(StrategyKernel):
         if not in_entry_window:
             return finish("no_signal", "outside_entry_window")
 
-        already_signaled = state.get("last_signal_date") == today
-        trace.add_condition(
-            "one_signal_per_day",
-            not already_signaled,
-            lhs=state.get("last_signal_date"),
-            op="!=",
-            rhs=today,
-        )
-        if already_signaled:
-            return finish("no_signal", "already_signaled_today")
-
         current_3m_bar = bars_3m.index[-1]
         already_evaluated_bar = state.get("last_evaluated_3m_bar") == current_3m_bar
         trace.add_condition(
@@ -172,7 +170,6 @@ class Stoch3mCrossLong(StrategyKernel):
             return finish("no_signal", "stoch_d_not_crossed")
 
         signal = Signal(instrument=self.SPEC.execution_instrument, side="long")
-        state["last_signal_date"] = today
         return finish("signal", "stoch_d_crossed_above_threshold", signal)
 
 

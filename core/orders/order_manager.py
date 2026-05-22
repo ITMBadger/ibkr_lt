@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from .strategy_modes import STRATEGY_MODE_DRY_RUN, strategy_mode_map
 from ..portfolio.state import PortfolioState
 from ..risk.policy import RiskPolicy
-from ..interfaces.strategy import ProtectiveStopSpec
+from ..interfaces.strategy import POSITION_MODE_MULTI, PositionPolicy, ProtectiveStopSpec
 from ..types import Fill, OrderRequest, OrderStatus, Position, Signal
 from ..audit import AuditLogger
 
@@ -39,6 +39,7 @@ class OrderManager:
         audit_logger: AuditLogger | None = None,
         protective_stops: Mapping[str, ProtectiveStopSpec] | None = None,
         strategy_modes: Mapping[str, str] | None = None,
+        position_policies: Mapping[str, PositionPolicy] | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -51,7 +52,10 @@ class OrderManager:
         self._protective_stops = dict(protective_stops or {})
         strategy_ids = set(self._protective_stops) | set(strategy_modes or {})
         self._strategy_modes = strategy_mode_map(strategy_modes, strategy_ids)
+        self._position_policies = dict(position_policies or {})
         self._dry_run_counter = itertools.count(1)
+        self._trade_counter = itertools.count(1)
+        self._order_trade_id: dict[str, str | None] = {}
 
     async def submit(self, signal: Signal, strategy_id: str) -> None:
         """Enqueue a signal for the order drain loop to process."""
@@ -74,13 +78,16 @@ class OrderManager:
             )
             return
         side = "short" if position.quantity > 0 else "long"
+        close_key = f"{strategy_id}-{position.instrument.symbol}-close-{reason}"
+        if position.trade_id:
+            close_key = f"{close_key}-{position.trade_id}"
         order = OrderRequest(
             instrument=position.instrument,
             side=side,
             quantity=qty,
             order_type="market",
             strategy_id=strategy_id,
-            idempotency_key=f"{strategy_id}-{position.instrument.symbol}-close-{reason}",
+            idempotency_key=close_key,
         )
         if not self._validate_order(order, is_entry=False):
             self._write_order_event(
@@ -115,6 +122,7 @@ class OrderManager:
         status = await self._broker.submit_order(order)
         self._order_owner[status.broker_order_id] = strategy_id
         self._order_role[status.broker_order_id] = "close"
+        self._order_trade_id[status.broker_order_id] = position.trade_id
         self._write_order_event(
             "close_submitted",
             strategy_id=strategy_id,
@@ -222,7 +230,16 @@ class OrderManager:
             return
 
         # Size the order
-        qty_float = self._risk.size_order(signal, self._portfolio)
+        trade_id = self._resolve_trade_id(signal, strategy_id)
+        policy = self._position_policies.get(strategy_id)
+        allow_existing_position = (
+            policy is not None and policy.position_mode == POSITION_MODE_MULTI
+        )
+        qty_float = self._risk.size_order(
+            signal,
+            self._portfolio,
+            allow_existing_position=allow_existing_position,
+        )
         if qty_float <= 0:
             self._write_order_event(
                 "signal_dropped",
@@ -247,13 +264,16 @@ class OrderManager:
             )
             return
 
+        entry_key = f"{strategy_id}-{signal.instrument.symbol}-{signal.side}"
+        if trade_id:
+            entry_key = f"{entry_key}-{trade_id}"
         order = OrderRequest(
             instrument=signal.instrument,
             side=signal.side,
             quantity=qty,
             order_type="market",
             strategy_id=strategy_id,
-            idempotency_key=f"{strategy_id}-{signal.instrument.symbol}-{signal.side}",
+            idempotency_key=entry_key,
         )
         if not self._validate_order(order, is_entry=True):
             self._write_order_event(
@@ -290,6 +310,7 @@ class OrderManager:
         status = await self._broker.submit_order(order)
         self._order_owner[status.broker_order_id] = strategy_id
         self._order_role[status.broker_order_id] = "entry"
+        self._order_trade_id[status.broker_order_id] = trade_id
         self._write_order_event(
             "order_submitted",
             strategy_id=strategy_id,
@@ -306,8 +327,9 @@ class OrderManager:
     async def _handle_fill(self, fill: Fill) -> None:
         strategy_id = self._order_owner.get(fill.broker_order_id)
         role = self._order_role.get(fill.broker_order_id, "unknown")
-        self._portfolio.apply_fill(fill, strategy_id=strategy_id)
-        self._write_fill_event(fill, strategy_id, role)
+        trade_id = self._order_trade_id.get(fill.broker_order_id)
+        self._portfolio.apply_fill(fill, strategy_id=strategy_id, trade_id=trade_id)
+        self._write_fill_event(fill, strategy_id, role, trade_id)
         log.info(
             "Fill: %s %s %.0f @ %.4f",
             fill.side, fill.instrument.symbol, fill.quantity, fill.price,
@@ -370,12 +392,19 @@ class OrderManager:
             return
 
         is_buy_fill = fill.side.upper() in _BUY_FILL_SIDES
+        trade_id = self._order_trade_id.get(fill.broker_order_id)
         stop_side = "short" if is_buy_fill else "long"
         if is_buy_fill:
             raw_stop_price = fill.price * (1.0 - spec.pct)
         else:
             raw_stop_price = fill.price * (1.0 + spec.pct)
         stop_price = _round_stop_price(fill.instrument, raw_stop_price)
+        stop_key = (
+            f"{strategy_id}-{fill.instrument.symbol}-protective-stop-"
+            f"{fill.broker_order_id}"
+        )
+        if trade_id:
+            stop_key = f"{stop_key}-{trade_id}"
         order = OrderRequest(
             instrument=fill.instrument,
             side=stop_side,
@@ -383,10 +412,7 @@ class OrderManager:
             order_type="stop",
             stop_price=stop_price,
             strategy_id=strategy_id,
-            idempotency_key=(
-                f"{strategy_id}-{fill.instrument.symbol}-protective-stop-"
-                f"{fill.broker_order_id}"
-            ),
+            idempotency_key=stop_key,
         )
         if not self._validate_order(order, is_entry=False):
             self._write_order_event(
@@ -409,6 +435,7 @@ class OrderManager:
         status = await self._broker.submit_order(order)
         self._order_owner[status.broker_order_id] = strategy_id
         self._order_role[status.broker_order_id] = "protective_stop"
+        self._order_trade_id[status.broker_order_id] = trade_id
         self._write_order_event(
             "protective_stop_submitted",
             strategy_id=strategy_id,
@@ -467,6 +494,14 @@ class OrderManager:
     def _is_dry_run_strategy(self, strategy_id: str) -> bool:
         return self._strategy_modes.get(strategy_id) == STRATEGY_MODE_DRY_RUN
 
+    def _resolve_trade_id(self, signal: Signal, strategy_id: str) -> str | None:
+        policy = self._position_policies.get(strategy_id)
+        if policy is None or policy.position_mode != POSITION_MODE_MULTI:
+            return signal.trade_id
+        if signal.trade_id:
+            return signal.trade_id
+        return f"{signal.instrument.symbol.lower()}_{next(self._trade_counter)}"
+
     def _dry_run_status(self, strategy_id: str) -> OrderStatus:
         return OrderStatus(
             broker_order_id=f"dry-run-{strategy_id}-{next(self._dry_run_counter)}",
@@ -496,12 +531,19 @@ class OrderManager:
         if self._audit is not None:
             self._audit.order({"event": event, **fields})
 
-    def _write_fill_event(self, fill, strategy_id: str | None, role: str) -> None:
+    def _write_fill_event(
+        self,
+        fill,
+        strategy_id: str | None,
+        role: str,
+        trade_id: str | None,
+    ) -> None:
         if self._audit is not None:
             self._audit.fill({
                 "event": "fill",
                 "strategy_id": strategy_id,
                 "role": role,
+                "trade_id": trade_id,
                 "fill": fill,
             })
 

@@ -10,16 +10,19 @@ from __future__ import annotations
 import threading
 import re
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
 
 from ..data.manager import DataManager
 from ..engine.timeframes import Timeframe
-from ..types import Instrument
+from ..types import Bar, Instrument
 from . import indicators as ind
 from .ids import parse_indicator_id
+
+_OHLCV = ["open", "high", "low", "close", "volume"]
 
 
 class FeatureRegistry:
@@ -33,8 +36,48 @@ class FeatureRegistry:
         self._managers = dict(managers)
         self._max = max_cache_size
         self._cache: OrderedDict[tuple, Any] = OrderedDict()
+        self._source_bars: dict[Instrument, pd.DataFrame] = {}
+        self._source_versions: dict[Instrument, int] = {}
         self._compute_counts: dict[tuple, int] = {}
         self._lock = threading.RLock()
+
+    def as_of(self, timestamp: datetime) -> "FeatureView":
+        """Return a timestamp-bound accessor that prevents future leakage."""
+        return FeatureView(self, timestamp)
+
+    def preload_from_managers(self) -> None:
+        """Seed feature sources from currently backfilled DataManager bars."""
+        with self._lock:
+            for instrument, manager in self._managers.items():
+                self._set_source(instrument, manager.bars_1m())
+
+    def preload_bars(self, bars: Iterable[Bar]) -> None:
+        """Merge replay/future bars into feature sources for vectorized backtests."""
+        grouped: dict[Instrument, list[Bar]] = {}
+        for bar in bars:
+            grouped.setdefault(bar.instrument, []).append(bar)
+
+        with self._lock:
+            for instrument, manager in self._managers.items():
+                frames = [manager.bars_1m()]
+                extra = _bars_to_frame(grouped.get(instrument, []))
+                if not extra.empty:
+                    frames.append(extra)
+                self._set_source(instrument, _combine_frames(frames))
+
+    def on_bar(self, bar: Bar) -> None:
+        """Merge a live/replay bar into the feature source when needed."""
+        with self._lock:
+            existing = self._source_bars.get(bar.instrument)
+            if existing is None:
+                return
+            row = _bars_to_frame([bar])
+            if row.empty:
+                return
+            ts = row.index[0]
+            if ts in existing.index and _rows_equal(existing.loc[ts], row.iloc[0]):
+                return
+            self._set_source(bar.instrument, _combine_frames([existing, row]))
 
     def get(
         self,
@@ -49,13 +92,43 @@ class FeatureRegistry:
             ctx.features.get("ema", SPY, "1d", period=20)
             ctx.features.get("bollinger", SPY, "1d", period=200)
 
-        The cache is keyed by indicator name, instrument, timeframe, params,
-        and the instrument DataManager revision. The same request from multiple
-        strategies on the same bar computes once.
+        The same request from multiple strategies on the same bar computes once.
+        When vectorized sources are preloaded, timestamp-bound feature views
+        slice the precomputed series to the current bar.
         """
-        manager = self._manager_for(instrument)
         normalized_name = _normalize_name(name)
         normalized_params = _normalize_params(params)
+        return self._get(
+            normalized_name,
+            instrument,
+            timeframe,
+            normalized_params,
+            params,
+            as_of=None,
+        )
+
+    def _get(
+        self,
+        normalized_name: str,
+        instrument: Instrument,
+        timeframe: str,
+        normalized_params: tuple[tuple[str, Any], ...],
+        params: Mapping[str, Any],
+        *,
+        as_of: datetime | None,
+    ) -> Any:
+        manager = self._manager_for(instrument)
+        with self._lock:
+            if instrument in self._source_bars:
+                return self._get_from_source(
+                    normalized_name,
+                    instrument,
+                    timeframe,
+                    normalized_params,
+                    params,
+                    as_of=as_of,
+                )
+
         revision = manager.revision
         key = (
             normalized_name,
@@ -69,7 +142,7 @@ class FeatureRegistry:
             cached = self._cache.get(key)
             if cached is not None:
                 self._cache.move_to_end(key)
-                return _copy(cached)
+                return _slice_to_as_of(cached, timeframe, as_of)
 
             bars = self._bars(manager, timeframe)
             value = self._compute(normalized_name, bars, params)
@@ -83,14 +156,22 @@ class FeatureRegistry:
             self._compute_counts[compute_key] = self._compute_counts.get(compute_key, 0) + 1
             if len(self._cache) > self._max:
                 self._cache.popitem(last=False)
-            return _copy(value)
+            return _slice_to_as_of(value, timeframe, as_of)
 
-    def get_id(self, indicator_id: str) -> Any:
+    def get_id(self, indicator_id: str, *, as_of: datetime | None = None) -> Any:
         """Compatibility helper for ids like ``ema_20@QQQ.3m``."""
         name, symbol, timeframe = parse_indicator_id(indicator_id)
         instrument = self._instrument_for_symbol(symbol)
         public_name, params = _name_to_request(name)
-        return self.get(public_name, instrument, timeframe or "1m", **params)
+        normalized_name = _normalize_name(public_name)
+        return self._get(
+            normalized_name,
+            instrument,
+            timeframe or "1m",
+            _normalize_params(params),
+            params,
+            as_of=as_of,
+        )
 
     def invalidate(self, instrument: Instrument | None = None) -> None:
         """Clear cache entries.
@@ -99,6 +180,8 @@ class FeatureRegistry:
         memory and is safe to call after each live bar.
         """
         with self._lock:
+            if instrument is not None and instrument in self._source_bars:
+                return
             if instrument is None:
                 self._cache.clear()
                 return
@@ -121,6 +204,80 @@ class FeatureRegistry:
             _normalize_params(params),
         )
         return self._compute_counts.get(key, 0)
+
+    def _get_from_source(
+        self,
+        normalized_name: str,
+        instrument: Instrument,
+        timeframe: str,
+        normalized_params: tuple[tuple[str, Any], ...],
+        params: Mapping[str, Any],
+        *,
+        as_of: datetime | None,
+    ) -> Any:
+        source_version = self._source_versions[instrument]
+        key = (
+            "feature",
+            normalized_name,
+            instrument,
+            timeframe,
+            normalized_params,
+            source_version,
+        )
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            return _slice_to_as_of(cached, timeframe, as_of)
+
+        bars = self._source_timeframe_bars(instrument, timeframe, source_version)
+        value = self._compute(normalized_name, bars, params)
+        self._cache[key] = value
+        compute_key = (
+            normalized_name,
+            instrument,
+            timeframe,
+            normalized_params,
+        )
+        self._compute_counts[compute_key] = self._compute_counts.get(compute_key, 0) + 1
+        if len(self._cache) > self._max:
+            self._cache.popitem(last=False)
+        return _slice_to_as_of(value, timeframe, as_of)
+
+    def _source_timeframe_bars(
+        self,
+        instrument: Instrument,
+        timeframe: str,
+        source_version: int,
+    ) -> pd.DataFrame:
+        key = ("bars", instrument, timeframe, source_version)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            return cached.copy()
+
+        source = self._source_bars[instrument]
+        if timeframe == "1m":
+            result = source.copy()
+        else:
+            result = managerless_resample(source, Timeframe.parse(timeframe))
+        self._cache[key] = result
+        if len(self._cache) > self._max:
+            self._cache.popitem(last=False)
+        return result.copy()
+
+    def _set_source(self, instrument: Instrument, bars: pd.DataFrame) -> None:
+        clean = bars[[col for col in _OHLCV if col in bars.columns]].copy()
+        if clean.empty:
+            clean.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
+        else:
+            clean.index = _normalize_index(clean.index)
+            clean = clean.sort_index()
+            clean = clean[~clean.index.duplicated(keep="last")]
+        existing = self._source_bars.get(instrument)
+        if existing is not None and clean.equals(existing):
+            return
+        self._source_bars[instrument] = clean
+        self._source_versions[instrument] = self._source_versions.get(instrument, 0) + 1
 
     def _manager_for(self, instrument: Instrument) -> DataManager:
         manager = self._managers.get(instrument)
@@ -228,6 +385,118 @@ def _normalize_params(params: Mapping[str, Any]) -> tuple[tuple[str, Any], ...]:
 
 def _copy(value: Any) -> Any:
     return value.copy() if hasattr(value, "copy") else value
+
+
+class FeatureView:
+    """Timestamp-bound feature accessor used inside MarketContext."""
+
+    def __init__(self, registry: FeatureRegistry, timestamp: datetime) -> None:
+        self._registry = registry
+        self._timestamp = timestamp
+
+    def get(
+        self,
+        name: str,
+        instrument: Instrument,
+        timeframe: str = "1m",
+        **params: Any,
+    ) -> Any:
+        normalized_name = _normalize_name(name)
+        return self._registry._get(
+            normalized_name,
+            instrument,
+            timeframe,
+            _normalize_params(params),
+            params,
+            as_of=self._timestamp,
+        )
+
+    def get_id(self, indicator_id: str) -> Any:
+        return self._registry.get_id(indicator_id, as_of=self._timestamp)
+
+
+def managerless_resample(bars_1m: pd.DataFrame, target_tf: Timeframe) -> pd.DataFrame:
+    from ..data.resampler import Resampler
+
+    return Resampler().resample(bars_1m, target_tf)
+
+
+def _slice_to_as_of(value: Any, timeframe: str, as_of: datetime | None) -> Any:
+    if as_of is None or not hasattr(value, "index"):
+        return _copy(value)
+    if not isinstance(value.index, pd.DatetimeIndex):
+        return _copy(value)
+    if value.empty:
+        return _copy(value)
+
+    ts = pd.Timestamp(as_of)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+
+    tf = Timeframe.parse(timeframe)
+    if tf.seconds <= 60:
+        cutoff = ts
+        mask = value.index <= cutoff
+    else:
+        cutoff = ts.floor(_to_pandas_offset(tf))
+        mask = value.index < cutoff
+    return value.loc[mask].copy()
+
+
+def _to_pandas_offset(tf: Timeframe) -> str:
+    unit = tf.label[-1]
+    qty = tf.label[:-1]
+    aliases = {"s": "s", "m": "min", "h": "h", "d": "D", "w": "W"}
+    return f"{qty}{aliases[unit]}"
+
+
+def _bars_to_frame(bars: Iterable[Bar]) -> pd.DataFrame:
+    rows = []
+    for bar in bars:
+        ts = bar.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        rows.append({
+            "timestamp": pd.Timestamp(ts).tz_convert("UTC"),
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+        })
+    if not rows:
+        df = pd.DataFrame(columns=_OHLCV)
+        df.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
+        return df
+    return pd.DataFrame(rows).set_index("timestamp")
+
+
+def _combine_frames(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
+    valid = [frame for frame in frames if frame is not None and not frame.empty]
+    if not valid:
+        df = pd.DataFrame(columns=_OHLCV)
+        df.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
+        return df
+    result = pd.concat(valid).sort_index()
+    result.index = _normalize_index(result.index)
+    result = result[~result.index.duplicated(keep="last")]
+    return result
+
+
+def _normalize_index(index: pd.Index) -> pd.DatetimeIndex:
+    dti = pd.DatetimeIndex(index)
+    if dti.tz is None:
+        dti = dti.tz_localize("UTC")
+    return dti.tz_convert("UTC")
+
+
+def _rows_equal(left: pd.Series, right: pd.Series) -> bool:
+    try:
+        return bool(left[_OHLCV].equals(right[_OHLCV]))
+    except Exception:
+        return False
 
 
 def _name_to_request(name: str) -> tuple[str, dict[str, Any]]:

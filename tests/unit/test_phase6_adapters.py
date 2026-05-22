@@ -15,7 +15,13 @@ from core.adapters.ibkr.data import IBKRDataProvider
 from core.adapters.paper.broker import PaperBroker
 from core.adapters.paper.data import ReplayDataProvider
 from core.engine.timeframes import TF_1M, TF_5S
-from core.interfaces.strategy import ProtectiveStopSpec, StrategyKernel, StrategySpec
+from core.interfaces.strategy import (
+    POSITION_MODE_MULTI,
+    PositionPolicy,
+    ProtectiveStopSpec,
+    StrategyKernel,
+    StrategySpec,
+)
 from core.orders.order_manager import OrderManager
 from core.portfolio.state import PortfolioState
 from core.risk.policy import RiskPolicy
@@ -816,6 +822,37 @@ def test_order_manager_live_strategy_still_submits_with_other_dry_run_strategy()
         await om._process_signal(Signal(MNQ, "long"), "_live_strategy")
         assert broker.submit_calls == 1
         assert broker.submitted_orders[0].strategy_id == "_live_strategy"
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_order_manager_multi_position_policy_allows_independent_lots():
+    async def run():
+        broker = _CountingBroker()
+        portfolio = PortfolioState()
+        om = OrderManager(
+            broker,
+            portfolio,
+            RiskPolicy(position_size_shares=1, max_order_quantity=5),
+            position_policies={
+                "_multi": PositionPolicy(position_mode=POSITION_MODE_MULTI),
+            },
+        )
+
+        bars = _bars(QQQ, 2)
+        await om._process_signal(Signal(QQQ, "long", trade_id="lot_a"), "_multi")
+        await broker.on_bar(bars[0])
+        await om.drain_ready_fills()
+
+        await om._process_signal(Signal(QQQ, "long", trade_id="lot_b"), "_multi")
+        await broker.on_bar(bars[1])
+        await om.drain_ready_fills()
+
+        lots = portfolio.get_strategy_positions("_multi", QQQ)
+        assert broker.submit_calls == 2
+        assert sorted(pos.trade_id for pos in lots) == ["lot_a", "lot_b"]
+        assert portfolio.get_strategy_position("_multi", QQQ).quantity == 2
 
     import asyncio
     asyncio.run(run())

@@ -180,6 +180,19 @@ class DataManager:
     def revision(self) -> int:
         return self._revision
 
+    def bar_count(self) -> int:
+        """Return the number of stored 1-minute bars without copying them."""
+        with self._lock:
+            return len(self._bars)
+
+    def session_count(self) -> int:
+        """Return the number of stored sessions without copying OHLCV rows."""
+        with self._lock:
+            if self._bars.empty:
+                return 0
+            local_index = self._bars.index.tz_convert(self._session_tz)
+            return int(local_index.normalize().nunique())
+
     @property
     def instrument(self) -> Instrument:
         return self._instrument

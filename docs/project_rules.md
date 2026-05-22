@@ -28,6 +28,7 @@ Tests that connect to a real broker session, including IBKR paper, must stay opt
 All strategy implementations are highly sensitive and proprietary unless explicitly listed as public.
 
 - Public strategy source allowed in git: `strategies/stoch_3m_cross_long.py`.
+- Public copy-only strategy scaffold allowed in git: `strategies/_sample_strategy.py`.
 - Public package marker allowed in git: `strategies/__init__.py`.
 - All other strategy source files, compiled artifacts, configs, docs, tests, formulas, thresholds, identifiers, logs, and derivative materials must remain hidden from git and public documentation.
 - Do not move proprietary strategy details into public docs, tests, config examples, comments, or shared framework modules.
@@ -39,8 +40,11 @@ New strategies should follow the existing `strategies/stoch_3m_cross_long.py` sh
 
 - Put one strategy class per strategy file under `strategies/`; use module-level `Instrument` and timezone constants for shared objects.
 - Decorate the class with `@register_strategy`, subclass `StrategyKernel`, and define a class-level `SPEC = StrategySpec(...)`.
+- Start from `strategies/_sample_strategy.py` when creating a new strategy, then rename the file, class, and `StrategySpec.id`.
 - Treat `StrategySpec.id` as the stable runtime identity used by config, logs, API metadata, and adopted-position ownership. Do not rely on the filename as the strategy id.
-- Keep `SPEC` minimal: declare only instruments, required timeframes, warmup bars, and broker-side protective stops the engine must know before runtime.
+- Keep `SPEC` minimal: declare only instruments, required timeframes, warmup bars, position policy, and broker-side protective stops the engine must know before runtime.
+- Declare `StrategySpec.position_policy` explicitly. Use `single_position` for one open strategy position per execution instrument; use `multi_position` only when the strategy creates independent logical lots and can manage per-lot state, preferably with deterministic `Signal.trade_id` values.
+- Declare the entry-frequency rule in `position_policy`: `one_per_day`, `one_per_session`, or `unlimited`. Do not duplicate date-throttle checks inside each strategy unless a private rule is stricter than the framework policy.
 - For protected/private strategies, prefer `ctx.features.get(...)` inside `generate()` or `on_exit()` for common indicators instead of listing every feature in `StrategySpec.indicators`. Example: `ctx.features.get("ema", QQQ, "3m", period=20)`.
 - Keep proprietary formulas, thresholds, scoring, entry/exit conditions, and condition names inside the private strategy file. Do not copy them into shared framework modules, config examples, public docs, or tests.
 - Keep `generate()` and `on_exit()` pure: no broker calls, file I/O, network I/O, thread management, or framework mutation outside the provided `state` dict.

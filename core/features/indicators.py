@@ -230,7 +230,7 @@ def range_ratio_by_session(
     for d, rng in session_range.items():
         avg = rolling_avg.get(d, np.nan)
         date_to_ratio[d] = rng / avg if avg and avg > 0 else np.nan
-    return dates.map(date_to_ratio)
+    return pd.Series(dates.map(date_to_ratio), index=bars.index, dtype=float)
 
 
 def vix_ema_ratio(

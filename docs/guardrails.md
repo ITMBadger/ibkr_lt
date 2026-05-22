@@ -37,9 +37,15 @@ This prevents hard venue rejects for crypto step sizes and ensures futures are a
 
 `Scheduler` checks `StrategySpec.warmup_bars` before dispatching a strategy. A strategy whose primary timeframe has fewer bars than `warmup_bars` will not receive a `MarketContext` and cannot generate a signal. This prevents signals on thin data at startup.
 
-### One Signal Per Day
+### Strategy Position Policy
 
-All live strategies enforce a `state["last_signal_date"]` check inside `generate()`. A second signal on the same calendar day is silently dropped. This is strategy-side enforcement (inside each `.py` file), not a framework gate.
+Strategies declare `StrategySpec.position_policy`.
+
+`position_mode="single_position"` permits one open strategy position per execution instrument. While that position is open, `Engine` calls `on_exit()` instead of `generate()`.
+
+`position_mode="multi_position"` permits independent logical lots on the same instrument. Multi-position strategies should use deterministic `Signal.trade_id` values when they need per-lot exit state.
+
+`entry_frequency` is enforced by `Engine` before order submission. Supported values are `one_per_day`, `one_per_session`, and `unlimited`. The current session key is the market date in the broker/session timezone.
 
 ### Centralized Order Submission
 
@@ -66,6 +72,10 @@ Strategies may declare `StrategySpec.protective_stop`. When an entry fill arrive
 ### Event Backtests
 
 `python -m backtest.run` uses the production `Engine` with `SimulatedClock`, `ReplayDataProvider`, `PaperBroker`, and real strategy modules. The runner loads warmup data from CSV before the replay start timestamp, then executes strategy logic only on replay bars inside the requested window.
+
+Default `event` mode dispatches selected strategies on every primary 1-minute replay bar, matching the live event cadence. `fast-event` mode keeps every 1-minute data, broker, order, and exit update, but only builds flat-entry strategy context when the selected evaluation timeframe has a new completed bar. Use `--mode fast-event` for faster research passes and `--eval-timeframe <bar_size>` when auto-detection is not enough.
+
+Backtests may preload replay bars into the shared feature registry so common indicators are vectorized once, then sliced to the current `MarketContext.timestamp`. Resampled features only expose bars completed before the current replay bar, so preloading must not create future leakage.
 
 Backtest market orders fill at the next replay bar open. Stop orders fill at `stop_price` when crossed by a replay bar. These assumptions are deterministic and close to the live event flow, but they are not a guarantee of identical IBKR live fills, partial fills, slippage, or gap-through stop behavior.
 
@@ -132,7 +142,7 @@ These controls existed in the archived legacy system and will be ported back onc
 | Centralized entry window gate (`min_entry_time`, `max_entry_time`) | archived runtime policy | Deferred; bundled strategies still apply their own local entry windows |
 | Daily drawdown kill switch | archived runtime state + heartbeat | Deferred |
 | Priority pairs (long/short conflict prevention) | archived priority-pair policy | Deferred |
-| Configurable position modes (`first_only`, `allow_scaling`) | archived trade policy | Deferred |
+| Additional portfolio/trade policies beyond `single_position`, `multi_position`, and entry frequency | archived trade policy | Deferred |
 | Trigger dedup (same `trigger_ts` across bars) | archived dispatcher | Deferred |
 | L1 session filters | archived central runtime | Deferred |
 | Manual startup adoption review workflow | archived adoption workflow | Deferred |

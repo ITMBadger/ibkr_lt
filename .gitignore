@@ -32,12 +32,13 @@ orders*.jsonl
 fills*.jsonl
 
 # Proprietary strategy source and derivative artifacts.
-# Keep strategies/__init__.py public so the package exists, but do not commit
-# private strategy implementations or compiled/reverse-engineerable outputs.
+# Keep strategies/__init__.py and the copy-only sample public, but do not
+# commit private strategy implementations or compiled/reverse-engineerable outputs.
 strategies/*.py
 !strategies/__init__.py
 strategies/**/*.py
 !strategies/**/__init__.py
+!strategies/_sample_strategy.py
 !strategies/stoch_3m_cross_long.py
 strategies/**/*.pyc
 strategies/**/*.pyd

@@ -14,9 +14,19 @@ async, and sync compiles cleanly with Cython.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Mapping
+from typing import Any, ClassVar, Literal, Mapping
 
 from ..types import Instrument, MarketContext, Position, Signal
+
+POSITION_MODE_SINGLE = "single_position"
+POSITION_MODE_MULTI = "multi_position"
+
+ENTRY_FREQUENCY_ONE_PER_DAY = "one_per_day"
+ENTRY_FREQUENCY_ONE_PER_SESSION = "one_per_session"
+ENTRY_FREQUENCY_UNLIMITED = "unlimited"
+
+PositionMode = Literal["single_position", "multi_position"]
+EntryFrequency = Literal["one_per_day", "one_per_session", "unlimited"]
 
 
 @dataclass(frozen=True)
@@ -28,12 +38,41 @@ class ProtectiveStopSpec:
 
 
 @dataclass(frozen=True)
+class PositionPolicy:
+    """Declares how a strategy may hold positions and emit entry signals."""
+
+    position_mode: PositionMode = POSITION_MODE_SINGLE
+    entry_frequency: EntryFrequency = ENTRY_FREQUENCY_UNLIMITED
+    max_concurrent_positions: int | None = 1
+
+    def __post_init__(self) -> None:
+        valid_modes = {POSITION_MODE_SINGLE, POSITION_MODE_MULTI}
+        if self.position_mode not in valid_modes:
+            raise ValueError(f"Unsupported position_mode: {self.position_mode!r}")
+
+        valid_frequencies = {
+            ENTRY_FREQUENCY_ONE_PER_DAY,
+            ENTRY_FREQUENCY_ONE_PER_SESSION,
+            ENTRY_FREQUENCY_UNLIMITED,
+        }
+        if self.entry_frequency not in valid_frequencies:
+            raise ValueError(f"Unsupported entry_frequency: {self.entry_frequency!r}")
+
+        if (
+            self.max_concurrent_positions is not None
+            and self.max_concurrent_positions < 1
+        ):
+            raise ValueError("max_concurrent_positions must be >= 1 or None")
+
+
+@dataclass(frozen=True)
 class StrategySpec:
     """Declares what data, timeframes, and indicators a strategy needs.
 
     The engine uses SPEC to:
     - subscribe and backfill primary_instrument and all reference_instruments
     - enforce warmup_bars before calling generate()
+    - enforce position and entry-frequency policy before accepting new entries
 
     indicators is retained for clear/dev and legacy strategies. Protected
     strategies should prefer ctx.features.get(...) at runtime so public metadata
@@ -48,6 +87,7 @@ class StrategySpec:
     warmup_bars: Mapping[str, int] = field(default_factory=dict)
     indicators: tuple[str, ...] = ()
     protective_stop: ProtectiveStopSpec | None = None
+    position_policy: PositionPolicy = field(default_factory=PositionPolicy)
 
 
 class StrategyKernel:
