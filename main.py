@@ -7,20 +7,20 @@ import logging
 import os
 import sys
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Sequence
 
 from core import DataFeed, Engine, Instrument, WallClock, load_strategies
-from core.adapters.dry_run import DryRunBroker
 from core.adapters.ibkr.broker import IBKRBroker
 from core.adapters.ibkr.client import IBKRClient
 from core.adapters.ibkr.data import IBKRDataProvider
 from core.adapters.polygon.data import PolygonDataProvider
 from core.adapters.csv.data import CSVDataProvider
-from core.adapters.paper.broker import PaperBroker
 from core.audit import AuditLogger, configure_runtime_logging
 from core.exceptions import ConfigError
 from core.risk.policy import RiskPolicy
 from core.engine.loader import get_registry
+from core.orders.strategy_modes import strategy_mode_map, validate_strategy_modes
 from api.server import start_control_api_thread
 
 logging.basicConfig(
@@ -46,7 +46,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--client-id", type=int, default=None, help="Override IBKR API client ID")
     parser.add_argument("--account", default=None, help="Override IBKR account ID")
     parser.add_argument("--strategy", default=None, help="Run one strategy by id")
-    parser.add_argument("--dry-run", action="store_true", help="Signals only, no native orders")
     parser.add_argument("--lookback-days", type=int, default=None)
     api_mode = parser.add_mutually_exclusive_group()
     api_mode.add_argument(
@@ -82,6 +81,9 @@ def main() -> None:
     strategy_ids = config.get("strategies") or list(registry.keys())
     if isinstance(strategy_ids, str):
         strategy_ids = [strategy_ids]
+    strategy_ids = [str(strategy_id) for strategy_id in strategy_ids]
+    validate_strategy_modes(config.get("strategy_modes"), registry.keys())
+    strategy_modes = strategy_mode_map(config.get("strategy_modes"), strategy_ids)
 
     strategies = []
     for sid in strategy_ids:
@@ -91,15 +93,13 @@ def main() -> None:
         strategies.append((registry[sid](), {}))
 
     broker, shared = _build_broker(config)
-    if bool(config.get("dry_run", False)):
-        broker = DryRunBroker(broker)
     data_feed = _build_data_feed(config, shared)
 
     print(f"Execution: {broker.name}")
+    print(f"IBKR environment: {config.get('mode', '')}")
     print(f"Data hist/live: {_provider_name(config, 'historical')} / {_provider_name(config, 'live')}")
     print(f"Strategies: {strategy_ids}")
-    if bool(config.get("dry_run", False)):
-        print("Dry run: ON — no native order placement")
+    print(f"Strategy modes: {strategy_modes}")
 
     engine = Engine(
         broker=broker,
@@ -115,8 +115,9 @@ def main() -> None:
         session_tz=str(config.get("session_timezone", "America/New_York")),
         adopted_position_map=_adopted_position_map(config),
         audit_logger=audit_logger,
+        strategy_modes=strategy_modes,
     )
-    api_server = _start_control_api(config, engine, strategy_ids)
+    api_server = _start_control_api(config, engine, strategy_ids, strategy_modes)
 
     print("Running. Press Ctrl+C to stop.")
     try:
@@ -138,7 +139,6 @@ def _legacy_cli_config(args: argparse.Namespace) -> dict[str, Any]:
     strategy_ids = [args.strategy] if args.strategy else None
     return {
         "mode": mode,
-        "dry_run": args.dry_run,
         "lookback_days": args.lookback_days or 500,
         "strategies": strategy_ids,
         "execution": {
@@ -168,11 +168,14 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_yaml(args.config)
     if "mode" in config:
         raise ValueError("YAML config must not define mode; use --paper or --live")
+    if "dry_run" in config:
+        raise ValueError(
+            "YAML config must not define dry_run; use strategy_modes.<strategy_id>: dry_run"
+        )
 
     mode = "paper" if args.paper else "live"
     port = _ibkr_port(mode, args.gateway)
     config["mode"] = mode
-    config["dry_run"] = bool(config.get("dry_run", False) or args.dry_run)
     if args.lookback_days is not None:
         config["lookback_days"] = args.lookback_days
     else:
@@ -253,7 +256,7 @@ def _build_broker(config: dict[str, Any]):
     if provider == "ibkr":
         account = str(execution.get("account", "")).strip()
         if not account and str(config.get("mode", "")).lower() != "paper":
-            raise ConfigError("IBKR live execution requires execution.account or --account")
+            raise ConfigError("IBKR live environment requires execution.account or --account")
         client = IBKRClient()
         shared["ibkr_client"] = client
         broker = IBKRBroker(
@@ -264,9 +267,7 @@ def _build_broker(config: dict[str, Any]):
             client_id=int(execution.get("client_id", 1)),
         )
         return broker, shared
-    if provider == "paper":
-        return PaperBroker(), shared
-    raise ValueError(f"Unknown execution provider: {provider!r}")
+    raise ConfigError("main.py runtime execution provider must be ibkr")
 
 
 def _build_data_feed(config: dict[str, Any], shared: dict[str, Any]) -> DataFeed:
@@ -328,7 +329,12 @@ def _adopted_position_map(config: dict[str, Any]) -> dict[Instrument, str]:
     return result
 
 
-def _start_control_api(config: dict[str, Any], engine: Engine, strategy_ids: list[str]):
+def _start_control_api(
+    config: dict[str, Any],
+    engine: Engine,
+    strategy_ids: list[str],
+    strategy_modes: Mapping[str, str] | None = None,
+):
     api_cfg = dict(config.get("api") or {})
     if not bool(api_cfg.get("enabled", True)):
         return None
@@ -340,7 +346,7 @@ def _start_control_api(config: dict[str, Any], engine: Engine, strategy_ids: lis
         port=port,
         token_env=str(api_cfg.get("token_env", "IBKR_LT_API_TOKEN")),
         log_level=str(api_cfg.get("log_level", "warning")),
-        metadata=_api_metadata(config, strategy_ids),
+        metadata=_api_metadata(config, strategy_ids, strategy_modes),
     )
     print(f"Control API: http://{host}:{port}")
     _warn_if_heartbeat_monitor_missing()
@@ -408,11 +414,16 @@ def _warn_if_heartbeat_monitor_missing(proc_root: Path = Path("/proc")) -> None:
     )
 
 
-def _api_metadata(config: dict[str, Any], strategy_ids: list[str]) -> dict[str, Any]:
+def _api_metadata(
+    config: dict[str, Any],
+    strategy_ids: list[str],
+    strategy_modes: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     data = dict(config.get("data") or {})
+    modes = dict(strategy_modes or strategy_mode_map(config.get("strategy_modes"), strategy_ids))
     return {
         "mode": str(config.get("mode", "")),
-        "dry_run": bool(config.get("dry_run", False)),
+        "strategy_modes": modes,
         "strategies": list(strategy_ids),
         "execution_provider": str(dict(config.get("execution") or {}).get("provider", "ibkr")),
         "historical_provider": str(dict(data.get("historical") or {}).get("provider", "ibkr")),

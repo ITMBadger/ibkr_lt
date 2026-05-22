@@ -33,7 +33,7 @@ async def health(
         "running": running,
         "connected": connected,
         "mode": str(metadata.get("mode", "")),
-        "dry_run": bool(metadata.get("dry_run", False)),
+        "strategy_modes": dict(metadata.get("strategy_modes") or {}),
         "next_endpoint": next_endpoint,
         "operator_message": operator_message,
     }

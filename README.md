@@ -10,7 +10,7 @@ The core idea is simple: the engine is stable, while broker and market-data prov
 
 - Strategies produce intent only: `Signal` or exit reason.
 - The engine owns scheduling, market context construction, risk routing, and execution flow.
-- `OrderManager` is the only framework component that submits orders to broker adapters.
+- `OrderManager` is the only framework component that submits orders to broker adapters and enforces per-strategy dry-run.
 - `DataFeed` composes historical and live data providers.
 - `DataManager` owns bar storage, deduplication, revisioning, and resampling.
 - `FeatureRegistry` computes shared indicators once per instrument/timeframe/revision.
@@ -101,6 +101,20 @@ Signal, order, and fill audit files remain append-only:
 - `signals.jsonl`
 - `orders.jsonl`
 - `fills.jsonl`
+
+## Strategy Modes
+
+Runtime paper/live selection only chooses the IBKR environment and port. Native
+order placement is controlled per strategy in `config.yaml`:
+
+```yaml
+strategy_modes:
+  stoch_3m_cross_long: live
+  another_strategy: dry_run
+```
+
+`dry_run` strategies still see real account, position, and market data, but
+`OrderManager` logs order intent without calling the broker submit API.
 
 ## Heartbeat Monitor
 

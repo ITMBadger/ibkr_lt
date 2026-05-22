@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from core.exceptions import ConfigError
+from core.orders.strategy_modes import validate_strategy_modes
 from main import (
+    _api_metadata,
     _build_broker,
     _cmdline_is_heartbeat_monitor,
     _config_from_args,
@@ -33,7 +35,6 @@ def _args(**overrides):
         "client_id": None,
         "account": None,
         "strategy": None,
-        "dry_run": False,
         "lookback_days": None,
         "api": False,
         "no_api": False,
@@ -78,6 +79,43 @@ def test_yaml_config_api_flag_reenables_explicitly_disabled_api(tmp_path: Path):
     config = _config_from_args(_args(config=str(config_path), api=True))
 
     assert config["api"]["enabled"] is True
+
+
+def test_yaml_config_rejects_legacy_global_dry_run(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("dry_run: true\nstrategies: []\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strategy_modes"):
+        _config_from_args(_args(config=str(config_path)))
+
+
+def test_api_metadata_includes_strategy_modes():
+    metadata = _api_metadata(
+        {"mode": "paper", "strategy_modes": {"a": "dry_run"}},
+        ["a", "b"],
+    )
+
+    assert metadata["strategy_modes"] == {"a": "dry_run", "b": "live"}
+
+
+def test_api_metadata_uses_normalized_strategy_modes_argument():
+    metadata = _api_metadata(
+        {"mode": "paper", "strategy_modes": {"a": "live"}},
+        ["a"],
+        {"a": "dry_run"},
+    )
+
+    assert metadata["strategy_modes"] == {"a": "dry_run"}
+
+
+def test_strategy_modes_reject_unknown_strategy_id():
+    with pytest.raises(ValueError, match="unknown strategy"):
+        validate_strategy_modes({"missing": "live"}, ["known"])
+
+
+def test_strategy_modes_reject_invalid_mode():
+    with pytest.raises(ValueError, match="Invalid strategy mode"):
+        validate_strategy_modes({"known": "paper"}, ["known"])
 
 
 def test_ibkr_broker_requires_explicit_account():

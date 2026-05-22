@@ -12,8 +12,11 @@ class HealthResponse(BaseModel):
     phase: str = Field(description="Engine phase: initialized, starting, running, stopped, or error.")
     running: bool = Field(description="Whether the engine is currently running.")
     connected: bool = Field(description="Whether broker and data feed are connected.")
-    mode: str = Field(default="", description="Runtime mode selected at bootstrap.")
-    dry_run: bool = Field(default=False, description="Whether native broker order placement is disabled.")
+    mode: str = Field(default="", description="IBKR environment selected at bootstrap.")
+    strategy_modes: dict[str, str] = Field(
+        default_factory=dict,
+        description="Per-strategy execution mode: live or dry_run.",
+    )
     next_endpoint: str | None = Field(default=None, description="Suggested endpoint to call next.")
     operator_message: str = Field(description="Short human-readable API state summary.")
 
@@ -27,4 +30,3 @@ class ApiMeta(BaseModel):
 
 
 __all__ = ["ApiMeta", "HealthResponse"]
-

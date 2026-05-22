@@ -4,12 +4,10 @@
 #
 # Mode is intentionally not stored here. Choose paper/live at runtime with
 # --paper or --live. Use --config only when running an alternate YAML file.
-# This file is configured for paper-account order testing. Run with --paper
-# (account is auto-detected from the TWS paper session). For --live, pass
-# --account or set execution.account in a private local config.
-# Add --dry-run at runtime when only signal/order-intent logging is desired.
+# This file is configured for IBKR paper-account order testing. Run with
+# --paper to select the paper port. For --live, pass --account or set
+# execution.account in a private local config.
 
-dry_run: false
 lookback_days: 10
 position_size_shares: 1
 max_order_quantity: 2
@@ -36,6 +34,11 @@ api:
 
 strategies:
   - stoch_3m_cross_long
+
+# Strategy modes are enforced inside OrderManager.
+# live submits native orders; dry_run logs intent without broker submission.
+strategy_modes:
+  stoch_3m_cross_long: live
 
 execution:
   provider: ibkr

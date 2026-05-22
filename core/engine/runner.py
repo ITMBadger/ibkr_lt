@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import RLock
@@ -24,6 +25,7 @@ from ..data.bar_builder import BarBuilder
 from ..data.feed import DataFeed
 from ..data.manager import DataManager
 from ..orders.order_manager import OrderManager
+from ..orders.strategy_modes import strategy_mode_map
 from ..features.registry import FeatureRegistry
 from ..audit import AuditLogger, pop_decision
 from .timeframes import TF_1M, TF_5S
@@ -63,6 +65,7 @@ class Engine:
         session_tz: str = "America/New_York",
         adopted_position_map: dict[Instrument, str] | None = None,
         audit_logger: AuditLogger | None = None,
+        strategy_modes: Mapping[str, str] | None = None,
     ) -> None:
         self._broker = broker
         if data_feed is not None:
@@ -73,6 +76,8 @@ class Engine:
             self._data_feed = DataFeed(historical, streaming)
         self._clock = clock or WallClock()
         self._strategies = strategies or []
+        strategy_ids = [kernel.SPEC.id for kernel, _ in self._strategies]
+        self._strategy_modes = strategy_mode_map(strategy_modes, strategy_ids)
         self._risk = risk or RiskPolicy()
         self._pool_workers = thread_pool_workers
         self._lookback_days = lookback_days
@@ -151,6 +156,7 @@ class Engine:
                         "timeframes": list(kernel.SPEC.timeframes),
                         "warmup_bars": dict(kernel.SPEC.warmup_bars),
                         "protective_stop": to_jsonable(kernel.SPEC.protective_stop),
+                        "mode": self._strategy_modes.get(kernel.SPEC.id, "live"),
                     }
                     for kernel, _ in self._strategies
                 ],
@@ -233,6 +239,7 @@ class Engine:
             self._risk,
             self._audit,
             protective_stops=protective_stops,
+            strategy_modes=self._strategy_modes,
         )
 
         # Backfill historical data. Split feeds may load offline history first

@@ -43,11 +43,13 @@ All live strategies enforce a `state["last_signal_date"]` check inside `generate
 
 ### Centralized Order Submission
 
-`OrderManager` owns strategy signal submission, strategy close submission, fill application, broker order-status logging, and configured broker-side protective stops.
+`OrderManager` owns strategy signal submission, strategy close submission, per-strategy dry-run enforcement, fill application, broker order-status logging, and configured broker-side protective stops.
 
 ### Dry Run
 
-`DryRunBroker` wraps a real broker for account and position visibility but never calls the native order placement API. Intended orders are recorded and logged with `OrderStatus(status="dry_run")`.
+Dry-run is configured per strategy with `strategy_modes.<strategy_id>: dry_run`. The runtime still uses the real IBKR broker path for account, position, and market visibility, but `OrderManager` does not call `BrokerAdapter.submit_order()` for dry-run strategies. It writes `order_intent` plus `order_dry_run` or `close_dry_run` audit events with `OrderStatus(status="dry_run")`. Strategies not listed default to `live`.
+
+IBKR paper/live is only an environment and port selection. It is not an execution-mode wrapper: `--paper` selects the IBKR paper port, and `--live` selects the IBKR live port.
 
 ### Startup Position Adoption
 

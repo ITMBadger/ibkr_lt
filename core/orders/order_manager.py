@@ -8,10 +8,12 @@ and submits configured protective stops.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from .strategy_modes import STRATEGY_MODE_DRY_RUN, strategy_mode_map
 from ..portfolio.state import PortfolioState
 from ..risk.policy import RiskPolicy
 from ..interfaces.strategy import ProtectiveStopSpec
@@ -36,6 +38,7 @@ class OrderManager:
         risk: RiskPolicy,
         audit_logger: AuditLogger | None = None,
         protective_stops: Mapping[str, ProtectiveStopSpec] | None = None,
+        strategy_modes: Mapping[str, str] | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -46,6 +49,9 @@ class OrderManager:
         self._order_owner: dict[str, str] = {}  # broker_order_id → strategy_id
         self._order_role: dict[str, str] = {}  # broker_order_id → entry/close/protective_stop
         self._protective_stops = dict(protective_stops or {})
+        strategy_ids = set(self._protective_stops) | set(strategy_modes or {})
+        self._strategy_modes = strategy_mode_map(strategy_modes, strategy_ids)
+        self._dry_run_counter = itertools.count(1)
 
     async def submit(self, signal: Signal, strategy_id: str) -> None:
         """Enqueue a signal for the order drain loop to process."""
@@ -90,6 +96,22 @@ class OrderManager:
             reason=reason,
             order=order,
         )
+        if self._is_dry_run_strategy(strategy_id):
+            self._write_dry_run_order_event(
+                "close_dry_run",
+                strategy_id=strategy_id,
+                order=order,
+                reason=reason,
+            )
+            log.info(
+                "Dry-run strategy %s: would close %s %s %.0f reason=%s",
+                strategy_id,
+                side,
+                position.instrument.symbol,
+                qty,
+                reason,
+            )
+            return
         status = await self._broker.submit_order(order)
         self._order_owner[status.broker_order_id] = strategy_id
         self._order_role[status.broker_order_id] = "close"
@@ -250,6 +272,21 @@ class OrderManager:
             order=order,
             raw_quantity=qty_float,
         )
+        if self._is_dry_run_strategy(strategy_id):
+            self._write_dry_run_order_event(
+                "order_dry_run",
+                strategy_id=strategy_id,
+                order=order,
+                signal=signal,
+            )
+            log.info(
+                "Dry-run strategy %s: would submit %s %s %.0f",
+                strategy_id,
+                signal.side,
+                signal.instrument.symbol,
+                qty,
+            )
+            return
         status = await self._broker.submit_order(order)
         self._order_owner[status.broker_order_id] = strategy_id
         self._order_role[status.broker_order_id] = "entry"
@@ -299,6 +336,14 @@ class OrderManager:
     async def _submit_protective_stop(self, fill: Fill, strategy_id: str) -> None:
         spec = self._protective_stops.get(strategy_id)
         if spec is None:
+            return
+        if self._is_dry_run_strategy(strategy_id):
+            self._write_order_event(
+                "protective_stop_dropped",
+                strategy_id=strategy_id,
+                reason="strategy_dry_run",
+                fill=fill,
+            )
             return
         if spec.reference != "fill_price":
             self._write_order_event(
@@ -418,6 +463,34 @@ class OrderManager:
             )
             return False
         return True
+
+    def _is_dry_run_strategy(self, strategy_id: str) -> bool:
+        return self._strategy_modes.get(strategy_id) == STRATEGY_MODE_DRY_RUN
+
+    def _dry_run_status(self, strategy_id: str) -> OrderStatus:
+        return OrderStatus(
+            broker_order_id=f"dry-run-{strategy_id}-{next(self._dry_run_counter)}",
+            status="dry_run",
+            filled_qty=0.0,
+        )
+
+    def _write_dry_run_order_event(
+        self,
+        event: str,
+        *,
+        strategy_id: str,
+        order: OrderRequest,
+        **fields,
+    ) -> OrderStatus:
+        status = self._dry_run_status(strategy_id)
+        self._write_order_event(
+            event,
+            strategy_id=strategy_id,
+            order=order,
+            status=status,
+            **fields,
+        )
+        return status
 
     def _write_order_event(self, event: str, **fields) -> None:
         if self._audit is not None:

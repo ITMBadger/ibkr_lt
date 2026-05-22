@@ -75,7 +75,7 @@ def test_main_py_paper_startup_and_control_api(main_py_runner, paper_config) -> 
     assert health["status"] == "ok"
     assert health["phase"] == "running"
     assert health["mode"] == "paper"
-    assert health["dry_run"] is False
+    assert health["strategy_modes"] == {"stoch_3m_cross_long": "live"}
 
     snapshot = json.loads(
         read_json_url(f"http://127.0.0.1:{paper_config.api_port}/api/v1/runtime/snapshot")

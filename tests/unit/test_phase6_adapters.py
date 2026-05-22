@@ -1,4 +1,4 @@
-"""Phase 6 unit tests: adapter hardening, dry-run, exits, split data feed."""
+"""Phase 6 unit tests: adapter hardening, strategy dry-run, exits, split data feed."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import pandas as pd
 
 from core import DataFeed, Engine, SimulatedClock
 from core.audit import AuditLogger, DecisionTrace, record_decision
-from core.adapters.dry_run import DryRunBroker
 from core.adapters.ibkr.data import IBKRDataProvider
 from core.adapters.paper.broker import PaperBroker
 from core.adapters.paper.data import ReplayDataProvider
@@ -219,20 +218,6 @@ class _FakeIBKRDataClient:
 
     def cancelRealTimeBars(self, req_id) -> None:
         self.cancelled_realtime.append(req_id)
-
-
-def test_dry_run_never_calls_native_submit():
-    async def run():
-        native = _CountingBroker()
-        dry = DryRunBroker(native)
-        order = OrderRequest(MNQ, "long", 1.0, "market")
-        status = await dry.submit_order(order)
-        assert status.status == "dry_run"
-        assert native.submit_calls == 0
-        assert dry.intended_orders == [order]
-
-    import asyncio
-    asyncio.run(run())
 
 
 def test_data_feed_splits_historical_and_live():
@@ -755,6 +740,67 @@ def test_order_manager_writes_order_and_fill_audit(tmp_path):
     assert (tmp_path / "orders.jsonl").exists()
     assert "order_submitted" in (tmp_path / "orders.jsonl").read_text(encoding="utf-8")
     assert (tmp_path / "fills.jsonl").exists()
+
+
+def test_order_manager_strategy_dry_run_does_not_submit_entry(tmp_path):
+    async def run():
+        broker = _CountingBroker()
+        audit = AuditLogger(log_dir=tmp_path)
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+            audit,
+            strategy_modes={"_phase6": "dry_run"},
+        )
+        await om._process_signal(Signal(MNQ, "long"), "_phase6")
+        assert broker.submit_calls == 0
+
+    import asyncio
+    asyncio.run(run())
+    text = (tmp_path / "orders.jsonl").read_text(encoding="utf-8")
+    assert "order_intent" in text
+    assert "order_dry_run" in text
+    assert "order_submitted" not in text
+
+
+def test_order_manager_strategy_dry_run_does_not_submit_close(tmp_path):
+    async def run():
+        broker = _CountingBroker()
+        audit = AuditLogger(log_dir=tmp_path)
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+            audit,
+            strategy_modes={"_phase6": "dry_run"},
+        )
+        await om.submit_close("_phase6", Position(QQQ, 1, 100.0), "test_exit")
+        assert broker.submit_calls == 0
+
+    import asyncio
+    asyncio.run(run())
+    text = (tmp_path / "orders.jsonl").read_text(encoding="utf-8")
+    assert "close_intent" in text
+    assert "close_dry_run" in text
+    assert "close_submitted" not in text
+
+
+def test_order_manager_live_strategy_still_submits_with_other_dry_run_strategy():
+    async def run():
+        broker = _CountingBroker()
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+            strategy_modes={"_dry_strategy": "dry_run"},
+        )
+        await om._process_signal(Signal(MNQ, "long"), "_live_strategy")
+        assert broker.submit_calls == 1
+        assert broker.submitted_orders[0].strategy_id == "_live_strategy"
+
+    import asyncio
+    asyncio.run(run())
 
 
 def test_order_manager_submits_fill_price_protective_stop():

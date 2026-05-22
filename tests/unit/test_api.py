@@ -45,7 +45,7 @@ async def test_health_and_meta_are_public():
     app = create_control_api_app(
         _SnapshotEngine(),
         api_token="secret",
-        metadata={"mode": "paper", "dry_run": True},
+        metadata={"mode": "paper", "strategy_modes": {"example_strategy": "dry_run"}},
     )
     async for client in _client(app):
         health = await client.get("/api/v1/health")
@@ -55,7 +55,7 @@ async def test_health_and_meta_are_public():
         assert health.status_code == 200
         assert health.json()["connected"] is True
         assert health.json()["mode"] == "paper"
-        assert health.json()["dry_run"] is True
+        assert health.json()["strategy_modes"] == {"example_strategy": "dry_run"}
         assert meta.status_code == 200
         assert meta.json()["service"] == "ibkr_lt_control_api"
         assert capabilities.status_code == 200
