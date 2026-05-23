@@ -3,6 +3,9 @@ settings.json
 # Local/editor/agent state
 .agents/
 .claude/
+.codex/
+.cursor/
+.vscode/
 .env
 .env.*
 !.env.example
@@ -22,8 +25,27 @@ dist/
 # Local runtime artifacts
 /var/
 logs/
+logs*/
 backtest_runs/
+backtest_runs*/
+results/
+results*/
+runs/
+runs*/
+reports/
+reports*/
+outputs/
+outputs*/
+scratch/
+scratch*/
+tmp/
+tmp*/
 *.log
+*.jsonl
+*.json
+*.yaml
+*.yml
+!config.yaml
 strategy_decisions*.jsonl
 strategy_trigger_decisions*.jsonl
 strategy_30m_latest_*.json
@@ -31,53 +53,83 @@ signals*.jsonl
 orders*.jsonl
 fills*.jsonl
 
-# Proprietary strategy source and derivative artifacts.
-# Keep strategies/__init__.py and the copy-only sample public, but do not
-# commit private strategy implementations or compiled/reverse-engineerable outputs.
-strategies/*.py
+# Proprietary strategy source and derivative artifacts. Default-deny this
+# folder; allow only the public package marker, sample scaffold, and demo
+# strategy explicitly.
+strategies/**
+!strategies/
 !strategies/__init__.py
-strategies/**/*.py
-!strategies/**/__init__.py
 !strategies/_sample_strategy.py
 !strategies/stoch_3m_cross_long.py
-strategies/**/*.pyc
-strategies/**/*.pyd
-strategies/**/*.so
-strategies/**/*.dll
-strategies/**/*.dylib
-strategies/**/*.json
-strategies/**/*.yaml
-strategies/**/*.yml
 
 # Internal strategy documentation/tests can reveal IDs, instruments,
 # thresholds, scoring formulas, exits, or adopted-position ownership.
-docs/strategies.md
-docs/architecture.md
-docs/architecture_illustration.md
-docs/starting_guide.md
-docs/*strategy*.md
-docs/*pre_live*.md
-docs/internal*.md
-docs/proprietary*.md
-tests/unit/test_phase5_*.py
-tests/unit/test_*strateg*.py
-configs/local*.yaml
-configs/private*.yaml
-configs/proprietary*.yaml
+*.md
+!README.md
+docs/**
+!docs/
+!docs/guardrails.md
+!docs/project_rules.md
+tests/**
+!tests/
+!tests/**/
+!tests/**/__init__.py
+configs/**
+config.local*
+config.private*
+config.proprietary*
+*.local.yaml
+*.local.yml
+*.private.yaml
+*.private.yml
+*.proprietary.yaml
+*.proprietary.yml
+
+# Generic private-artifact catchalls. Avoid strategy-specific names here:
+# the ignore file itself is public.
+*private*
+*proprietary*
+*internal*
+*secret*
+*research*
+*experiment*
+*sweep*
+*walk_forward*
+*backtest_run*
+*decision*
+*signal*
+*order*
+*fill*
 
 # Legacy/research material often contains the original strategy formulas.
 legacy/
 archived/
 archive/
 research/
+research*/
+experiments/
+experiments*/
+sweeps/
+sweeps*/
 notebooks/
 *.ipynb
 
 # Market data and replay corpora can leak signal timing when paired with logs.
 /data/
 /market_data/
+data*/
+market_data*/
 *.csv
+*.csv.gz
 *.parquet
 *.feather
 *.h5
 *.hdf5
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.arrow

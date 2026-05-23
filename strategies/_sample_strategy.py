@@ -154,6 +154,11 @@ class SampleStrategy(StrategyKernel):
             return finish("no_signal", "already_evaluated_3m_bar")
         state["last_evaluated_3m_bar"] = current_3m_bar
 
+        # For multi-bar setup/confirmation patterns, preserve the research
+        # runner's candidate lifecycle exactly. If a setup is consumed by its
+        # first confirmation attempt, do not let a later bar reuse that same
+        # setup just because final filters rejected the first candidate.
+
         # Preferred shared-indicator style. This keeps SPEC minimal and avoids
         # advertising every private feature dependency through metadata.
         ema_fast = ctx.features.get("ema", QQQ, "3m", period=9) if ctx.features else None
