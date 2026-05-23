@@ -27,7 +27,7 @@ class AuditLogger:
         self,
         *,
         enabled: bool = True,
-        log_dir: str | Path = "logs",
+        log_dir: str | Path = "runs/runtime",
         profile: str = "owner",
         strategy_decisions: str = "full",
         decision_scope: str = "every_eval",
@@ -59,9 +59,13 @@ class AuditLogger:
         if not cfg:
             return None
         enabled = bool(cfg.get("enabled", True))
+        log_dir = _format_run_dir_template(
+            cfg.get("log_dir", "runs/{mode}"),
+            mode=str(config.get("mode", "runtime") or "runtime"),
+        )
         return cls(
             enabled=enabled,
-            log_dir=cfg.get("log_dir", "logs"),
+            log_dir=log_dir,
             profile=str(cfg.get("profile", "owner")),
             strategy_decisions=str(cfg.get("strategy_decisions", "full")),
             decision_scope=str(cfg.get("decision_scope", "every_eval")),
@@ -186,7 +190,7 @@ class AuditLogger:
 
 def configure_runtime_logging(
     *,
-    log_dir: str | Path = "logs",
+    log_dir: str | Path = "runs/runtime",
     level: str = "INFO",
     enabled: bool = True,
 ) -> None:
@@ -211,6 +215,15 @@ def configure_runtime_logging(
 
 def _is_entry_signal(event: dict[str, Any]) -> bool:
     return event.get("phase") == "entry" and event.get("decision") == "signal"
+
+
+def _format_run_dir_template(value: str | Path, *, mode: str) -> str | Path:
+    if not isinstance(value, str):
+        return value
+    try:
+        return value.format(mode=_safe_filename_part(mode))
+    except (KeyError, IndexError, ValueError):
+        return value
 
 
 def _has_full_decision_detail(event: dict[str, Any]) -> bool:

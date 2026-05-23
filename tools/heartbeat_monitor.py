@@ -25,8 +25,8 @@ import websockets
 
 
 DEFAULT_API_URL = "http://127.0.0.1:8550"
-DEFAULT_STATUS_FILE = Path("var/heartbeat_monitor/status.json")
-DEFAULT_ALERT_FILE = Path("var/heartbeat_monitor/alerts.jsonl")
+DEFAULT_STATUS_FILE = Path("runs/heartbeat_monitor/status.json")
+DEFAULT_ALERT_FILE = Path("runs/heartbeat_monitor/alerts.jsonl")
 
 
 @dataclass(frozen=True)

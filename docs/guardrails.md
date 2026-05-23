@@ -81,7 +81,7 @@ Backtest market orders fill at the next replay bar open. Stop orders fill at `st
 
 ### Audit Logs
 
-When `logging.enabled=true`, the runtime creates a per-run folder under the configured log directory, named with minute-level ET time such as `logs/20260522_1047_et/`, and writes runtime, strategy decision, signal, order, and fill logs there. Full decision traces are owner/dev artifacts and include relevant OHLCV, condition thresholds, indicator values, and pass/fail state.
+When `logging.enabled=true`, the runtime creates a per-run folder under the configured run directory, named with minute-level ET time such as `runs/paper/20260522_1047_et/`, and writes runtime, strategy decision, signal, order, and fill logs there. Full decision traces are owner/dev artifacts and include relevant OHLCV, condition thresholds, indicator values, and pass/fail state.
 
 Decision logging is controlled by `logging.decision_scope`:
 
@@ -123,8 +123,8 @@ The FastAPI control API is read-only in the current framework. It exposes health
 
 - Polls `/api/v1/health` every 5 seconds by default.
 - Keeps `/ws/events` connected and pings it when no runtime events arrive.
-- Writes `var/heartbeat_monitor/status.json` for current monitor state.
-- Appends `var/heartbeat_monitor/alerts.jsonl` for alert events.
+- Writes `runs/heartbeat_monitor/status.json` for current monitor state.
+- Appends `runs/heartbeat_monitor/alerts.jsonl` for alert events.
 - Alerts when the API is unreachable, the engine enters `error`, the engine is not running when expected, or the WebSocket remains disconnected.
 - `main.py` warns at control API startup if no `heartbeat_monitor.py` process is detected.
 - The missing-monitor warning is built into API startup and is skipped only when `--no-api` disables the API.

@@ -107,8 +107,9 @@ The API is intentionally read-only. Manual trading, order cancellation, and star
 ## Audit Logs
 
 When `logging.enabled=true`, runtime output is written under a per-run folder:
-`logs/<YYYYMMDD_HHMM>_et/`. If two app runs start in the same minute, the later
-folder receives a numeric suffix such as `_2`.
+`runs/paper/<YYYYMMDD_HHMM>_et/` or `runs/live/<YYYYMMDD_HHMM>_et/`. If two app
+runs start in the same minute, the later folder receives a numeric suffix such
+as `_2`.
 
 The default shared config uses quieter owner decision logging:
 
@@ -153,7 +154,7 @@ python -m backtest.run --mode fast-event --strategy stoch_3m_cross_long --start 
 The runner reads CSV data from `data.historical.path` in `config.yaml`, or from
 `--csv`. Use a directory when selected strategies require more than one symbol.
 It backfills warmup bars before the start timestamp, then replays test-window
-bars event by event. Results are written under `backtest_runs/`.
+bars event by event. Results are written under `runs/backtests/`.
 
 Use `--mode fast-event` for faster research replays. It still feeds every
 1-minute bar through the production data, broker, order, and exit path, but it
@@ -184,8 +185,8 @@ Heartbeat Monitor -> Agent/operator alert path
 
 The monitor polls `/api/v1/health` every 5 seconds, keeps `/ws/events` connected, pings the WebSocket if no events arrive, and writes local files for an agent to watch:
 
-- `var/heartbeat_monitor/status.json`
-- `var/heartbeat_monitor/alerts.jsonl`
+- `runs/heartbeat_monitor/status.json`
+- `runs/heartbeat_monitor/alerts.jsonl`
 
 When the control API starts, `main.py` warns if no `heartbeat_monitor.py` process is detected. This is part of API startup and is only skipped when the API is disabled with `--no-api`.
 

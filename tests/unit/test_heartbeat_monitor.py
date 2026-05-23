@@ -4,6 +4,8 @@ from pathlib import Path
 
 from tools.heartbeat_monitor import (
     AlertEmitter,
+    DEFAULT_ALERT_FILE,
+    DEFAULT_STATUS_FILE,
     MonitorConfig,
     MonitorState,
     api_url,
@@ -23,6 +25,11 @@ def test_monitor_url_helpers():
     assert websocket_url("https://example.test/api", "/ws/events") == (
         "wss://example.test/api/ws/events"
     )
+
+
+def test_default_monitor_files_live_under_runs():
+    assert DEFAULT_STATUS_FILE == Path("runs/heartbeat_monitor/status.json")
+    assert DEFAULT_ALERT_FILE == Path("runs/heartbeat_monitor/alerts.jsonl")
 
 
 def test_evaluate_health_respects_expectations():
@@ -72,7 +79,7 @@ def test_alert_emitter_deduplicates_and_resolves(tmp_path: Path, capsys):
 
 
 def test_write_json_atomic_creates_parent(tmp_path: Path):
-    path = tmp_path / "var" / "heartbeat_monitor" / "status.json"
+    path = tmp_path / "runs" / "heartbeat_monitor" / "status.json"
 
     write_json_atomic(path, {"service": "heartbeat_monitor"})
 

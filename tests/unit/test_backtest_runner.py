@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import json
+from argparse import Namespace
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from backtest.config import BacktestSettings, parse_boundary, resolve_strategy_ids
+from backtest.config import (
+    BacktestSettings,
+    parse_boundary,
+    resolve_settings,
+    resolve_strategy_ids,
+)
 from backtest.loaders import required_instruments, resolve_evaluation_timeframes
 from backtest.run import run_backtest
+from core.audit.logger import AuditLogger
 from core.interfaces.strategy import StrategyKernel, StrategySpec
 from core.types import Instrument, MarketContext, Signal
 
@@ -76,6 +84,46 @@ def test_resolve_evaluation_timeframes_uses_strategy_bar_size():
 
     assert resolve_evaluation_timeframes(strategies) == {"_bt_3m_count": "3m"}
     assert resolve_evaluation_timeframes(strategies, "5m") == {"_bt_3m_count": "5m"}
+
+
+def test_audit_log_dir_template_uses_runtime_mode(tmp_path):
+    audit = AuditLogger.from_config({
+        "mode": "paper",
+        "logging": {
+            "enabled": False,
+            "log_dir": str(tmp_path / "runs" / "{mode}"),
+        },
+    })
+
+    assert audit is not None
+    assert audit.base_log_dir == tmp_path / "runs" / "paper"
+
+
+def test_resolve_settings_defaults_to_runs_backtests(tmp_path):
+    args = Namespace(
+        config="config.yaml",
+        csv=tmp_path / "QQQ.csv",
+        start="2026-05-01",
+        end="2026-05-01",
+        strategy=None,
+        lookback_days=None,
+        output_dir=None,
+        mode=None,
+        eval_timeframe=None,
+        all_live=False,
+        thread_pool_workers=None,
+        no_progress=False,
+        progress_interval_bars=None,
+        progress_interval_seconds=None,
+    )
+
+    settings = resolve_settings(
+        args=args,
+        config={"data": {"historical": {"provider": "csv"}}},
+        known_strategy_ids=["demo_strategy"],
+    )
+
+    assert settings.output_dir == Path("runs/backtests")
 
 
 def test_run_backtest_uses_execution_instrument_bars_for_paper_fills(tmp_path):

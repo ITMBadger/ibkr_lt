@@ -119,7 +119,7 @@ def resolve_settings(
     output_dir = normalize_local_path(
         getattr(args, "output_dir", None)
         or backtest_cfg.get("output_dir")
-        or "backtest_runs"
+        or "runs/backtests"
     )
 
     return BacktestSettings(

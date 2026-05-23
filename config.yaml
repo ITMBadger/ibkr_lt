@@ -16,7 +16,7 @@ session_timezone: America/New_York
 
 logging:
   enabled: true
-  log_dir: logs
+  log_dir: runs/{mode}
   run_subdir: true
   profile: owner
   strategy_decisions: full

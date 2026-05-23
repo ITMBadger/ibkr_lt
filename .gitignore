@@ -22,7 +22,12 @@ build/
 dist/
 *.egg-info/
 
-# Local runtime artifacts
+# Local generated run artifacts
+/runs/
+runs*/
+
+# Legacy local runtime artifacts. Keep ignored so existing local history does not
+# become visible after the generated-run layout moved under runs/.
 /var/
 logs/
 logs*/
@@ -30,8 +35,6 @@ backtest_runs/
 backtest_runs*/
 results/
 results*/
-runs/
-runs*/
 reports/
 reports*/
 outputs/
