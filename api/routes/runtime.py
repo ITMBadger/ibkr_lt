@@ -2,24 +2,21 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from ..dependencies import AuthDependency, engine_from_request, metadata_from_request
+from ..dependencies import AuthDependency, operator_service_from_request
 
 router = APIRouter(prefix="/runtime", tags=["runtime"], dependencies=[AuthDependency])
 
 
 @router.get("/snapshot")
 async def snapshot(
-    engine=Depends(engine_from_request),
-    metadata: dict = Depends(metadata_from_request),
+    operator=Depends(operator_service_from_request),
 ) -> dict:
-    state = engine.snapshot_state()
-    state["metadata"] = metadata
-    return state
+    return operator.runtime_snapshot()
 
 
 @router.get("/strategies")
-async def strategies(engine=Depends(engine_from_request)) -> list[dict]:
-    return list(engine.snapshot_state().get("strategies", []))
+async def strategies(operator=Depends(operator_service_from_request)) -> list[dict]:
+    return operator.strategies()
 
 
 __all__ = ["router"]

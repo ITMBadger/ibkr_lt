@@ -19,6 +19,8 @@ from core.adapters.polygon.data import PolygonDataProvider
 from core.adapters.csv.data import CSVDataProvider
 from core.audit import AuditLogger, configure_runtime_logging
 from core.exceptions import ConfigError
+from core.observability import warn_if_heartbeat_monitor_missing
+from core.operator import OperatorService
 from core.privacy import build_strategy_aliases, is_customer_profile
 from core.risk.policy import RiskPolicy
 from core.engine.loader import get_registry
@@ -145,6 +147,14 @@ def main() -> None:
         strategy_aliases=strategy_aliases,
         startup_position_gate_enabled=str(config.get("mode", "")).lower() == "live",
     )
+    api_metadata = _api_metadata(
+        config,
+        strategy_ids,
+        strategy_modes,
+        metadata_profile=metadata_profile,
+        strategy_aliases=strategy_aliases,
+    )
+    operator_service = OperatorService(engine, metadata=api_metadata)
     api_server = _start_control_api(
         config,
         engine,
@@ -152,6 +162,14 @@ def main() -> None:
         strategy_modes,
         metadata_profile=metadata_profile,
         strategy_aliases=strategy_aliases,
+        operator_service=operator_service,
+        metadata=api_metadata,
+    )
+    engine.set_startup_position_mapping_enabled(
+        _startup_mapping_enabled(
+            config,
+            dashboard_active=bool(api_server and api_server.dashboard_active),
+        )
     )
 
     print("Running. Press Ctrl+C to stop.")
@@ -362,9 +380,13 @@ def _metadata_profile(config: dict[str, Any]) -> str:
     return str(config.get("runtime_profile") or logging_cfg.get("profile") or "owner")
 
 
-def _startup_mapping_enabled(config: dict[str, Any]) -> bool:
+def _startup_mapping_enabled(
+    config: dict[str, Any],
+    *,
+    dashboard_active: bool = False,
+) -> bool:
     api_cfg = dict(config.get("api") or {})
-    return bool(api_cfg.get("enabled", True))
+    return bool(api_cfg.get("enabled", True)) or bool(dashboard_active)
 
 
 def _adopted_position_map(config: dict[str, Any]) -> dict[Instrument, str]:
@@ -462,90 +484,41 @@ def _start_control_api(
     *,
     metadata_profile: str = "owner",
     strategy_aliases: Mapping[str, str] | None = None,
+    operator_service: OperatorService | None = None,
+    metadata: dict[str, Any] | None = None,
 ):
     api_cfg = dict(config.get("api") or {})
-    if not bool(api_cfg.get("enabled", True)):
+    api_enabled = bool(api_cfg.get("enabled", True))
+    if not api_enabled and engine is None and operator_service is None:
         return None
     host = str(api_cfg.get("host", "127.0.0.1"))
     port = int(api_cfg.get("port", 8550))
+    api_metadata = metadata or _api_metadata(
+        config,
+        strategy_ids,
+        strategy_modes,
+        metadata_profile=metadata_profile,
+        strategy_aliases=strategy_aliases,
+    )
     server = start_control_api_thread(
         engine,
         host=host,
         port=port,
         token_env=str(api_cfg.get("token_env", "IBKR_LT_API_TOKEN")),
         log_level=str(api_cfg.get("log_level", "warning")),
-        metadata=_api_metadata(
-            config,
-            strategy_ids,
-            strategy_modes,
-            metadata_profile=metadata_profile,
-            strategy_aliases=strategy_aliases,
-        ),
+        metadata=api_metadata,
+        runtime_config=config,
+        api_enabled=api_enabled,
+        operator_service=operator_service,
     )
-    print(f"Control API: http://{host}:{port}")
-    _warn_if_heartbeat_monitor_missing()
+    if server.thread is None:
+        return None
+    if api_enabled:
+        print(f"Control API: http://{host}:{port}")
+        warn_if_heartbeat_monitor_missing()
+    if server.dashboard_active:
+        print(f"Dashboard: http://{host}:{port}/dashboard")
     return server
-
-
-def _cmdline_is_heartbeat_monitor(cmdline: Sequence[str]) -> bool:
-    normalized = [str(part).replace("\\", "/") for part in cmdline]
-    for index, part in enumerate(normalized):
-        if part == "-m" and index + 1 < len(normalized):
-            if normalized[index + 1] == "tools.heartbeat_monitor":
-                return True
-        if part == "heartbeat_monitor.py" or part.endswith("/heartbeat_monitor.py"):
-            return True
-    return False
-
-
-def _heartbeat_monitor_process_running(
-    proc_root: Path = Path("/proc"),
-    *,
-    current_pid: int | None = None,
-) -> bool | None:
-    if not proc_root.exists():
-        return None
-    current_pid = os.getpid() if current_pid is None else int(current_pid)
-    try:
-        entries = list(proc_root.iterdir())
-    except OSError:
-        return None
-
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            pid = int(entry.name)
-        except ValueError:
-            continue
-        if pid == current_pid:
-            continue
-        try:
-            raw = (entry / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if not raw:
-            continue
-        cmdline = [
-            part.decode("utf-8", errors="ignore")
-            for part in raw.split(b"\0")
-            if part
-        ]
-        if _cmdline_is_heartbeat_monitor(cmdline):
-            return True
-    return False
-
-
-def _warn_if_heartbeat_monitor_missing(proc_root: Path = Path("/proc")) -> None:
-    running = _heartbeat_monitor_process_running(proc_root)
-    if running is not False:
-        return
-    print(
-        "Warning: Heartbeat Monitor process is not detected. "
-        "Start it in another terminal with: "
-        "~/.venv/bin/python tools/heartbeat_monitor.py",
-        file=sys.stderr,
-    )
 
 
 def _api_metadata(

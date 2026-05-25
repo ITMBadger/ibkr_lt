@@ -7,6 +7,8 @@ import httpx
 
 from api.app import create_control_api_app
 from api.server import is_local_control_host, resolve_control_api_token
+from core.operator import OperatorService
+from dashboard.loader import load_dashboard_plugin, mount_dashboard_plugin
 
 
 class _SnapshotEngine:
@@ -55,6 +57,110 @@ class _SnapshotEngine:
             **self.startup_gate_status(),
             "message": "Startup position refresh requested.",
         }
+
+
+def test_operator_service_delegates_runtime_and_startup_controls():
+    engine = _SnapshotEngine()
+    operator = OperatorService(engine, metadata={"mode": "paper"})
+
+    assert operator.runtime_snapshot()["metadata"] == {"mode": "paper"}
+    assert operator.positions()["broker"][0]["instrument"]["symbol"] == "MES"
+    assert operator.events(limit=1)[0]["message"] == "ready"
+    assert operator.startup_gate_status()["phase"] == "awaiting_mapping"
+    assert operator.request_startup_gate_refresh()["message"] == "Startup position refresh requested."
+    mapped = operator.submit_startup_mappings([
+        {
+            "position_id": "position:equity:QQQ:long",
+            "strategy_id": "example_live_strategy",
+            "quantity": 1,
+        }
+    ])
+    assert mapped["allocations"][0]["quantity"] == 1
+
+
+def test_dashboard_loader_skips_missing_module():
+    result = load_dashboard_plugin({"dashboard": {"module": "_missing_dashboard_for_test"}})
+
+    assert result.plugin is None
+    assert result.status.active is False
+    assert result.status.reason == "dashboard_module_not_found"
+
+
+@pytest.mark.anyio
+async def test_dashboard_loader_mounts_licensed_plugin(tmp_path, monkeypatch):
+    package = tmp_path / "licensed_dashboard"
+    package.mkdir()
+    package.joinpath("__init__.py").write_text(
+        "\n".join([
+            "class Plugin:",
+            "    def status(self):",
+            "        return {'available': True, 'licensed': True, 'reason': ''}",
+            "    def mount(self, app, operator_service, *, config, metadata):",
+            "        @app.get('/dashboard-test')",
+            "        async def dashboard_test():",
+            "            return {'phase': operator_service.snapshot_state()['phase']}",
+            "def get_dashboard_plugin():",
+            "    return Plugin()",
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    app = create_control_api_app(_SnapshotEngine())
+
+    result = load_dashboard_plugin({"dashboard": {"module": "licensed_dashboard"}})
+    status = mount_dashboard_plugin(
+        app,
+        result,
+        app.state.operator_service,
+        config={},
+        metadata={},
+    )
+
+    assert status.active is True
+    async for client in _client(app):
+        response = await client.get("/dashboard-test")
+        assert response.status_code == 200
+        assert response.json() == {"phase": "running"}
+
+
+def test_dashboard_loader_skips_expired_plugin(tmp_path, monkeypatch):
+    package = tmp_path / "expired_dashboard"
+    package.mkdir()
+    package.joinpath("__init__.py").write_text(
+        "\n".join([
+            "class Plugin:",
+            "    def status(self):",
+            "        return {'available': True, 'licensed': False, 'reason': 'license_expired'}",
+            "    def mount(self, app, operator_service, *, config, metadata):",
+            "        raise AssertionError('expired dashboard should not mount')",
+            "def get_dashboard_plugin():",
+            "    return Plugin()",
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    result = load_dashboard_plugin({"dashboard": {"module": "expired_dashboard"}})
+
+    assert result.plugin is None
+    assert result.status.licensed is False
+    assert result.status.reason == "license_expired"
+
+
+def test_dashboard_loader_treats_import_error_as_nonfatal(tmp_path, monkeypatch):
+    package = tmp_path / "broken_dashboard"
+    package.mkdir()
+    package.joinpath("__init__.py").write_text(
+        "raise RuntimeError('boom')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    result = load_dashboard_plugin({"dashboard": {"module": "broken_dashboard"}})
+
+    assert result.plugin is None
+    assert result.status.active is False
+    assert result.status.reason.startswith("import_error:")
 
 
 async def _client(app):

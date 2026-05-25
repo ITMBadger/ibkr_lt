@@ -27,7 +27,12 @@ from core.interfaces.strategy import (
 from core.orders.order_manager import OrderManager
 from core.portfolio.state import PortfolioState
 from core.risk.policy import RiskPolicy
-from core.startup import PositionOwnershipLedger
+from core.startup import (
+    PositionOwnershipLedger,
+    StartupPositionGateController,
+    build_startup_gate_status,
+    validate_startup_allocations,
+)
 from core.types import Bar, Fill, Instrument, MarketContext, OrderRequest, OrderStatus, Position, Signal
 
 QQQ = Instrument(asset_class="equity", symbol="QQQ")
@@ -480,16 +485,10 @@ def test_engine_writes_strategy_decision_trace(tmp_path):
 
 
 def test_startup_gate_ignores_unrelated_positions():
-    engine = Engine(
-        broker=PaperBroker(),
-        data_feed=DataFeed(None, ReplayDataProvider([])),
-        strategies=[(_AdoptableQqqStrategy(), {})],
-        startup_position_gate_enabled=True,
-    )
-
-    status = engine._build_startup_gate_status(  # noqa: SLF001
+    status = build_startup_gate_status(
         [Position(SPY, quantity=5, avg_cost=100.0)],
         [(_AdoptableQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
     )
 
     assert status["phase"] == "clear"
@@ -498,21 +497,15 @@ def test_startup_gate_ignores_unrelated_positions():
 
 
 def test_startup_gate_uses_operator_quantity():
-    engine = Engine(
-        broker=PaperBroker(),
-        data_feed=DataFeed(None, ReplayDataProvider([])),
-        strategies=[(_AdoptableQqqStrategy(), {})],
-        strategy_risk={"_adoptable_qqq": RiskPolicy(position_size_shares=2)},
-        startup_position_gate_enabled=True,
-    )
-    status = engine._build_startup_gate_status(  # noqa: SLF001
+    status = build_startup_gate_status(
         [Position(QQQ, quantity=5, avg_cost=100.0)],
         [(_AdoptableQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
+        strategy_risk={"_adoptable_qqq": RiskPolicy(position_size_shares=2)},
     )
-    engine._set_startup_gate_status(status)  # noqa: SLF001
 
     position_id = status["positions"][0]["position_id"]
-    result = engine.submit_startup_mappings([
+    result = validate_startup_allocations(status, [
         {
             "position_id": position_id,
             "strategy_id": "_adoptable_qqq",
@@ -520,26 +513,19 @@ def test_startup_gate_uses_operator_quantity():
         }
     ])
 
-    assert result["phase"] == "mapped"
-    assert result["allocations"][0]["quantity"] == 3.0
+    assert result[0]["quantity"] == 3.0
 
 
 def test_startup_gate_rejects_insufficient_broker_quantity():
-    engine = Engine(
-        broker=PaperBroker(),
-        data_feed=DataFeed(None, ReplayDataProvider([])),
-        strategies=[(_AdoptableQqqStrategy(), {})],
-        strategy_risk={"_adoptable_qqq": RiskPolicy(position_size_shares=2)},
-        startup_position_gate_enabled=True,
-    )
-    status = engine._build_startup_gate_status(  # noqa: SLF001
+    status = build_startup_gate_status(
         [Position(QQQ, quantity=1, avg_cost=100.0)],
         [(_AdoptableQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
+        strategy_risk={"_adoptable_qqq": RiskPolicy(position_size_shares=2)},
     )
-    engine._set_startup_gate_status(status)  # noqa: SLF001
 
     with pytest.raises(ValueError, match="exceeds broker quantity"):
-        engine.submit_startup_mappings([
+        validate_startup_allocations(status, [
             {
                 "position_id": status["positions"][0]["position_id"],
                 "strategy_id": "_adoptable_qqq",
@@ -549,20 +535,14 @@ def test_startup_gate_rejects_insufficient_broker_quantity():
 
 
 def test_startup_gate_rejects_missing_allocation_quantity():
-    engine = Engine(
-        broker=PaperBroker(),
-        data_feed=DataFeed(None, ReplayDataProvider([])),
-        strategies=[(_AdoptableQqqStrategy(), {})],
-        startup_position_gate_enabled=True,
-    )
-    status = engine._build_startup_gate_status(  # noqa: SLF001
+    status = build_startup_gate_status(
         [Position(QQQ, quantity=1, avg_cost=100.0)],
         [(_AdoptableQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
     )
-    engine._set_startup_gate_status(status)  # noqa: SLF001
 
     with pytest.raises(ValueError, match="must include quantity"):
-        engine.submit_startup_mappings([
+        validate_startup_allocations(status, [
             {
                 "position_id": status["positions"][0]["position_id"],
                 "strategy_id": "_adoptable_qqq",
@@ -600,15 +580,10 @@ def test_startup_gate_blocks_derivative_contract_mismatch():
         def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
             return None
 
-    engine = Engine(
-        broker=PaperBroker(),
-        data_feed=DataFeed(None, ReplayDataProvider([])),
-        strategies=[(_AdoptableFutureStrategy(), {})],
-        startup_position_gate_enabled=True,
-    )
-    status = engine._build_startup_gate_status(  # noqa: SLF001
+    status = build_startup_gate_status(
         [Position(broker_instrument, quantity=1, avg_cost=100.0)],
         [(_AdoptableFutureStrategy(), {})],
+        default_risk=RiskPolicy(),
     )
 
     assert status["phase"] == "blocked"
@@ -616,12 +591,11 @@ def test_startup_gate_blocks_derivative_contract_mismatch():
 
 
 def test_startup_gate_uses_configured_adopted_position_mapping():
-    engine = Engine(
-        broker=PaperBroker(),
-        data_feed=DataFeed(None, ReplayDataProvider([])),
-        strategies=[(_AdoptableQqqStrategy(), {})],
-        startup_position_gate_enabled=True,
-        startup_position_allocations=[
+    status = build_startup_gate_status(
+        [Position(QQQ, quantity=1, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
+        configured_allocations=[
             {
                 "symbol": "QQQ",
                 "asset_class": "equity",
@@ -631,10 +605,6 @@ def test_startup_gate_uses_configured_adopted_position_mapping():
             }
         ],
     )
-    status = engine._build_startup_gate_status(  # noqa: SLF001
-        [Position(QQQ, quantity=1, avg_cost=100.0)],
-        [(_AdoptableQqqStrategy(), {})],
-    )
 
     assert status["phase"] == "clear"
     assert status["allocations"][0]["strategy_id"] == "_adoptable_qqq"
@@ -643,17 +613,20 @@ def test_startup_gate_uses_configured_adopted_position_mapping():
 
 def test_startup_gate_fails_fast_without_mapping_interface():
     async def run():
-        engine = Engine(
-            broker=PaperBroker(),
-            data_feed=DataFeed(None, ReplayDataProvider([])),
-            strategies=[(_AdoptableQqqStrategy(), {})],
-            startup_position_gate_enabled=True,
-            startup_position_mapping_enabled=False,
+        gate = StartupPositionGateController(
+            enabled=True,
+            mapping_enabled=False,
+            default_risk=RiskPolicy(),
         )
+
+        async def refresh_positions():
+            return []
+
         with pytest.raises(RuntimeError, match="no mapping interface"):
-            await engine._run_startup_position_gate(  # noqa: SLF001
+            await gate.run(
                 [Position(QQQ, quantity=1, avg_cost=100.0)],
                 [(_AdoptableQqqStrategy(), {})],
+                refresh_positions=refresh_positions,
             )
 
     asyncio.run(run())
@@ -1112,6 +1085,88 @@ def test_order_manager_drops_duplicate_pending_close(tmp_path):
     text = (tmp_path / "orders.jsonl").read_text(encoding="utf-8")
     assert "close_submitted" in text
     assert "close_already_pending" in text
+
+
+def test_order_manager_drops_duplicate_close_while_submit_in_flight():
+    class _SlowSubmitBroker(_CountingBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def submit_order(self, order: OrderRequest):
+            self.submit_calls += 1
+            self.submitted_orders.append(order)
+            self.entered.set()
+            await self.release.wait()
+            return OrderStatus(order.idempotency_key, "open", filled_qty=0)
+
+    async def run():
+        broker = _SlowSubmitBroker()
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        )
+        position = Position(QQQ, 1, 100.0)
+
+        first = asyncio.create_task(om.submit_close("_phase6", position, "test_exit"))
+        await broker.entered.wait()
+        await om.submit_close("_phase6", position, "test_exit_again")
+        broker.release.set()
+        await first
+
+        assert broker.submit_calls == 1
+
+    asyncio.run(run())
+
+
+def test_order_manager_retries_close_after_immediate_reject():
+    class _RejectThenOpenBroker(_CountingBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.statuses = ["rejected", "open"]
+
+        async def submit_order(self, order: OrderRequest):
+            self.submit_calls += 1
+            self.submitted_orders.append(order)
+            return OrderStatus(order.idempotency_key, self.statuses.pop(0), filled_qty=0)
+
+    async def run():
+        broker = _RejectThenOpenBroker()
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        )
+        position = Position(QQQ, 1, 100.0)
+
+        await om.submit_close("_phase6", position, "test_exit")
+        await om.submit_close("_phase6", position, "test_exit")
+
+        assert broker.submit_calls == 2
+
+    asyncio.run(run())
+
+
+def test_order_manager_retries_close_after_cancelled_update():
+    async def run():
+        broker = _CountingBroker()
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        )
+        position = Position(QQQ, 1, 100.0)
+
+        await om.submit_close("_phase6", position, "test_exit")
+        close_order_id = broker.submitted_orders[0].idempotency_key
+        om._handle_order_update(OrderStatus(close_order_id, "cancelled", filled_qty=0))
+        await om.submit_close("_phase6", position, "test_exit_again")
+
+        assert broker.submit_calls == 2
+
+    asyncio.run(run())
 
 
 def test_order_manager_keeps_close_pending_until_fill_after_filled_update():

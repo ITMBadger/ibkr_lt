@@ -39,6 +39,11 @@ api:
   token_env: IBKR_LT_API_TOKEN
   log_level: warning
 
+# Optional proprietary dashboard auto-loads from protected_dashboard when the
+# package is present and licensed. Leave unset for API-only customer builds.
+# dashboard:
+#   enabled: true
+
 execution:
   provider: ibkr
   host: 127.0.0.1

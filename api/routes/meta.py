@@ -44,6 +44,7 @@ def _meta_payload() -> dict:
             "event_polling": True,
             "event_stream": True,
             "startup_position_gate": True,
+            "optional_dashboard": True,
             "agent_direct_read": True,
             "heartbeat_monitor": True,
             "manual_trade": False,

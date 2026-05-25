@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from ..dependencies import engine_from_request, metadata_from_request
+from ..dependencies import operator_service_from_request
 from ..schemas import HealthResponse
 
 router = APIRouter(tags=["health"])
@@ -10,10 +10,10 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health", response_model=HealthResponse)
 async def health(
-    engine=Depends(engine_from_request),
-    metadata: dict = Depends(metadata_from_request),
+    operator=Depends(operator_service_from_request),
 ) -> dict:
-    snap = engine.snapshot_state()
+    snap = operator.snapshot_state()
+    metadata = dict(operator.metadata)
     connection = dict(snap.get("connection") or {})
     connected = bool(connection.get("connected"))
     running = bool(snap.get("running"))

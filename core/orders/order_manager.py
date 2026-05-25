@@ -169,11 +169,19 @@ class OrderManager:
                 reason,
             )
             return
-        status = await self._broker.submit_order(order)
+        submitting_order_id = f"submitting:{close_key}"
+        self._pending_closes[position_key] = submitting_order_id
+        try:
+            status = await self._broker.submit_order(order)
+        except Exception:
+            self._clear_pending_close_reservation(position_key, submitting_order_id)
+            raise
         self._order_owner[status.broker_order_id] = strategy_id
         self._order_role[status.broker_order_id] = "close"
         self._order_trade_id[status.broker_order_id] = position.trade_id
-        if status.status not in _UNACCEPTED_ORDER_STATUSES:
+        if status.status in _UNACCEPTED_ORDER_STATUSES:
+            self._clear_pending_close_reservation(position_key, submitting_order_id)
+        else:
             self._pending_closes[position_key] = status.broker_order_id
             self._close_keys_by_order_id[status.broker_order_id] = position_key
         self._write_order_event(
@@ -713,6 +721,15 @@ class OrderManager:
             current_order_id = self._pending_closes.get(position_key)
             if current_order_id == broker_order_id:
                 self._pending_closes.pop(position_key, None)
+
+    def _clear_pending_close_reservation(
+        self,
+        position_key: tuple[str, Instrument, str | None],
+        broker_order_id: str,
+    ) -> None:
+        current_order_id = self._pending_closes.get(position_key)
+        if current_order_id == broker_order_id:
+            self._pending_closes.pop(position_key, None)
 
     def _clear_protective_stop(self, broker_order_id: str) -> None:
         position_key = self._protective_stop_keys_by_order_id.pop(

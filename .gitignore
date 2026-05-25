@@ -1,16 +1,15 @@
-settings.json
-
 # Local/editor/agent state
 .agents/
 .claude/
 .codex/
 .cursor/
 .vscode/
+settings.json
 .env
 .env.*
 !.env.example
 
-# Python/generated test artifacts
+# Python/build artifacts
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -22,12 +21,10 @@ build/
 dist/
 *.egg-info/
 
-# Local generated run artifacts
+# Runtime logs, audit output, reports, and generated state. These can reveal
+# instruments, timing, orders, fills, decisions, and ownership mappings.
 /runs/
 runs*/
-
-# Legacy local runtime artifacts. Keep ignored so existing local history does not
-# become visible after the generated-run layout moved under runs/.
 /var/
 logs/
 logs*/
@@ -46,35 +43,49 @@ tmp*/
 *.log
 *.jsonl
 *.json
-*.yaml
-*.yml
-!config.yaml
 strategy_decisions*.jsonl
 strategy_trigger_decisions*.jsonl
 strategy_30m_latest_*.json
 signals*.jsonl
 orders*.jsonl
 fills*.jsonl
+*decision*
+*signal*
+*order*
+*fill*
 
-# Proprietary strategy source and derivative artifacts. Default-deny this
-# folder; allow only the public package marker, sample scaffold, and demo
-# strategy explicitly.
+# Config privacy. Only the root shared config is public. Root config variants
+# such as config.live.yaml, config.vwap.local.yaml, and config.private.yml are
+# always local/private.
+*.yaml
+*.yml
+/config.*
+!/config.yaml
+!configs/
+!configs/customer.template.yaml
+configs/local/
+configs/local/**
+
+# Public demo strategy surface only. All other strategy implementations are
+# proprietary unless explicitly allowed here.
 strategies/**
 !strategies/
 !strategies/__init__.py
 !strategies/_sample_strategy.py
 !strategies/stoch_3m_cross_long.py
 
-# Protected/customer strategy package. PyArmor/Cython outputs and private source
-# live here locally; only the empty package marker is safe to publish.
+# Protected strategy/dashboard packages and any artifacts/logs/configs named
+# after them are private. Do not whitelist package markers here; tracked files
+# under these paths must be removed from Git tracking separately.
+*protected_strategies*
+protected_strategies/
 protected_strategies/**
-!protected_strategies/
-!protected_strategies/__init__.py
+*protected_dashboard*
+protected_dashboard/
+protected_dashboard/**
 
-# Internal strategy documentation/tests can reveal IDs, instruments,
-# thresholds, scoring formulas, exits, or adopted-position ownership.
-# `docs/roadmap/` is the local backlog/review/deferred-work area and remains
-# ignored unless a note is deliberately sanitized for public docs.
+# Internal docs/tests can reveal strategy IDs, instruments, thresholds, scoring
+# formulas, exits, and pending roadmap items.
 *.md
 !README.md
 docs/**
@@ -85,21 +96,9 @@ tests/**
 !tests/
 !tests/**/
 !tests/**/__init__.py
-configs/**
-!configs/
-!configs/customer.template.yaml
-config.local*
-config.private*
-config.proprietary*
-*.local.yaml
-*.local.yml
-*.private.yaml
-*.private.yml
-*.proprietary.yaml
-*.proprietary.yml
 
-# Generic private-artifact catchalls. Avoid strategy-specific names here:
-# the ignore file itself is public.
+# Generic private/research catchalls. Avoid strategy-specific names in this
+# public file.
 *private*
 *proprietary*
 *internal*
@@ -109,12 +108,6 @@ config.proprietary*
 *sweep*
 *walk_forward*
 *backtest_run*
-*decision*
-*signal*
-*order*
-*fill*
-
-# Legacy/research material often contains the original strategy formulas.
 legacy/
 archived/
 archive/

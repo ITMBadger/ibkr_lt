@@ -20,11 +20,11 @@ async def runtime_events_websocket(websocket: WebSocket) -> None:
             return
 
     await websocket.accept()
-    engine = websocket.app.state.engine
+    operator = websocket.app.state.operator_service
     seen: set[tuple[Any, Any, Any]] = set()
     try:
         while True:
-            snap = engine.snapshot_state()
+            snap = operator.snapshot_state()
             events = list(snap.get("recent_events", []))
             new_events = []
             for event in events:
@@ -49,4 +49,3 @@ async def runtime_events_websocket(websocket: WebSocket) -> None:
 
 
 __all__ = ["runtime_events_websocket"]
-

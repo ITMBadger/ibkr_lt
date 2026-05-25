@@ -15,6 +15,10 @@ async def engine_from_request(request: Request):
     return request.app.state.engine
 
 
+async def operator_service_from_request(request: Request):
+    return request.app.state.operator_service
+
+
 async def metadata_from_request(request: Request) -> dict:
     return dict(getattr(request.app.state, "metadata", {}) or {})
 
@@ -45,5 +49,6 @@ __all__ = [
     "AuthDependency",
     "engine_from_request",
     "metadata_from_request",
+    "operator_service_from_request",
     "require_api_auth",
 ]

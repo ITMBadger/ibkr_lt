@@ -107,6 +107,23 @@ Hermes should call `GET /api/v1/health` first, then use `next_endpoint` to decid
 
 The API does not submit trades or cancel broker orders. The only active mutation endpoints are the protected startup gate endpoints, which are limited to live-startup position mapping and refresh.
 
+## Optional Dashboard
+
+The runtime auto-detects an optional proprietary dashboard plugin named
+`protected_dashboard`. When the package is present and its license check passes,
+it is mounted on the same FastAPI/uvicorn host under `/dashboard`. When it is
+missing, expired, disabled, or broken, startup continues in API-only mode.
+
+The dashboard uses the same safe operator facade as the API. It can read broker
+positions and submit startup position mappings, but it must not call broker
+adapters, submit trades, cancel orders, or inspect strategy internals directly.
+
+Disable dashboard probing for troubleshooting with:
+
+```bash
+IBKR_LT_DASHBOARD_DISABLED=1 python main.py --paper
+```
+
 ## Audit Logs
 
 When `logging.enabled=true`, runtime output is written under a per-run folder:
@@ -247,7 +264,7 @@ The monitor polls `/api/v1/health` every 5 seconds, keeps `/ws/events` connected
 - `runs/heartbeat_monitor/status.json`
 - `runs/heartbeat_monitor/alerts.jsonl`
 
-When the control API starts, `main.py` warns if no `heartbeat_monitor.py` process is detected. This is part of API startup and is only skipped when the API is disabled with `--no-api`.
+When the control API starts, the runtime warns if no `heartbeat_monitor.py` process is detected. This is part of API startup and is only skipped when the API is disabled with `--no-api`.
 
 Useful options:
 

@@ -150,6 +150,15 @@ def _check_file_shape(path: Path, rel: Path) -> list[Finding]:
         and path.name not in _SAFE_PROTECTED_PY_FILES
     ):
         findings.append(Finding(rel, "protected strategy Python source should not be distributed"))
+    if (
+        rel_parts
+        and rel_parts[0] == "protected_dashboard"
+        and suffix == ".py"
+        and path.name not in _SAFE_PROTECTED_PY_FILES
+    ):
+        findings.append(Finding(rel, "protected dashboard Python source should not be distributed"))
+    if rel.as_posix() == "protected_dashboard.py":
+        findings.append(Finding(rel, "protected dashboard Python source should not be distributed"))
     return findings
 
 

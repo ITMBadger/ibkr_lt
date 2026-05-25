@@ -6,16 +6,19 @@ from pathlib import Path
 import pytest
 
 from core.exceptions import ConfigError
+from core.observability import (
+    cmdline_is_heartbeat_monitor,
+    heartbeat_monitor_process_running,
+    warn_if_heartbeat_monitor_missing,
+)
 from core.orders.strategy_modes import validate_strategy_modes
 from main import (
     _api_metadata,
     _build_broker,
-    _cmdline_is_heartbeat_monitor,
     _config_from_args,
-    _heartbeat_monitor_process_running,
     _legacy_cli_config,
     _start_control_api,
-    _warn_if_heartbeat_monitor_missing,
+    _startup_mapping_enabled,
 )
 
 
@@ -81,6 +84,18 @@ def test_yaml_config_api_flag_reenables_explicitly_disabled_api(tmp_path: Path):
     assert config["api"]["enabled"] is True
 
 
+def test_startup_mapping_enabled_accepts_api_or_dashboard():
+    assert _startup_mapping_enabled({"api": {"enabled": True}}) is True
+    assert _startup_mapping_enabled({"api": {"enabled": False}}) is False
+    assert (
+        _startup_mapping_enabled(
+            {"api": {"enabled": False}},
+            dashboard_active=True,
+        )
+        is True
+    )
+
+
 def test_yaml_config_rejects_legacy_global_dry_run(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("dry_run: true\nstrategies: []\n", encoding="utf-8")
@@ -127,18 +142,18 @@ def test_no_api_skips_heartbeat_monitor_warning(monkeypatch):
     def fail_if_called():
         raise AssertionError("heartbeat monitor warning should not run")
 
-    monkeypatch.setattr("main._warn_if_heartbeat_monitor_missing", fail_if_called)
+    monkeypatch.setattr("main.warn_if_heartbeat_monitor_missing", fail_if_called)
 
     assert _start_control_api({"api": {"enabled": False}}, engine=None, strategy_ids=[]) is None
 
 
 def test_cmdline_detects_heartbeat_monitor_script_and_module():
-    assert _cmdline_is_heartbeat_monitor([
+    assert cmdline_is_heartbeat_monitor([
         "python",
         "tools/heartbeat_monitor.py",
     ])
-    assert _cmdline_is_heartbeat_monitor(["python", "-m", "tools.heartbeat_monitor"])
-    assert not _cmdline_is_heartbeat_monitor([
+    assert cmdline_is_heartbeat_monitor(["python", "-m", "tools.heartbeat_monitor"])
+    assert not cmdline_is_heartbeat_monitor([
         "pytest",
         "tests/unit/test_heartbeat_monitor.py",
     ])
@@ -147,22 +162,22 @@ def test_cmdline_detects_heartbeat_monitor_script_and_module():
 def test_process_scan_detects_running_monitor(tmp_path: Path):
     _write_cmdline(tmp_path, 100, ["python", "tools/heartbeat_monitor.py"])
 
-    assert _heartbeat_monitor_process_running(tmp_path, current_pid=1) is True
+    assert heartbeat_monitor_process_running(tmp_path, current_pid=1) is True
 
 
 def test_process_scan_ignores_current_process_and_test_file(tmp_path: Path):
     _write_cmdline(tmp_path, 1, ["python", "tools/heartbeat_monitor.py"])
     _write_cmdline(tmp_path, 2, ["pytest", "tests/unit/test_heartbeat_monitor.py"])
 
-    assert _heartbeat_monitor_process_running(tmp_path, current_pid=1) is False
+    assert heartbeat_monitor_process_running(tmp_path, current_pid=1) is False
 
 
 def test_process_scan_returns_none_when_unavailable(tmp_path: Path):
-    assert _heartbeat_monitor_process_running(tmp_path / "missing") is None
+    assert heartbeat_monitor_process_running(tmp_path / "missing") is None
 
 
 def test_missing_monitor_warning_uses_stderr(tmp_path: Path, capsys):
-    _warn_if_heartbeat_monitor_missing(tmp_path)
+    warn_if_heartbeat_monitor_missing(tmp_path)
 
     captured = capsys.readouterr()
     assert "Heartbeat Monitor process is not detected" in captured.err

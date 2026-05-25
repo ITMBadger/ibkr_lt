@@ -148,3 +148,35 @@ def test_customer_package_check_flags_raw_strategy_source(tmp_path: Path):
     messages = "\n".join(finding.message for finding in findings)
     assert "protected strategy Python source" in messages
     assert "forbidden token" in messages
+
+
+def test_customer_package_check_flags_raw_dashboard_source(tmp_path: Path):
+    package = tmp_path / "customer_package"
+    protected = package / "protected_dashboard"
+    protected.mkdir(parents=True)
+    (protected / "__init__.py").write_text("", encoding="utf-8")
+    (protected / "app.py").write_text("PRIVATE_DASHBOARD_TOKEN = 'secret_alpha'\n", encoding="utf-8")
+
+    findings = check_customer_package(
+        root=package,
+        forbidden_tokens=["secret_alpha"],
+    )
+
+    messages = "\n".join(finding.message for finding in findings)
+    assert "protected dashboard Python source" in messages
+    assert "forbidden token" in messages
+
+
+def test_customer_package_check_flags_top_level_dashboard_source(tmp_path: Path):
+    package = tmp_path / "customer_package"
+    package.mkdir()
+    (package / "protected_dashboard.py").write_text("PRIVATE = 'secret_alpha'\n", encoding="utf-8")
+
+    findings = check_customer_package(
+        root=package,
+        forbidden_tokens=["secret_alpha"],
+    )
+
+    messages = "\n".join(finding.message for finding in findings)
+    assert "protected dashboard Python source" in messages
+    assert "forbidden token" in messages
