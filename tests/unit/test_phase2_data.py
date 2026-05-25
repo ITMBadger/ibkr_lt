@@ -15,6 +15,7 @@ from core.engine.timeframes import TF_5S, TF_1M, TF_3M, TF_30M
 from core.data.bar_builder import BarBuilder
 from core.data.resampler import Resampler
 from core.data.manager import DataManager
+from core.features.registry import FeatureRegistry
 from core.adapters.csv.data import CSVDataProvider
 from core.adapters.paper.data import ReplayDataProvider
 
@@ -265,6 +266,52 @@ class TestDataManager:
         assert len(df) == 2
         assert list(df["close"]) == [101.5, 102.5]
         assert len(dm.bars_1m(lookback_days=1)) == 1
+
+
+# ---------------------------------------------------------------------------
+# FeatureRegistry
+# ---------------------------------------------------------------------------
+
+class TestFeatureRegistry:
+    def test_latest_bar_1m_uses_timestamp_bound_view(self):
+        dm = DataManager(QQQ)
+        dm.merge_backfill([
+            _1m_bar(QQQ, "2026-05-01 13:30:00", c=100.5),
+            _1m_bar(QQQ, "2026-05-01 13:31:00", c=101.5),
+            _1m_bar(QQQ, "2026-05-01 13:32:00", c=102.5),
+        ])
+        features = FeatureRegistry({QQQ: dm})
+        features.preload_from_managers()
+
+        view = features.as_of(datetime(2026, 5, 1, 13, 31, 30, tzinfo=timezone.utc))
+        row = view.latest_bar(QQQ, "1m")
+
+        assert row is not None
+        assert row.name == pd.Timestamp("2026-05-01 13:31:00+00:00")
+        assert row["close"] == pytest.approx(101.5)
+
+    def test_latest_bar_coarser_timeframe_returns_only_completed_bar(self):
+        dm = DataManager(QQQ)
+        dm.merge_backfill([
+            _1m_bar(QQQ, f"2026-05-01 13:{30 + i:02d}:00", c=100.5 + i)
+            for i in range(7)
+        ])
+        features = FeatureRegistry({QQQ: dm})
+        features.preload_from_managers()
+
+        before_close = features.as_of(
+            datetime(2026, 5, 1, 13, 35, 59, tzinfo=timezone.utc)
+        ).latest_bar(QQQ, "3m")
+        at_close = features.as_of(
+            datetime(2026, 5, 1, 13, 36, tzinfo=timezone.utc)
+        ).latest_bar(QQQ, "3m")
+
+        assert before_close is not None
+        assert before_close.name == pd.Timestamp("2026-05-01 13:30:00+00:00")
+        assert before_close["close"] == pytest.approx(102.5)
+        assert at_close is not None
+        assert at_close.name == pd.Timestamp("2026-05-01 13:33:00+00:00")
+        assert at_close["close"] == pytest.approx(105.5)
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,8 @@ class DataManager:
         self._session_tz = session_tz
 
         self._bars: pd.DataFrame = _empty_frame()
+        self._pending_rows: list[tuple[pd.Timestamp, list[float]]] = []
+        self._pending_flush_size = 512
         self._revision: int = 0
         self._lock = threading.RLock()
 
@@ -70,6 +72,7 @@ class DataManager:
         df = df[~df.index.duplicated(keep="last")]
 
         with self._lock:
+            self._pending_rows.clear()
             self._bars = df
             self._revision += 1
             self._trim_lookback()
@@ -91,6 +94,7 @@ class DataManager:
         new_rows: list[dict] = []
 
         with self._lock:
+            self._flush_pending()
             existing = set(self._bars.index)
             for bar in bars:
                 ts = bar.timestamp
@@ -138,20 +142,30 @@ class DataManager:
         ts = bar.timestamp
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
+        ts = pd.Timestamp(ts).tz_convert("UTC")
+        values = [bar.open, bar.high, bar.low, bar.close, bar.volume]
 
         with self._lock:
-            row = pd.DataFrame(
-                [[bar.open, bar.high, bar.low, bar.close, bar.volume]],
-                index=pd.DatetimeIndex([ts], tz="UTC"),
-                columns=_OHLCV,
-            )
-            self._bars = (
-                pd.concat([self._bars, row])
-                .sort_index()
-            )
-            self._bars = self._bars[~self._bars.index.duplicated(keep="last")]
+            latest_pending = self._pending_rows[-1][0] if self._pending_rows else None
+            latest_stored = self._bars.index[-1] if not self._bars.empty else None
+            latest = latest_pending if latest_pending is not None else latest_stored
+            if latest is None or ts > latest:
+                self._pending_rows.append((ts, values))
+                if len(self._pending_rows) >= self._pending_flush_size:
+                    self._flush_pending()
+            else:
+                self._flush_pending()
+                row = pd.DataFrame(
+                    [values],
+                    index=pd.DatetimeIndex([ts], tz="UTC", name="timestamp"),
+                    columns=_OHLCV,
+                )
+                self._bars = (
+                    pd.concat([self._bars, row])
+                    .sort_index()
+                )
+                self._bars = self._bars[~self._bars.index.duplicated(keep="last")]
             self._revision += 1
-            self._trim_lookback()
             return bar
 
     # ------------------------------------------------------------------
@@ -160,6 +174,7 @@ class DataManager:
 
     def bars_1m(self, lookback_days: int = 0) -> pd.DataFrame:
         with self._lock:
+            self._flush_pending()
             if lookback_days > 0:
                 cutoff = self._lookback_cutoff(lookback_days)
                 return self._bars[self._bars.index >= cutoff].copy()
@@ -169,6 +184,7 @@ class DataManager:
         """Return cached resample. Cache is invalidated on revision change."""
         cache_key = (target_tf.label, lookback_bars)
         with self._lock:
+            self._flush_pending()
             cached_rev, cached_df = self._resample_cache.get(cache_key, (-1, None))
             if cached_rev == self._revision and cached_df is not None:
                 return cached_df.copy()
@@ -183,11 +199,12 @@ class DataManager:
     def bar_count(self) -> int:
         """Return the number of stored 1-minute bars without copying them."""
         with self._lock:
-            return len(self._bars)
+            return len(self._bars) + len(self._pending_rows)
 
     def session_count(self) -> int:
         """Return the number of stored sessions without copying OHLCV rows."""
         with self._lock:
+            self._flush_pending()
             if self._bars.empty:
                 return 0
             local_index = self._bars.index.tz_convert(self._session_tz)
@@ -200,6 +217,8 @@ class DataManager:
     def latest_timestamp(self) -> datetime | None:
         """Return the timestamp of the most recent bar, or None if empty."""
         with self._lock:
+            if self._pending_rows:
+                return self._pending_rows[-1][0].to_pydatetime()
             if self._bars.empty:
                 return None
             return self._bars.index[-1].to_pydatetime()
@@ -212,7 +231,32 @@ class DataManager:
         if self._lookback_days <= 0 or self._bars.empty:
             return
         cutoff = self._lookback_cutoff(self._lookback_days)
-        self._bars = self._bars[self._bars.index >= cutoff]
+        if self._bars.index[0] >= cutoff:
+            return
+        trim_at = self._bars.index.searchsorted(pd.Timestamp(cutoff), side="left")
+        if trim_at > 0:
+            self._bars = self._bars.iloc[int(trim_at):]
+
+    def _flush_pending(self) -> None:
+        if not self._pending_rows:
+            return
+        index = pd.DatetimeIndex(
+            [ts for ts, _ in self._pending_rows],
+            tz="UTC",
+            name="timestamp",
+        )
+        values = [row for _, row in self._pending_rows]
+        pending = pd.DataFrame(values, index=index, columns=_OHLCV)
+        self._pending_rows.clear()
+
+        if self._bars.empty:
+            self._bars = pending
+        elif pending.index[0] > self._bars.index[-1]:
+            self._bars = pd.concat([self._bars, pending])
+        else:
+            self._bars = pd.concat([self._bars, pending]).sort_index()
+            self._bars = self._bars[~self._bars.index.duplicated(keep="last")]
+        self._trim_lookback()
 
     def _lookback_cutoff(self, lookback_days: int) -> datetime:
         if self._bars.empty:

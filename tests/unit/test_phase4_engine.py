@@ -17,7 +17,7 @@ from core.features.indicators import (
 )
 from core.features.ids import parse_indicator_id
 from core.features.registry import FeatureRegistry
-from core.risk.policy import RiskPolicy
+from core.risk.policy import SIZING_MODE_FULL_EQUITY, RiskPolicy
 from core.portfolio.state import PortfolioState
 from core.engine.loader import register_strategy, get_registry, _registry
 from core.interfaces.strategy import (
@@ -326,6 +326,43 @@ class TestRiskPolicy:
         rp = RiskPolicy(position_size_shares=20, max_order_quantity=5)
         sig = Signal(instrument=MNQ, side="long")
         assert rp.size_order(sig, PortfolioState()) == 5
+
+    def test_full_equity_sizes_from_account_equity_and_price(self):
+        rp = RiskPolicy(
+            sizing_mode=SIZING_MODE_FULL_EQUITY,
+            equity_fraction=1.0,
+            max_order_quantity=None,
+        )
+        sig = Signal(instrument=MNQ, side="long")
+
+        assert rp.size_order(
+            sig,
+            PortfolioState(),
+            reference_price=100.0,
+            account_equity=100_000.0,
+        ) == pytest.approx(500.0)
+
+    def test_full_equity_can_be_explicitly_capped(self):
+        rp = RiskPolicy(
+            sizing_mode=SIZING_MODE_FULL_EQUITY,
+            equity_fraction=1.0,
+            max_order_quantity=3,
+        )
+        sig = Signal(instrument=MNQ, side="long")
+
+        assert rp.size_order(
+            sig,
+            PortfolioState(),
+            reference_price=100.0,
+            account_equity=100_000.0,
+        ) == 3
+
+    def test_full_equity_requires_price_and_equity(self):
+        rp = RiskPolicy(sizing_mode=SIZING_MODE_FULL_EQUITY, max_order_quantity=None)
+        sig = Signal(instrument=MNQ, side="long")
+
+        assert rp.size_order(sig, PortfolioState(), account_equity=100_000.0) == 0
+        assert rp.size_order(sig, PortfolioState(), reference_price=100.0) == 0
 
     def test_flat_signal_returns_zero(self):
         rp = RiskPolicy(position_size_shares=1)

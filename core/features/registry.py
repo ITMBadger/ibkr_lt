@@ -14,6 +14,7 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from ..data.manager import DataManager
@@ -106,6 +107,67 @@ class FeatureRegistry:
             params,
             as_of=None,
         )
+
+    def bars(
+        self,
+        instrument: Instrument,
+        timeframe: str = "1m",
+        *,
+        as_of: datetime | None = None,
+        start: datetime | pd.Timestamp | None = None,
+        end: datetime | pd.Timestamp | None = None,
+        lookback_bars: int = 0,
+    ) -> pd.DataFrame:
+        """Return cached timestamp-bound bars for strategy-private calculations."""
+        manager = self._manager_for(instrument)
+        with self._lock:
+            if instrument in self._source_bars:
+                source_version = self._source_versions[instrument]
+                bars = self._cached_source_timeframe_bars(
+                    instrument,
+                    timeframe,
+                    source_version,
+                )
+                return _slice_bars(
+                    bars,
+                    timeframe,
+                    as_of=as_of,
+                    start=start,
+                    end=end,
+                    lookback_bars=lookback_bars,
+                )
+
+        bars = self._bars(manager, timeframe)
+        return _slice_bars(
+            bars,
+            timeframe,
+            as_of=as_of,
+            start=start,
+            end=end,
+            lookback_bars=lookback_bars,
+        )
+
+    def latest_bar(
+        self,
+        instrument: Instrument,
+        timeframe: str = "1m",
+        *,
+        as_of: datetime | None = None,
+    ) -> pd.Series | None:
+        """Return the latest timestamp-safe OHLCV bar without a DataFrame slice."""
+        manager = self._manager_for(instrument)
+        with self._lock:
+            if instrument in self._source_bars:
+                source_version = self._source_versions[instrument]
+                bars = self._cached_source_timeframe_bars(
+                    instrument,
+                    timeframe,
+                    source_version,
+                )
+                return _latest_bar_from_bars(bars, timeframe, as_of=as_of)
+
+        bars = self._bars(manager, timeframe)
+        return _latest_bar_from_bars(bars, timeframe, as_of=as_of)
 
     def _get(
         self,
@@ -249,11 +311,23 @@ class FeatureRegistry:
         timeframe: str,
         source_version: int,
     ) -> pd.DataFrame:
+        return self._cached_source_timeframe_bars(
+            instrument,
+            timeframe,
+            source_version,
+        ).copy()
+
+    def _cached_source_timeframe_bars(
+        self,
+        instrument: Instrument,
+        timeframe: str,
+        source_version: int,
+    ) -> pd.DataFrame:
         key = ("bars", instrument, timeframe, source_version)
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)
-            return cached.copy()
+            return cached
 
         source = self._source_bars[instrument]
         if timeframe == "1m":
@@ -263,7 +337,7 @@ class FeatureRegistry:
         self._cache[key] = result
         if len(self._cache) > self._max:
             self._cache.popitem(last=False)
-        return result.copy()
+        return result
 
     def _set_source(self, instrument: Instrument, bars: pd.DataFrame) -> None:
         clean = bars[[col for col in _OHLCV if col in bars.columns]].copy()
@@ -414,6 +488,35 @@ class FeatureView:
     def get_id(self, indicator_id: str) -> Any:
         return self._registry.get_id(indicator_id, as_of=self._timestamp)
 
+    def bars(
+        self,
+        instrument: Instrument,
+        timeframe: str = "1m",
+        *,
+        start: datetime | pd.Timestamp | None = None,
+        end: datetime | pd.Timestamp | None = None,
+        lookback_bars: int = 0,
+    ) -> pd.DataFrame:
+        return self._registry.bars(
+            instrument,
+            timeframe,
+            as_of=self._timestamp,
+            start=start,
+            end=end,
+            lookback_bars=lookback_bars,
+        )
+
+    def latest_bar(
+        self,
+        instrument: Instrument,
+        timeframe: str = "1m",
+    ) -> pd.Series | None:
+        return self._registry.latest_bar(
+            instrument,
+            timeframe,
+            as_of=self._timestamp,
+        )
+
 
 def managerless_resample(bars_1m: pd.DataFrame, target_tf: Timeframe) -> pd.DataFrame:
     from ..data.resampler import Resampler
@@ -438,11 +541,87 @@ def _slice_to_as_of(value: Any, timeframe: str, as_of: datetime | None) -> Any:
     tf = Timeframe.parse(timeframe)
     if tf.seconds <= 60:
         cutoff = ts
-        mask = value.index <= cutoff
+        stop = value.index.searchsorted(cutoff, side="right")
     else:
         cutoff = ts.floor(_to_pandas_offset(tf))
-        mask = value.index < cutoff
-    return value.loc[mask].copy()
+        stop = value.index.searchsorted(cutoff, side="left")
+    return value.iloc[: int(stop)].copy()
+
+
+def _slice_bars(
+    bars: pd.DataFrame,
+    timeframe: str,
+    *,
+    as_of: datetime | None,
+    start: datetime | pd.Timestamp | None,
+    end: datetime | pd.Timestamp | None,
+    lookback_bars: int,
+) -> pd.DataFrame:
+    if bars.empty:
+        return bars.copy()
+    index = bars.index
+    start_pos = 0
+    stop_pos = len(index)
+    if as_of is not None:
+        ts = pd.Timestamp(as_of)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+
+        tf = Timeframe.parse(timeframe)
+        if tf.seconds <= 60:
+            cutoff = ts
+            stop_pos = min(stop_pos, int(index.searchsorted(cutoff, side="right")))
+        else:
+            cutoff = ts.floor(_to_pandas_offset(tf))
+            stop_pos = min(stop_pos, int(index.searchsorted(cutoff, side="left")))
+    if start is not None:
+        start_pos = max(start_pos, int(index.searchsorted(_normalize_bound(start), side="left")))
+    if end is not None:
+        stop_pos = min(stop_pos, int(index.searchsorted(_normalize_bound(end), side="right")))
+    if start_pos >= stop_pos:
+        return bars.iloc[0:0].copy()
+    result = bars.iloc[start_pos:stop_pos]
+    if lookback_bars > 0:
+        result = result.iloc[-lookback_bars:]
+    return result.copy()
+
+
+def _latest_bar_from_bars(
+    bars: pd.DataFrame,
+    timeframe: str,
+    *,
+    as_of: datetime | None,
+) -> pd.Series | None:
+    if bars.empty:
+        return None
+    if as_of is None:
+        return bars.iloc[-1].copy()
+
+    ts = pd.Timestamp(as_of)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+
+    tf = Timeframe.parse(timeframe)
+    if tf.seconds <= 60:
+        cutoff = ts
+        pos = int(bars.index.searchsorted(cutoff, side="right")) - 1
+    else:
+        cutoff = ts.floor(_to_pandas_offset(tf))
+        pos = int(bars.index.searchsorted(cutoff, side="left")) - 1
+    if pos < 0:
+        return None
+    return bars.iloc[pos].copy()
+
+
+def _normalize_bound(value: datetime | pd.Timestamp) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
 
 
 def _to_pandas_offset(tf: Timeframe) -> str:
@@ -494,7 +673,11 @@ def _normalize_index(index: pd.Index) -> pd.DatetimeIndex:
 
 def _rows_equal(left: pd.Series, right: pd.Series) -> bool:
     try:
-        return bool(left[_OHLCV].equals(right[_OHLCV]))
+        if isinstance(left, pd.DataFrame):
+            left = left.iloc[-1]
+        left_values = pd.to_numeric(left[_OHLCV], errors="coerce").to_numpy(dtype=float)
+        right_values = pd.to_numeric(right[_OHLCV], errors="coerce").to_numpy(dtype=float)
+        return bool(np.allclose(left_values, right_values, equal_nan=True))
     except Exception:
         return False
 

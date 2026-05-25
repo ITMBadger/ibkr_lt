@@ -45,6 +45,10 @@ class BacktestSettings:
     progress_enabled: bool = True
     progress_interval_bars: int = 1000
     progress_interval_seconds: float = 30.0
+    max_parallel_workers: int = 4
+    sizing_mode: str = "fixed_shares"
+    sizing_equity_fraction: float = 1.0
+    sizing_max_order_quantity: float | None = None
 
 
 def load_yaml_config(path: str | Path) -> dict[str, Any]:
@@ -99,6 +103,7 @@ def resolve_settings(
 
     backtest_cfg = dict(config.get("backtest") or {})
     progress_cfg = dict(backtest_cfg.get("progress") or {})
+    sizing_cfg = dict(backtest_cfg.get("sizing") or {})
     mode = normalize_backtest_mode(
         getattr(args, "mode", None)
         or backtest_cfg.get("mode", "event")
@@ -121,6 +126,15 @@ def resolve_settings(
         or backtest_cfg.get("output_dir")
         or "runs/backtests"
     )
+    sizing_mode = normalize_sizing_mode(sizing_cfg.get("mode", "fixed_shares"))
+    sizing_equity_fraction = float(sizing_cfg.get("equity_fraction", 1.0))
+    if sizing_equity_fraction <= 0:
+        raise ConfigError("backtest.sizing.equity_fraction must be > 0")
+    sizing_max_order_quantity = sizing_cfg.get("max_order_quantity")
+    if sizing_max_order_quantity is not None:
+        sizing_max_order_quantity = float(sizing_max_order_quantity)
+        if sizing_max_order_quantity <= 0:
+            raise ConfigError("backtest.sizing.max_order_quantity must be > 0")
 
     return BacktestSettings(
         config_path=normalize_local_path(getattr(args, "config", "config.yaml")),
@@ -164,17 +178,37 @@ def resolve_settings(
             if getattr(args, "progress_interval_seconds", None) is not None
             else progress_cfg.get("interval_seconds", 30.0)
         ),
+        max_parallel_workers=int(
+            getattr(args, "max_parallel_workers", None)
+            if getattr(args, "max_parallel_workers", None) is not None
+            else backtest_cfg.get("max_parallel_workers", 4)
+        ),
+        sizing_mode=sizing_mode,
+        sizing_equity_fraction=sizing_equity_fraction,
+        sizing_max_order_quantity=sizing_max_order_quantity,
     )
 
 
 def normalize_backtest_mode(value: str) -> str:
     normalized = str(value or "event").strip().lower().replace("_", "-")
-    if normalized not in {"event", "fast-event"}:
+    if normalized not in {"event", "fast-event", "parallel"}:
         raise ConfigError(
-            "Backtest mode must be 'event' or 'fast-event'; "
+            "Backtest mode must be 'event', 'fast-event', or 'parallel'; "
             f"got {value!r}"
         )
     return normalized
+
+
+def normalize_sizing_mode(value: str) -> str:
+    normalized = str(value or "fixed_shares").strip().lower().replace("-", "_")
+    if normalized in {"fixed", "fixed_share", "fixed_shares"}:
+        return "fixed_shares"
+    if normalized in {"full_equity", "full", "full_account", "equity"}:
+        return "full_equity"
+    raise ConfigError(
+        "backtest.sizing.mode must be 'fixed_shares' or 'full_equity'; "
+        f"got {value!r}"
+    )
 
 
 def resolve_strategy_ids(

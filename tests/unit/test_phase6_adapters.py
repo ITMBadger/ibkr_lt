@@ -25,7 +25,7 @@ from core.interfaces.strategy import (
 from core.orders.order_manager import OrderManager
 from core.portfolio.state import PortfolioState
 from core.risk.policy import RiskPolicy
-from core.types import Bar, Instrument, MarketContext, OrderRequest, Position, Signal
+from core.types import Bar, Instrument, MarketContext, OrderRequest, OrderStatus, Position, Signal
 
 QQQ = Instrument(asset_class="equity", symbol="QQQ")
 SPY = Instrument(asset_class="equity", symbol="SPY")
@@ -55,12 +55,19 @@ class _CountingBroker(PaperBroker):
     def __init__(self) -> None:
         super().__init__()
         self.submit_calls = 0
+        self.cancel_calls = 0
         self.submitted_orders: list[OrderRequest] = []
+        self.cancelled_order_ids: list[str] = []
 
     async def submit_order(self, order: OrderRequest):
         self.submit_calls += 1
         self.submitted_orders.append(order)
         return await super().submit_order(order)
+
+    async def cancel_order(self, broker_order_id: str) -> None:
+        self.cancel_calls += 1
+        self.cancelled_order_ids.append(broker_order_id)
+        await super().cancel_order(broker_order_id)
 
 
 class _RecordingReplay(ReplayDataProvider):
@@ -810,6 +817,51 @@ def test_order_manager_strategy_dry_run_does_not_submit_close(tmp_path):
     assert "close_submitted" not in text
 
 
+def test_order_manager_drops_duplicate_pending_close(tmp_path):
+    async def run():
+        broker = _CountingBroker()
+        audit = AuditLogger(log_dir=tmp_path)
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+            audit,
+        )
+        position = Position(QQQ, 1, 100.0)
+
+        await om.submit_close("_phase6", position, "first_exit")
+        await om.submit_close("_phase6", position, "second_exit")
+
+        assert broker.submit_calls == 1
+
+    import asyncio
+    asyncio.run(run())
+    text = (tmp_path / "orders.jsonl").read_text(encoding="utf-8")
+    assert "close_submitted" in text
+    assert "close_already_pending" in text
+
+
+def test_order_manager_keeps_close_pending_until_fill_after_filled_update():
+    async def run():
+        broker = _CountingBroker()
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        )
+        position = Position(QQQ, 1, 100.0)
+
+        await om.submit_close("_phase6", position, "test_exit")
+        close_order_id = broker.submitted_orders[0].idempotency_key
+        om._handle_order_update(OrderStatus(close_order_id, "filled", filled_qty=1))
+        await om.submit_close("_phase6", position, "test_exit_again")
+
+        assert broker.submit_calls == 1
+
+    import asyncio
+    asyncio.run(run())
+
+
 def test_order_manager_live_strategy_still_submits_with_other_dry_run_strategy():
     async def run():
         broker = _CountingBroker()
@@ -906,6 +958,57 @@ def test_order_manager_submits_fill_price_protective_stop():
 
     import asyncio
     asyncio.run(run())
+
+
+def test_order_manager_cancels_protective_stop_when_strategy_close_submits(tmp_path):
+    async def run():
+        broker = _CountingBroker()
+        portfolio = PortfolioState()
+        audit = AuditLogger(log_dir=tmp_path)
+        om = OrderManager(
+            broker,
+            portfolio,
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+            audit,
+            protective_stops={
+                "_phase6": ProtectiveStopSpec(pct=0.015, reference="fill_price"),
+            },
+        )
+        await om._process_signal(Signal(QQQ, "long"), "_phase6")
+        await broker.on_bar(_bars(QQQ, 1)[0])
+        await om.drain_ready_fills()
+        await om.drain_ready_order_updates()
+
+        position = portfolio.get_strategy_position("_phase6", QQQ)
+        assert position is not None
+        stop_order_id = broker.submitted_orders[1].idempotency_key
+
+        await om.submit_close("_phase6", position, "target_exit")
+
+        assert broker.cancel_calls == 1
+        assert broker.cancelled_order_ids == [stop_order_id]
+
+        await broker.on_bar(Bar(
+            instrument=QQQ,
+            timeframe=TF_1M,
+            timestamp=datetime(2026, 5, 1, 13, 31, tzinfo=timezone.utc),
+            open=102.0,
+            high=103.0,
+            low=90.0,
+            close=91.0,
+            volume=1000.0,
+            is_closed=True,
+            source="test",
+        ))
+        await om.drain_ready_fills()
+        await om.drain_ready_order_updates()
+
+        assert portfolio.get_strategy_position("_phase6", QQQ) is None
+
+    import asyncio
+    asyncio.run(run())
+    text = (tmp_path / "orders.jsonl").read_text(encoding="utf-8")
+    assert "protective_stop_cancel_requested" in text
 
 
 def test_order_manager_drains_order_updates(tmp_path):

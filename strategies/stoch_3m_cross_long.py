@@ -41,6 +41,9 @@ MARKET_TZ = ZoneInfo("America/New_York")
 class Stoch3mCrossLong(StrategyKernel):
     """Buy QQQ when 3-minute stochastic slowD crosses up through 20."""
 
+    _BAR_SIZE = "3m"
+    _PARALLEL_BACKTEST_SAFE = True
+
     SPEC = StrategySpec(
         id="stoch_3m_cross_long",
         primary_instrument=QQQ,

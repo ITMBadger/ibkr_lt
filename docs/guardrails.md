@@ -31,7 +31,14 @@ This prevents hard venue rejects for crypto step sizes and ensures futures are a
 
 ### RiskPolicy Cap
 
-`RiskPolicy.max_order_quantity` (default `2`) prevents oversized computed orders from reaching the broker. It is configured by the runtime bootstrap from CLI defaults or YAML.
+`RiskPolicy.max_order_quantity` (default `2`) prevents oversized fixed-share
+orders from reaching the broker. It is configured by the runtime bootstrap from
+CLI defaults or YAML.
+
+Backtests may opt into `backtest.sizing.mode: full_equity`, which sizes from the
+simulated mark-to-market account equity and the latest replay price. In that
+mode, `backtest.sizing.max_order_quantity` is optional; when omitted, sizing is
+intentionally uncapped for account-based research runs.
 
 ### Warmup Guard
 
@@ -69,15 +76,45 @@ If a strategy has an owned open position, `Engine` calls `StrategyKernel.on_exit
 
 Strategies may declare `StrategySpec.protective_stop`. When an entry fill arrives, `OrderManager` can submit an opposite-side broker-native stop order using the actual fill price as reference. This is order-management protection, not strategy `on_exit()` logic. Because the stop is based on the actual fill, it is submitted after the fill callback rather than pre-attached atomically before entry fill.
 
+If a strategy-owned `on_exit()` close is accepted before the protective stop
+fills, `OrderManager` requests cancellation of the tracked protective stop order.
+If the protective stop fills first, `OrderManager` requests cancellation of any
+pending strategy close for the same strategy/instrument/trade lot.
+
+### Pending Close Dedupe
+
+`OrderManager.submit_close()` keeps a pending-close index keyed by strategy,
+instrument, and logical `trade_id`. While a close is pending, duplicate
+`on_exit()` reasons for the same lot are dropped centrally and audited as
+`close_already_pending`. The pending marker is cleared when the close fill is
+applied, or when the broker reports the close as cancelled/rejected.
+
 ### Event Backtests
 
 `python -m backtest.run` uses the production `Engine` with `SimulatedClock`, `ReplayDataProvider`, `PaperBroker`, and real strategy modules. The runner loads warmup data from CSV before the replay start timestamp, then executes strategy logic only on replay bars inside the requested window.
 
 Default `event` mode dispatches selected strategies on every primary 1-minute replay bar, matching the live event cadence. `fast-event` mode keeps every 1-minute data, broker, order, and exit update, but only builds flat-entry strategy context when the selected evaluation timeframe has a new completed bar. Use `--mode fast-event` for faster research passes and `--eval-timeframe <bar_size>` when auto-detection is not enough.
 
-Backtests may preload replay bars into the shared feature registry so common indicators are vectorized once, then sliced to the current `MarketContext.timestamp`. Resampled features only expose bars completed before the current replay bar, so preloading must not create future leakage.
+`parallel` mode requires each selected strategy to declare
+`_PARALLEL_BACKTEST_SAFE = True`. It loads warmup bars for each worker chunk,
+generates flat-entry candidates in worker processes capped by
+`min(os.cpu_count(), 4)` or `--max-parallel-workers`, then replays accepted
+entries, fills, protective stops, and `on_exit()` chronologically through the
+same single-process engine/order path. Treat `parallel` as a research
+acceleration mode and validate strategy results against `fast-event`.
+
+Backtests may preload replay bars into the shared feature registry so common
+indicators are vectorized once, then sliced to the current
+`MarketContext.timestamp`. Resampled features only expose bars completed before
+the current replay bar, so preloading must not create future leakage.
 
 Backtest market orders fill at the next replay bar open. Stop orders fill at `stop_price` when crossed by a replay bar. These assumptions are deterministic and close to the live event flow, but they are not a guarantee of identical IBKR live fills, partial fills, slippage, or gap-through stop behavior.
+
+Completed backtests write `summary.json` and `report.html`. The HTML report
+reconstructs trades, mark-to-market equity, drawdowns, period returns, and
+exposure from replay bars plus `fills.jsonl`; if report generation fails, the
+runner writes `report_error.txt` and raises rather than silently publishing an
+incomplete report.
 
 ### Audit Logs
 

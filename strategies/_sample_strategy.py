@@ -37,6 +37,11 @@ MARKET_TZ = ZoneInfo("America/New_York")
 class SampleStrategy(StrategyKernel):
     """Copy-only example showing the standard strategy shape."""
 
+    # Entry evaluation cadence. fast-event backtests use this to decide when
+    # generate() needs to run. Open-position exits still run on every 1m bar.
+    _BAR_SIZE = "3m"
+    _PARALLEL_BACKTEST_SAFE = True
+
     SPEC = StrategySpec(
         # Stable runtime id. Config, logs, API metadata, and position adoption
         # use this value, so do not rely on the filename as the strategy id.
@@ -47,10 +52,13 @@ class SampleStrategy(StrategyKernel):
         primary_instrument=QQQ,
         execution_instrument=QQQ,
 
-        # Declare only timeframes the engine must build before generate().
+        # Declare every raw bar timeframe the strategy depends on. This lets
+        # the engine warm up/cache/resample shared bars once, and lets
+        # fast-event auto-detect the entry cadence from _BAR_SIZE.
         # Keep proprietary indicator details out of SPEC.indicators when
         # possible; use ctx.features.get(...) inside strategy logic instead.
         timeframes=("1m", "3m"),
+        # Warmup must cover the largest entry/exit lookback the strategy needs.
         warmup_bars={"3m": 30},
 
         # Optional broker-side protective stop submitted after entry fill.
@@ -107,6 +115,10 @@ class SampleStrategy(StrategyKernel):
         - no file, network, or database I/O
         - no logging of proprietary formulas
         - no mutation outside the provided state dict
+        - no manual resampling inside the strategy hot path
+        - use ctx.features.get(...) for common indicators
+        - use ctx.features.bars(..., lookback_bars=N) for private bar windows
+        - use ctx.features.latest_bar(...) when only the current bar is needed
         """
         trace = DecisionTrace.entry(ctx, self.SPEC.id)
 
@@ -119,8 +131,14 @@ class SampleStrategy(StrategyKernel):
             record_decision(state, trace)
             return signal
 
-        bars_3m = ctx.bars.get(QQQ, {}).get("3m")
-        if bars_3m is None or len(bars_3m) < self.SPEC.warmup_bars["3m"]:
+        required_3m = self.SPEC.warmup_bars["3m"]
+        if ctx.features:
+            bars_3m = ctx.features.bars(QQQ, "3m", lookback_bars=required_3m)
+        else:
+            bars_3m = ctx.bars.get(QQQ, {}).get("3m")
+            if bars_3m is not None:
+                bars_3m = bars_3m.iloc[-required_3m:]
+        if bars_3m is None or len(bars_3m) < required_3m:
             trace.add_metric("bars_3m_count", 0 if bars_3m is None else len(bars_3m))
             return finish("no_signal", "insufficient_3m_bars")
 
@@ -141,7 +159,13 @@ class SampleStrategy(StrategyKernel):
         if not in_entry_window:
             return finish("no_signal", "outside_entry_window")
 
-        current_3m_bar = bars_3m.index[-1]
+        # Use latest_bar() when only the current completed bar is needed. It is
+        # cheaper than allocating a one-row DataFrame slice, especially during
+        # open-position exit checks.
+        latest_3m = ctx.features.latest_bar(QQQ, "3m") if ctx.features else bars_3m.iloc[-1]
+        if latest_3m is None:
+            return finish("no_signal", "missing_latest_3m_bar")
+        current_3m_bar = latest_3m.name
         already_evaluated = state.get("last_evaluated_3m_bar") == current_3m_bar
         trace.add_condition(
             "one_evaluation_per_completed_3m_bar",
@@ -194,8 +218,13 @@ class SampleStrategy(StrategyKernel):
 
         In multi_position mode, `position.trade_id` identifies the logical lot
         currently being evaluated. Store per-lot state under that key.
+        on_exit() is called every 1m bar for each open lot, so avoid rebuilding
+        DataFrames or indicators here unless the exit rule truly needs them.
         """
+        latest_1m = ctx.features.latest_bar(QQQ, "1m") if ctx.features else None
+        # Use latest_1m for stop/target checks that only need the current bar.
         _ = ctx, position, state
+        _ = latest_1m
         return None
 
 

@@ -149,12 +149,15 @@ Backtests use the same `Engine`, strategy modules, `DataManager`,
 ```bash
 python -m backtest.run --strategy stoch_3m_cross_long --start 2025-01-01 --end 2025-03-31
 python -m backtest.run --mode fast-event --strategy stoch_3m_cross_long --start 2025-01-01 --end 2025-03-31
+python -m backtest.run --mode parallel --strategy stoch_3m_cross_long --start 2025-01-01 --end 2025-03-31
 ```
 
 The runner reads CSV data from `data.historical.path` in `config.yaml`, or from
 `--csv`. Use a directory when selected strategies require more than one symbol.
 It backfills warmup bars before the start timestamp, then replays test-window
-bars event by event. Results are written under `runs/backtests/`.
+bars event by event. Results are written under `runs/backtests/`, including
+`summary.json` and a self-contained `report.html` with fill-derived trades,
+equity, drawdown, monthly/yearly returns, and exposure metrics.
 
 Use `--mode fast-event` for faster research replays. It still feeds every
 1-minute bar through the production data, broker, order, and exit path, but it
@@ -162,6 +165,28 @@ only calls flat-entry strategy logic when the strategy evaluation timeframe
 changes. Pass `--eval-timeframe 3m` to override the auto-detected bar size.
 The backtest runner also preloads replay bars into the shared feature registry
 so common indicators are vectorized once and sliced to each replay timestamp.
+
+Use `--mode parallel` for long research passes on strategies that declare
+`_PARALLEL_BACKTEST_SAFE = True`. Parallel mode gives each worker its own
+lookback warmup, generates entry candidates in worker processes capped by
+`min(os.cpu_count(), 4)` or `--max-parallel-workers`, then replays accepted
+entries, fills, stops, and `on_exit()` chronologically in one process. Validate
+each strategy against `fast-event` before treating parallel results as final.
+
+Backtests default to fixed-share sizing from the normal runtime settings.
+Research runs may opt into account-based sizing through YAML:
+
+```yaml
+backtest:
+  sizing:
+    mode: full_equity
+    equity_fraction: 1.0
+    max_order_quantity: null
+```
+
+`full_equity` uses the simulated mark-to-market account equity and latest replay
+price at each signal. Leave `max_order_quantity` unset only when the run is
+intended to model uncapped account-based sizing.
 
 Configured `strategy_modes` are respected. Use `--all-live` when you want a
 simulation fill path for strategies that are marked `dry_run` in live/paper

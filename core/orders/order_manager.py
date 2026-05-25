@@ -11,13 +11,13 @@ import asyncio
 import itertools
 import logging
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from .strategy_modes import STRATEGY_MODE_DRY_RUN, strategy_mode_map
 from ..portfolio.state import PortfolioState
 from ..risk.policy import RiskPolicy
 from ..interfaces.strategy import POSITION_MODE_MULTI, PositionPolicy, ProtectiveStopSpec
-from ..types import Fill, OrderRequest, OrderStatus, Position, Signal
+from ..types import Fill, Instrument, OrderRequest, OrderStatus, Position, Signal
 from ..audit import AuditLogger
 
 if TYPE_CHECKING:
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _BUY_FILL_SIDES = {"BOT", "BUY", "B", "LONG"}
+_UNACCEPTED_ORDER_STATUSES = {"cancelled", "rejected"}
 
 
 class OrderManager:
@@ -40,6 +41,9 @@ class OrderManager:
         protective_stops: Mapping[str, ProtectiveStopSpec] | None = None,
         strategy_modes: Mapping[str, str] | None = None,
         position_policies: Mapping[str, PositionPolicy] | None = None,
+        sizing_price_provider: Callable[[Instrument], float | None] | None = None,
+        sizing_equity_provider: Callable[[], float | None] | None = None,
+        fill_listener: Callable[[Fill], None] | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -53,9 +57,22 @@ class OrderManager:
         strategy_ids = set(self._protective_stops) | set(strategy_modes or {})
         self._strategy_modes = strategy_mode_map(strategy_modes, strategy_ids)
         self._position_policies = dict(position_policies or {})
+        self._sizing_price_provider = sizing_price_provider
+        self._sizing_equity_provider = sizing_equity_provider
+        self._fill_listener = fill_listener
         self._dry_run_counter = itertools.count(1)
         self._trade_counter = itertools.count(1)
         self._order_trade_id: dict[str, str | None] = {}
+        self._pending_closes: dict[tuple[str, Instrument, str | None], str] = {}
+        self._close_keys_by_order_id: dict[str, tuple[str, Instrument, str | None]] = {}
+        self._protective_stop_orders: dict[
+            tuple[str, Instrument, str | None],
+            set[str],
+        ] = {}
+        self._protective_stop_keys_by_order_id: dict[
+            str,
+            tuple[str, Instrument, str | None],
+        ] = {}
 
     async def submit(self, signal: Signal, strategy_id: str) -> None:
         """Enqueue a signal for the order drain loop to process."""
@@ -75,6 +92,28 @@ class OrderManager:
                 strategy_id=strategy_id,
                 reason="flat_position",
                 position=position,
+            )
+            return
+        position_key = self._position_key(
+            strategy_id,
+            position.instrument,
+            position.trade_id,
+        )
+        pending_close_order_id = self._pending_closes.get(position_key)
+        if pending_close_order_id is not None:
+            self._write_order_event(
+                "close_dropped",
+                strategy_id=strategy_id,
+                reason="close_already_pending",
+                pending_broker_order_id=pending_close_order_id,
+                position=position,
+            )
+            log.info(
+                "Close already pending for %s %s trade_id=%s order_id=%s",
+                strategy_id,
+                position.instrument.symbol,
+                position.trade_id,
+                pending_close_order_id,
             )
             return
         side = "short" if position.quantity > 0 else "long"
@@ -123,6 +162,9 @@ class OrderManager:
         self._order_owner[status.broker_order_id] = strategy_id
         self._order_role[status.broker_order_id] = "close"
         self._order_trade_id[status.broker_order_id] = position.trade_id
+        if status.status not in _UNACCEPTED_ORDER_STATUSES:
+            self._pending_closes[position_key] = status.broker_order_id
+            self._close_keys_by_order_id[status.broker_order_id] = position_key
         self._write_order_event(
             "close_submitted",
             strategy_id=strategy_id,
@@ -130,6 +172,13 @@ class OrderManager:
             order=order,
             status=status,
         )
+        if status.status not in _UNACCEPTED_ORDER_STATUSES:
+            await self._cancel_protective_stops_for_position(
+                position_key,
+                strategy_id=strategy_id,
+                close_order_id=status.broker_order_id,
+                reason=reason,
+            )
         log.info(
             "Submitted close for %s: %s %s %.0f reason=%s → order_id=%s status=%s",
             strategy_id,
@@ -239,6 +288,8 @@ class OrderManager:
             signal,
             self._portfolio,
             allow_existing_position=allow_existing_position,
+            reference_price=self._sizing_reference_price(signal),
+            account_equity=self._sizing_account_equity(),
         )
         if qty_float <= 0:
             self._write_order_event(
@@ -329,11 +380,31 @@ class OrderManager:
         role = self._order_role.get(fill.broker_order_id, "unknown")
         trade_id = self._order_trade_id.get(fill.broker_order_id)
         self._portfolio.apply_fill(fill, strategy_id=strategy_id, trade_id=trade_id)
+        if self._fill_listener is not None:
+            self._fill_listener(fill)
         self._write_fill_event(fill, strategy_id, role, trade_id)
         log.info(
             "Fill: %s %s %.0f @ %.4f",
             fill.side, fill.instrument.symbol, fill.quantity, fill.price,
         )
+        if role == "close":
+            self._clear_pending_close(fill.broker_order_id)
+            if strategy_id is not None:
+                await self._cancel_protective_stops_for_position(
+                    self._position_key(strategy_id, fill.instrument, trade_id),
+                    strategy_id=strategy_id,
+                    close_order_id=fill.broker_order_id,
+                    reason="close_filled",
+                )
+        elif role == "protective_stop":
+            self._clear_protective_stop(fill.broker_order_id)
+            if strategy_id is not None:
+                await self._cancel_pending_close_for_position(
+                    self._position_key(strategy_id, fill.instrument, trade_id),
+                    strategy_id=strategy_id,
+                    protective_stop_order_id=fill.broker_order_id,
+                    reason="protective_stop_filled",
+                )
         if strategy_id is not None and role == "entry":
             await self._submit_protective_stop(fill, strategy_id)
 
@@ -354,6 +425,11 @@ class OrderManager:
             status.avg_fill_price,
             role,
         )
+        if status.status in _UNACCEPTED_ORDER_STATUSES:
+            if role == "close":
+                self._clear_pending_close(status.broker_order_id)
+            elif role == "protective_stop":
+                self._clear_protective_stop(status.broker_order_id)
 
     async def _submit_protective_stop(self, fill: Fill, strategy_id: str) -> None:
         spec = self._protective_stops.get(strategy_id)
@@ -436,6 +512,12 @@ class OrderManager:
         self._order_owner[status.broker_order_id] = strategy_id
         self._order_role[status.broker_order_id] = "protective_stop"
         self._order_trade_id[status.broker_order_id] = trade_id
+        if status.status not in _UNACCEPTED_ORDER_STATUSES and status.status != "filled":
+            position_key = self._position_key(strategy_id, fill.instrument, trade_id)
+            self._protective_stop_orders.setdefault(position_key, set()).add(
+                status.broker_order_id
+            )
+            self._protective_stop_keys_by_order_id[status.broker_order_id] = position_key
         self._write_order_event(
             "protective_stop_submitted",
             strategy_id=strategy_id,
@@ -501,6 +583,126 @@ class OrderManager:
         if signal.trade_id:
             return signal.trade_id
         return f"{signal.instrument.symbol.lower()}_{next(self._trade_counter)}"
+
+    def _position_key(
+        self,
+        strategy_id: str,
+        instrument: Instrument,
+        trade_id: str | None,
+    ) -> tuple[str, Instrument, str | None]:
+        return (strategy_id, instrument, trade_id)
+
+    async def _cancel_protective_stops_for_position(
+        self,
+        position_key: tuple[str, Instrument, str | None],
+        *,
+        strategy_id: str,
+        close_order_id: str,
+        reason: str,
+    ) -> None:
+        stop_order_ids = sorted(self._protective_stop_orders.get(position_key, set()))
+        for stop_order_id in stop_order_ids:
+            try:
+                await self._broker.cancel_order(stop_order_id)
+            except Exception as exc:
+                self._write_order_event(
+                    "protective_stop_cancel_failed",
+                    strategy_id=strategy_id,
+                    reason=reason,
+                    close_broker_order_id=close_order_id,
+                    protective_stop_broker_order_id=stop_order_id,
+                    error=str(exc),
+                )
+                log.warning(
+                    "Failed to cancel protective stop %s for %s: %s",
+                    stop_order_id,
+                    strategy_id,
+                    exc,
+                )
+                continue
+            self._clear_protective_stop(stop_order_id)
+            self._write_order_event(
+                "protective_stop_cancel_requested",
+                strategy_id=strategy_id,
+                reason=reason,
+                close_broker_order_id=close_order_id,
+                protective_stop_broker_order_id=stop_order_id,
+            )
+            log.info(
+                "Requested protective stop cancel for %s order_id=%s close_order_id=%s",
+                strategy_id,
+                stop_order_id,
+                close_order_id,
+            )
+
+    async def _cancel_pending_close_for_position(
+        self,
+        position_key: tuple[str, Instrument, str | None],
+        *,
+        strategy_id: str,
+        protective_stop_order_id: str,
+        reason: str,
+    ) -> None:
+        close_order_id = self._pending_closes.get(position_key)
+        if close_order_id is None:
+            return
+        try:
+            await self._broker.cancel_order(close_order_id)
+        except Exception as exc:
+            self._write_order_event(
+                "close_cancel_failed",
+                strategy_id=strategy_id,
+                reason=reason,
+                close_broker_order_id=close_order_id,
+                protective_stop_broker_order_id=protective_stop_order_id,
+                error=str(exc),
+            )
+            log.warning(
+                "Failed to cancel pending close %s for %s: %s",
+                close_order_id,
+                strategy_id,
+                exc,
+            )
+            return
+        self._clear_pending_close(close_order_id)
+        self._write_order_event(
+            "close_cancel_requested",
+            strategy_id=strategy_id,
+            reason=reason,
+            close_broker_order_id=close_order_id,
+            protective_stop_broker_order_id=protective_stop_order_id,
+        )
+
+    def _clear_pending_close(self, broker_order_id: str) -> None:
+        position_key = self._close_keys_by_order_id.pop(broker_order_id, None)
+        if position_key is not None:
+            current_order_id = self._pending_closes.get(position_key)
+            if current_order_id == broker_order_id:
+                self._pending_closes.pop(position_key, None)
+
+    def _clear_protective_stop(self, broker_order_id: str) -> None:
+        position_key = self._protective_stop_keys_by_order_id.pop(
+            broker_order_id,
+            None,
+        )
+        if position_key is None:
+            return
+        order_ids = self._protective_stop_orders.get(position_key)
+        if order_ids is None:
+            return
+        order_ids.discard(broker_order_id)
+        if not order_ids:
+            self._protective_stop_orders.pop(position_key, None)
+
+    def _sizing_reference_price(self, signal: Signal) -> float | None:
+        if self._sizing_price_provider is None:
+            return None
+        return self._sizing_price_provider(signal.instrument)
+
+    def _sizing_account_equity(self) -> float | None:
+        if self._sizing_equity_provider is None:
+            return None
+        return self._sizing_equity_provider()
 
     def _dry_run_status(self, strategy_id: str) -> OrderStatus:
         return OrderStatus(

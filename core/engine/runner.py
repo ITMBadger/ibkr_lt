@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import RLock
@@ -41,7 +41,7 @@ from ..interfaces.strategy import (
     StrategyKernel,
 )
 from ..risk.policy import RiskPolicy
-from ..types import Bar, Instrument, Position
+from ..types import Bar, Fill, Instrument, Position, Signal
 from .clock import Clock, SimulatedClock, WallClock
 from .scheduler import Scheduler
 
@@ -54,6 +54,7 @@ log = logging.getLogger(__name__)
 _ORDER_TASK_YIELD_SECONDS = 0.001
 _DISPATCH_MODE_EVENT = "event"
 _DISPATCH_MODE_FAST_EVENT = "fast_event"
+_DISPATCH_MODE_PARALLEL = "parallel"
 
 
 class Engine:
@@ -79,6 +80,7 @@ class Engine:
         strategy_modes: Mapping[str, str] | None = None,
         dispatch_mode: str = _DISPATCH_MODE_EVENT,
         evaluation_timeframes: Mapping[str, str] | None = None,
+        precomputed_entry_signals: Mapping[str, Sequence[tuple[datetime, Signal]]] | None = None,
         feature_preload_bars: list[Bar] | None = None,
         progress_enabled: bool = False,
         progress_total_bars: int | None = None,
@@ -99,6 +101,9 @@ class Engine:
         self._dispatch_mode = _normalize_dispatch_mode(dispatch_mode)
         self._evaluation_timeframes = _normalize_evaluation_timeframes(
             evaluation_timeframes
+        )
+        self._precomputed_entry_signals = _normalize_precomputed_entry_signals(
+            precomputed_entry_signals
         )
         self._feature_preload_bars = list(feature_preload_bars or [])
         self._progress = _EngineProgress(
@@ -192,6 +197,12 @@ class Engine:
                             if kernel.SPEC.id in self._evaluation_timeframes
                             else None
                         ),
+                        "precomputed_entry_signals": sum(
+                            len(signals)
+                            for signals in self._precomputed_entry_signals
+                            .get(kernel.SPEC.id, {})
+                            .values()
+                        ),
                     }
                     for kernel, _ in self._strategies
                 ],
@@ -273,6 +284,8 @@ class Engine:
         # Portfolio state and order manager
         portfolio = PortfolioState()
         self._set_portfolio(portfolio)
+        account_snapshot = await self._broker.get_account()
+        sizing_account = _MarkToMarketSizingState(account_snapshot.net_liquidation)
         adopted = await self._broker.get_positions()
         if adopted:
             strategy_map = self._resolve_adopted_position_map(adopted)
@@ -304,6 +317,9 @@ class Engine:
             protective_stops=protective_stops,
             strategy_modes=self._strategy_modes,
             position_policies=position_policies,
+            sizing_price_provider=sizing_account.latest_price,
+            sizing_equity_provider=sizing_account.equity,
+            fill_listener=sizing_account.apply_fill,
         )
 
         # Backfill historical data. Split feeds may load offline history first
@@ -354,6 +370,7 @@ class Engine:
                 "Feature replay preload complete bars=%d",
                 len(self._feature_preload_bars),
             )
+        features_are_replay_preloaded = is_simulated and bool(self._feature_preload_bars)
 
         # Subscribe streaming
         for instr in all_instruments:
@@ -429,6 +446,36 @@ class Engine:
             self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
 
         async def evaluate_entry(kernel: StrategyKernel, ctx, state: dict) -> None:
+            if self._dispatch_mode == _DISPATCH_MODE_PARALLEL:
+                signals = self._precomputed_signals_at(kernel.SPEC.id, ctx.timestamp)
+                if not signals:
+                    self._progress.count("parallel_entry_misses")
+                    return
+                for signal in signals:
+                    if not self._entry_frequency_allows(kernel, state, ctx.timestamp):
+                        self._progress.count("entry_frequency_skips")
+                        continue
+                    self._progress.count("entry_evals")
+                    self._mark_entry_frequency(kernel, state, ctx.timestamp)
+                    self._progress.count("entry_signals")
+                    order_t0 = time.perf_counter()
+                    self._write_signal_event(
+                        kernel.SPEC.id,
+                        "entry",
+                        ctx.timestamp,
+                        signal=signal,
+                        trade_id=signal.trade_id,
+                        source="precomputed",
+                    )
+                    await order_manager.submit(signal, kernel.SPEC.id)
+                    if is_simulated:
+                        await order_manager.drain_ready_orders()
+                        await order_manager.drain_ready_order_updates()
+                    else:
+                        await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+                    self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
+                return
+
             if not self._entry_frequency_allows(kernel, state, ctx.timestamp):
                 self._progress.count("entry_frequency_skips")
                 return
@@ -491,7 +538,9 @@ class Engine:
                 stage_t0 = time.perf_counter()
                 dm.on_bar(bar_1m)
                 self._record_bar(bar_1m)
-                features.on_bar(bar_1m)
+                sizing_account.update_bar(bar_1m)
+                if not features_are_replay_preloaded:
+                    features.on_bar(bar_1m)
                 self._progress.add_timing("data_update", time.perf_counter() - stage_t0)
 
                 # Let PaperBroker resolve pending orders on new bar
@@ -544,6 +593,31 @@ class Engine:
                         else:
                             self._progress.count("fast_event_entry_skips")
                         return should_generate
+                elif self._dispatch_mode == _DISPATCH_MODE_PARALLEL:
+
+                    def include_strategy(
+                        kernel: StrategyKernel,
+                        _state: dict,
+                    ) -> bool:
+                        if kernel.SPEC.position_policy.position_mode == POSITION_MODE_MULTI:
+                            positions = portfolio.get_strategy_positions(
+                                kernel.SPEC.id,
+                                kernel.SPEC.execution_instrument,
+                            )
+                        else:
+                            position = portfolio.get_strategy_position(
+                                kernel.SPEC.id,
+                                kernel.SPEC.execution_instrument,
+                            )
+                            positions = [position] if position is not None else []
+                        if positions:
+                            self._progress.count("parallel_exit_contexts")
+                            return True
+                        if self._has_precomputed_signal_at(kernel.SPEC.id, bar_1m.timestamp):
+                            self._progress.count("parallel_entry_contexts")
+                            return True
+                        self._progress.count("parallel_entry_skips")
+                        return False
 
                 stage_t0 = time.perf_counter()
                 dispatch_results = scheduler.on_bar(
@@ -678,6 +752,19 @@ class Engine:
 
         last_evaluation_bars[kernel.SPEC.id] = latest_bar
         return True
+
+    def _has_precomputed_signal_at(self, strategy_id: str, timestamp: datetime) -> bool:
+        return bool(self._precomputed_signals_at(strategy_id, timestamp))
+
+    def _precomputed_signals_at(
+        self,
+        strategy_id: str,
+        timestamp: datetime,
+    ) -> list[Signal]:
+        by_timestamp = self._precomputed_entry_signals.get(strategy_id)
+        if not by_timestamp:
+            return []
+        return list(by_timestamp.get(_normalize_precomputed_timestamp(timestamp), ()))
 
     def _has_entry_capacity(self, kernel: StrategyKernel, open_positions: int) -> bool:
         limit = kernel.SPEC.position_policy.max_concurrent_positions
@@ -1010,11 +1097,51 @@ class _EngineProgress:
         return " ".join(text for _, text in rows[:limit])
 
 
+class _MarkToMarketSizingState:
+    """Small account model used only for sizing decisions inside the engine."""
+
+    def __init__(self, initial_equity: float) -> None:
+        self._cash = float(initial_equity)
+        self._latest_prices: dict[Instrument, float] = {}
+        self._positions: dict[Instrument, float] = defaultdict(float)
+
+    def update_bar(self, bar: Bar) -> None:
+        self._latest_prices[bar.instrument] = float(bar.close)
+
+    def latest_price(self, instrument: Instrument) -> float | None:
+        return self._latest_prices.get(instrument)
+
+    def equity(self) -> float:
+        equity = self._cash
+        for instrument, quantity in self._positions.items():
+            price = self._latest_prices.get(instrument)
+            if price is not None:
+                equity += quantity * price * float(instrument.multiplier or 1.0)
+        return equity
+
+    def apply_fill(self, fill: Fill) -> None:
+        signed_qty = _signed_fill_quantity(fill)
+        multiplier = float(fill.instrument.multiplier or 1.0)
+        self._cash -= signed_qty * float(fill.price) * multiplier
+        new_qty = self._positions.get(fill.instrument, 0.0) + signed_qty
+        if abs(new_qty) < 1e-9:
+            self._positions.pop(fill.instrument, None)
+        else:
+            self._positions[fill.instrument] = new_qty
+        self._latest_prices.setdefault(fill.instrument, float(fill.price))
+
+
+def _signed_fill_quantity(fill: Fill) -> float:
+    if fill.side.upper() in {"BOT", "BUY", "B", "LONG"}:
+        return float(fill.quantity)
+    return -float(fill.quantity)
+
+
 def _normalize_dispatch_mode(mode: str) -> str:
     normalized = str(mode or _DISPATCH_MODE_EVENT).strip().lower().replace("-", "_")
-    if normalized not in {_DISPATCH_MODE_EVENT, _DISPATCH_MODE_FAST_EVENT}:
+    if normalized not in {_DISPATCH_MODE_EVENT, _DISPATCH_MODE_FAST_EVENT, _DISPATCH_MODE_PARALLEL}:
         raise ValueError(
-            "dispatch_mode must be 'event' or 'fast-event'; "
+            "dispatch_mode must be 'event', 'fast-event', or 'parallel'; "
             f"got {mode!r}"
         )
     return normalized
@@ -1027,6 +1154,24 @@ def _normalize_evaluation_timeframes(
     for strategy_id, label in dict(evaluation_timeframes or {}).items():
         result[str(strategy_id)] = Timeframe.parse(str(label))
     return result
+
+
+def _normalize_precomputed_entry_signals(
+    signals: Mapping[str, Sequence[tuple[datetime, Signal]]] | None,
+) -> dict[str, dict[datetime, list[Signal]]]:
+    result: dict[str, dict[datetime, list[Signal]]] = {}
+    for strategy_id, entries in dict(signals or {}).items():
+        by_timestamp = result.setdefault(str(strategy_id), {})
+        for timestamp, signal in entries:
+            key = _normalize_precomputed_timestamp(timestamp)
+            by_timestamp.setdefault(key, []).append(signal)
+    return result
+
+
+def _normalize_precomputed_timestamp(timestamp: datetime) -> datetime:
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
 
 
 def _completed_timeframe_bar_start(latest_ts: datetime, timeframe: Timeframe) -> datetime:

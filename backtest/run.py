@@ -15,7 +15,7 @@ import logging
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -26,7 +26,7 @@ from core.audit import AuditLogger, configure_runtime_logging
 from core.audit.logger import allocate_run_log_dir
 from core.engine.loader import get_registry
 from core.exceptions import ConfigError
-from core.risk.policy import RiskPolicy
+from core.risk.policy import SIZING_MODE_FULL_EQUITY, RiskPolicy
 
 from .config import BacktestSettings, load_yaml_config, resolve_settings
 from .loaders import (
@@ -37,6 +37,12 @@ from .loaders import (
     resolve_evaluation_timeframes,
     validate_csv_path,
 )
+from .parallel import (
+    candidates_to_engine_map,
+    generate_parallel_entry_candidates,
+    validate_parallel_strategies,
+)
+from .report_html import write_html_report, write_report_error
 from .reporting import audit_file_stats, write_summary
 
 log = logging.getLogger(__name__)
@@ -46,6 +52,7 @@ log = logging.getLogger(__name__)
 class BacktestResult:
     run_dir: Path
     summary_path: Path
+    report_path: Path | None
     processed_bars: int
     strategy_ids: list[str]
 
@@ -70,11 +77,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None, help="Backtest run output directory")
     parser.add_argument(
         "--mode",
-        choices=("event", "fast-event"),
+        choices=("event", "fast-event", "parallel"),
         default=None,
         help=(
             "Backtest dispatch mode. event evaluates each primary 1-minute bar; "
-            "fast-event evaluates flat entries only when the evaluation bar changes."
+            "fast-event evaluates flat entries only when the evaluation bar changes; "
+            "parallel precomputes entry candidates in worker processes, then replays "
+            "fills and exits chronologically."
         ),
     )
     parser.add_argument(
@@ -113,6 +122,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Emit progress after this many wall-clock seconds.",
     )
+    parser.add_argument(
+        "--max-parallel-workers",
+        type=int,
+        default=None,
+        help="Worker cap for --mode parallel. Default is min(os.cpu_count(), 4).",
+    )
     return parser.parse_args(argv)
 
 
@@ -140,6 +155,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("Backtest complete")
     print(f"Run dir: {result.run_dir}")
     print(f"Summary: {result.summary_path}")
+    if result.report_path is not None:
+        print(f"Report: {result.report_path}")
     print(f"Processed bars: {result.processed_bars}")
     print(f"Strategies: {result.strategy_ids}")
 
@@ -154,9 +171,11 @@ def run_backtest(
     validate_csv_path(settings.csv_path, instruments)
     evaluation_timeframes = (
         resolve_evaluation_timeframes(strategies, settings.evaluation_timeframe)
-        if settings.mode == "fast-event"
+        if settings.mode in {"fast-event", "parallel"}
         else {}
     )
+    if settings.mode == "parallel":
+        validate_parallel_strategies(strategies)
     csv_provider = build_csv_provider(
         csv_path=settings.csv_path,
         session_tz=settings.session_tz,
@@ -165,27 +184,63 @@ def run_backtest(
         market_close=settings.market_close,
     )
     load_started = time.perf_counter()
+    load_start = (
+        settings.start - timedelta(days=max(0, settings.lookback_days))
+        if settings.mode == "parallel"
+        else settings.start
+    )
     log.info(
         "Loading replay bars instruments=%s start=%s end=%s csv_path=%s",
         [instrument.symbol for instrument in instruments],
-        settings.start.isoformat(),
+        load_start.isoformat(),
         settings.end.isoformat(),
         settings.csv_path,
     )
-    replay_bars = asyncio.run(
+    loaded_bars = asyncio.run(
         load_replay_bars(
             csv_provider,
             instruments,
-            start=settings.start,
+            start=load_start,
             end=settings.end,
         )
     )
+    replay_bars = [
+        bar
+        for bar in loaded_bars
+        if settings.start <= _ensure_utc(bar.timestamp) <= settings.end
+    ]
+    if not replay_bars:
+        raise ConfigError(
+            "No replay bars loaded inside requested test window. "
+            f"start={settings.start.isoformat()} end={settings.end.isoformat()}"
+        )
     replay_load_seconds = time.perf_counter() - load_started
     log.info(
-        "Loaded replay bars count=%d seconds=%.2f",
+        "Loaded bars count=%d replay_bars=%d seconds=%.2f",
+        len(loaded_bars),
         len(replay_bars),
         replay_load_seconds,
     )
+
+    candidate_generation_seconds = 0.0
+    parallel_stats = None
+    precomputed_entry_signals = None
+    if settings.mode == "parallel":
+        candidate_started = time.perf_counter()
+        candidates, parallel_stats = generate_parallel_entry_candidates(
+            settings=settings,
+            bars=loaded_bars,
+            strategies=strategies,
+            evaluation_timeframes=evaluation_timeframes,
+        )
+        candidate_generation_seconds = time.perf_counter() - candidate_started
+        precomputed_entry_signals = candidates_to_engine_map(candidates)
+        log.info(
+            "Generated parallel entry candidates count=%d seconds=%.2f workers=%s",
+            len(candidates),
+            candidate_generation_seconds,
+            parallel_stats.get("workers") if parallel_stats else None,
+        )
 
     audit_logger, run_dir = _build_audit_logger(settings)
     logging_cfg = dict(settings.logging or {})
@@ -197,14 +252,22 @@ def run_backtest(
 
     clock = SimulatedClock()
     clock.advance_to(settings.start)
+    broker = PaperBroker()
+    initial_account = asyncio.run(broker.get_account())
     engine = Engine(
-        broker=PaperBroker(),
+        broker=broker,
         data_feed=DataFeed(csv_provider, ReplayDataProvider(replay_bars)),
         clock=clock,
         strategies=strategies,
         risk=RiskPolicy(
             position_size_shares=settings.position_size_shares,
-            max_order_quantity=settings.max_order_quantity,
+            max_order_quantity=(
+                settings.sizing_max_order_quantity
+                if settings.sizing_mode == SIZING_MODE_FULL_EQUITY
+                else settings.max_order_quantity
+            ),
+            sizing_mode=settings.sizing_mode,
+            equity_fraction=settings.sizing_equity_fraction,
         ),
         thread_pool_workers=settings.thread_pool_workers,
         lookback_days=settings.lookback_days,
@@ -213,6 +276,7 @@ def run_backtest(
         strategy_modes=settings.strategy_modes,
         dispatch_mode=settings.mode,
         evaluation_timeframes=evaluation_timeframes,
+        precomputed_entry_signals=precomputed_entry_signals,
         feature_preload_bars=replay_bars,
         progress_enabled=settings.progress_enabled,
         progress_total_bars=len(replay_bars),
@@ -250,15 +314,28 @@ def run_backtest(
         "session_timezone": settings.session_tz,
         "strategies": settings.strategy_ids,
         "strategy_modes": settings.strategy_modes,
+        "sizing": {
+            "mode": settings.sizing_mode,
+            "equity_fraction": settings.sizing_equity_fraction,
+            "max_order_quantity": (
+                settings.sizing_max_order_quantity
+                if settings.sizing_mode == SIZING_MODE_FULL_EQUITY
+                else settings.max_order_quantity
+            ),
+            "position_size_shares": settings.position_size_shares,
+        },
         "mode": settings.mode,
         "evaluation_timeframes": evaluation_timeframes,
         "instruments": instruments,
         "replay_bars": len(replay_bars),
         "timings": {
             "replay_load_seconds": replay_load_seconds,
+            "candidate_generation_seconds": candidate_generation_seconds,
             "engine_run_seconds": engine_run_seconds,
             "total_seconds": total_seconds,
         },
+        "parallel": parallel_stats,
+        "initial_account": initial_account,
         "progress": {
             "enabled": settings.progress_enabled,
             "interval_bars": settings.progress_interval_bars,
@@ -281,9 +358,29 @@ def run_backtest(
         },
     }
     summary_path = write_summary(run_dir, summary)
+    try:
+        report = write_html_report(
+            run_dir=run_dir,
+            summary=summary,
+            replay_bars=replay_bars,
+            initial_equity=float(initial_account.net_liquidation),
+        )
+    except Exception as exc:
+        error_path = write_report_error(run_dir, exc)
+        log.exception("Backtest report generation failed; details written to %s", error_path)
+        raise RuntimeError(
+            f"Backtest report generation failed; details written to {error_path}"
+        ) from exc
+    summary["report"] = {
+        "path": report.report_path,
+        "metrics": report.metrics,
+        "warnings": report.warnings,
+    }
+    summary_path = write_summary(run_dir, summary)
     return BacktestResult(
         run_dir=run_dir,
         summary_path=summary_path,
+        report_path=report.report_path,
         processed_bars=len(replay_bars),
         strategy_ids=list(settings.strategy_ids),
     )
@@ -303,6 +400,12 @@ def _build_audit_logger(settings: BacktestSettings) -> tuple[AuditLogger | None,
         run_subdir=True,
     )
     return audit_logger, audit_logger.log_dir
+
+
+def _ensure_utc(timestamp: datetime) -> datetime:
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
 
 
 if __name__ == "__main__":
