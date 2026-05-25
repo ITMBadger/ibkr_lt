@@ -45,6 +45,8 @@ New strategies should follow the existing `strategies/stoch_3m_cross_long.py` sh
 - Keep `SPEC` minimal: declare only instruments, required timeframes, warmup bars, position policy, and broker-side protective stops the engine must know before runtime.
 - Declare `StrategySpec.position_policy` explicitly. Use `single_position` for one open strategy position per execution instrument; use `multi_position` only when the strategy creates independent logical lots and can manage per-lot state, preferably with deterministic `Signal.trade_id` values.
 - Declare the entry-frequency rule in `position_policy`: `one_per_day`, `one_per_session`, or `unlimited`. Do not duplicate date-throttle checks inside each strategy unless a private rule is stricter than the framework policy.
+- Leave `supports_position_adoption=False` unless the strategy can safely seed all state needed to manage a broker position that existed before startup.
+- When adoption is supported, implement `on_adopt_position()` and require any operator-provided fields the strategy needs through `POSITION_ADOPTION_REQUIRED_FIELDS`.
 - For protected/private strategies, prefer `ctx.features.get(...)` inside `generate()` or `on_exit()` for common indicators instead of listing every feature in `StrategySpec.indicators`. Example: `ctx.features.get("ema", QQQ, "3m", period=20)`.
 - Keep proprietary formulas, thresholds, scoring, entry/exit conditions, and condition names inside the private strategy file. Do not copy them into shared framework modules, config examples, public docs, or tests.
 - Keep `generate()` and `on_exit()` pure: no broker calls, file I/O, network I/O, thread management, or framework mutation outside the provided `state` dict.

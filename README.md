@@ -61,7 +61,7 @@ Entry frequency is enforced by the engine with `one_per_day`, `one_per_session`,
 
 ## Hermes Control API
 
-The project starts a read-only FastAPI control surface by default for the Hermes agent and operator runtime visibility:
+The project starts a non-trading FastAPI control surface by default for the Hermes agent and operator runtime visibility:
 
 ```bash
 python main.py --paper
@@ -98,11 +98,14 @@ Protected endpoints:
 - `GET /api/v1/runtime/strategies`
 - `GET /api/v1/positions`
 - `GET /api/v1/events`
+- `GET /api/v1/startup/gate`
+- `POST /api/v1/startup/mappings`
+- `POST /api/v1/startup/refresh`
 - `WS /ws/events`
 
-Hermes should call `GET /api/v1/health` first, then use `next_endpoint` to decide whether to poll health again or read `/api/v1/runtime/snapshot`.
+Hermes should call `GET /api/v1/health` first, then use `next_endpoint` to decide whether to poll health again, read `/api/v1/runtime/snapshot`, or inspect `/api/v1/startup/gate`.
 
-The API is intentionally read-only. Manual trading, order cancellation, and startup approval commands should be added later through a command bus with explicit guardrails.
+The API does not submit trades or cancel broker orders. The only active mutation endpoints are the protected startup gate endpoints, which are limited to live-startup position mapping and refresh.
 
 ## Audit Logs
 
@@ -140,6 +143,15 @@ strategy_modes:
 
 `dry_run` strategies still see real account, position, and market data, but
 `OrderManager` logs order intent without calling the broker submit API.
+
+## Live Startup Position Gate
+
+Live mode checks broker positions after connecting. Broker positions that do
+not match enabled strategy execution instruments are logged as unmanaged and
+startup continues. Matching positions pause startup at `awaiting_startup_mapping`
+until an operator submits allocations through `POST /api/v1/startup/mappings`.
+Only strategies that declare `supports_position_adoption=True` and implement
+`on_adopt_position()` can receive an adopted live position.
 
 ## Event Backtesting
 

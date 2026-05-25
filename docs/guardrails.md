@@ -68,7 +68,20 @@ IBKR paper/live is only an environment and port selection. It is not an executio
 
 ### Startup Position Adoption
 
-`Engine` loads broker positions on startup and seeds `PortfolioState`. If an adopted position maps to exactly one strategy execution instrument, it is assigned to that strategy. If multiple strategies share the instrument, YAML `adopted_positions` mapping is required before strategy exits manage it.
+`Engine` loads broker positions on startup and seeds `PortfolioState`.
+
+In live mode, the startup position gate is enabled. Broker positions that do
+not match any enabled strategy execution instrument are logged as unmanaged and
+startup continues. Broker positions that match one or more enabled strategy
+execution instruments pause startup at `awaiting_startup_mapping` until an
+operator submits protected API allocations. A strategy can adopt a live broker
+position only when its `PositionPolicy.supports_position_adoption` is `True`
+and `on_adopt_position()` returns the strategy-owned `Position`.
+
+If multiple enabled strategies share the same execution instrument, the
+operator must choose the owner in the submitted allocation. YAML
+`adopted_positions` remains available as an explicit ownership hint for
+non-gated startup paths.
 
 ### Strategy-Owned Exits
 
@@ -145,16 +158,20 @@ Tests under `tests/paper/` are opt-in because they connect to TWS/IB Gateway pap
 
 ### Hermes Control API
 
-The FastAPI control API is read-only in the current framework. It exposes health, metadata, runtime snapshot, positions, recent events, and an event WebSocket for the Hermes agent/operator.
+The FastAPI control API is non-trading in the current framework. It exposes
+health, metadata, runtime snapshot, positions, recent events, startup position
+gate state, startup position mapping controls, and an event WebSocket for the
+Hermes agent/operator.
 
 - Enabled by default; use `--no-api` or `api.enabled=false` only when the API should be disabled.
 - Public: `/api/v1/health`, `/api/v1/meta`, `/api/v1/meta/capabilities`.
 - Local-only hosts (`127.0.0.1`, `localhost`, `::1`) may run without a token.
 - Non-local hosts such as `0.0.0.0` or LAN IPs require `IBKR_LT_API_TOKEN` before startup.
-- Protected when a token is set: `/api/v1/runtime/*`, `/api/v1/positions`, `/api/v1/events`, `/ws/events`.
+- Protected when a token is set: `/api/v1/runtime/*`, `/api/v1/positions`, `/api/v1/events`, `/api/v1/startup/*`, `/ws/events`.
 - API routes read through `Engine.snapshot_state()`.
 - API routes must not call broker adapters, `OrderManager`, or strategies directly.
-- No manual trade, order cancel, startup approval, or state mutation endpoints are active.
+- No manual trade or order-cancel endpoints are active.
+- Startup mutation is limited to `/api/v1/startup/mappings` and `/api/v1/startup/refresh`.
 
 ### Heartbeat Monitor
 
