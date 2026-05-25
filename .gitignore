@@ -65,6 +65,12 @@ strategies/**
 !strategies/_sample_strategy.py
 !strategies/stoch_3m_cross_long.py
 
+# Protected/customer strategy package. PyArmor/Cython outputs and private source
+# live here locally; only the empty package marker is safe to publish.
+protected_strategies/**
+!protected_strategies/
+!protected_strategies/__init__.py
+
 # Internal strategy documentation/tests can reveal IDs, instruments,
 # thresholds, scoring formulas, exits, or adopted-position ownership.
 # `docs/roadmap/` is the local backlog/review/deferred-work area and remains
@@ -80,6 +86,8 @@ tests/**
 !tests/**/
 !tests/**/__init__.py
 configs/**
+!configs/
+!configs/customer.template.yaml
 config.local*
 config.private*
 config.proprietary*

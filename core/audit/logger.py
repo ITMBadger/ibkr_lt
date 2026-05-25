@@ -10,12 +10,13 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from .decision_csv import csv_fieldnames, decision_table_csvs, flatten_decision_event
 from .serialize import to_jsonable
 from .trace import DecisionTrace
+from ..privacy import is_customer_profile, redact_payload, redact_text
 
 _FILENAME_TZ = ZoneInfo("America/New_York")
 
@@ -35,6 +36,7 @@ class AuditLogger:
         run_id: str | None = None,
         run_subdir: bool = False,
         run_started_at: datetime | None = None,
+        strategy_aliases: Mapping[str, str] | None = None,
     ) -> None:
         self.enabled = enabled
         self.profile = profile
@@ -42,6 +44,7 @@ class AuditLogger:
         self.decision_scope = decision_scope
         self.decision_interval_minutes = max(1, int(decision_interval_minutes))
         self.run_id = run_id or uuid.uuid4().hex
+        self.strategy_aliases = dict(strategy_aliases or {})
         self.base_log_dir = Path(log_dir)
         self.run_subdir = run_subdir
         self.log_dir = self.base_log_dir
@@ -54,7 +57,12 @@ class AuditLogger:
                 self.log_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "AuditLogger | None":
+    def from_config(
+        cls,
+        config: dict[str, Any],
+        *,
+        strategy_aliases: Mapping[str, str] | None = None,
+    ) -> "AuditLogger | None":
         cfg = dict(config.get("logging") or {})
         if not cfg:
             return None
@@ -71,11 +79,17 @@ class AuditLogger:
             decision_scope=str(cfg.get("decision_scope", "every_eval")),
             decision_interval_minutes=int(cfg.get("decision_interval_minutes", 30)),
             run_subdir=bool(cfg.get("run_subdir", True)),
+            strategy_aliases=strategy_aliases,
         )
 
     def write(self, filename: str, event: dict[str, Any]) -> None:
         if not self.enabled:
             return
+        event = redact_payload(
+            event,
+            profile=self.profile,
+            aliases=self.strategy_aliases,
+        )
         payload = {
             "run_id": self.run_id,
             "logged_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -193,6 +207,8 @@ def configure_runtime_logging(
     log_dir: str | Path = "runs/runtime",
     level: str = "INFO",
     enabled: bool = True,
+    profile: str = "owner",
+    strategy_aliases: Mapping[str, str] | None = None,
 ) -> None:
     """Attach a runtime.log file handler to the root logger."""
     if not enabled:
@@ -205,12 +221,56 @@ def configure_runtime_logging(
 
     for handler in root.handlers:
         if getattr(handler, "_tradeframe_runtime_log", None) == str(runtime_path):
+            _configure_strategy_redaction_filters(
+                root,
+                profile=profile,
+                strategy_aliases=strategy_aliases or {},
+            )
             return
 
     handler = logging.FileHandler(runtime_path, encoding="utf-8")
     handler._tradeframe_runtime_log = str(runtime_path)  # type: ignore[attr-defined]
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     root.addHandler(handler)
+    _configure_strategy_redaction_filters(
+        root,
+        profile=profile,
+        strategy_aliases=strategy_aliases or {},
+    )
+
+
+class _StrategyRedactionFilter(logging.Filter):
+    def __init__(self, profile: str, strategy_aliases: Mapping[str, str]) -> None:
+        super().__init__()
+        self._tradeframe_strategy_redaction = True
+        self._profile = profile
+        self._aliases = dict(strategy_aliases)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        record.msg = redact_text(
+            message,
+            profile=self._profile,
+            aliases=self._aliases,
+        )
+        record.args = ()
+        return True
+
+
+def _configure_strategy_redaction_filters(
+    root: logging.Logger,
+    *,
+    profile: str,
+    strategy_aliases: Mapping[str, str],
+) -> None:
+    for handler in root.handlers:
+        handler.filters = [
+            item
+            for item in handler.filters
+            if not getattr(item, "_tradeframe_strategy_redaction", False)
+        ]
+        if is_customer_profile(profile):
+            handler.addFilter(_StrategyRedactionFilter(profile, strategy_aliases))
 
 
 def _is_entry_signal(event: dict[str, Any]) -> bool:

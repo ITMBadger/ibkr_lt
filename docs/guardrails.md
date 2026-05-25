@@ -73,15 +73,22 @@ IBKR paper/live is only an environment and port selection. It is not an executio
 In live mode, the startup position gate is enabled. Broker positions that do
 not match any enabled strategy execution instrument are logged as unmanaged and
 startup continues. Broker positions that match one or more enabled strategy
-execution instruments pause startup at `awaiting_startup_mapping` until an
-operator submits protected API allocations. A strategy can adopt a live broker
-position only when its `PositionPolicy.supports_position_adoption` is `True`
-and `on_adopt_position()` returns the strategy-owned `Position`.
+execution instruments either use a stored ownership-ledger/config allocation or
+pause startup at `awaiting_startup_mapping` until an operator submits protected
+API allocations. A strategy can adopt a live broker position only when its
+`PositionPolicy.supports_position_adoption` is `True` and
+`on_adopt_position()` returns the strategy-owned `Position`.
 
-If multiple enabled strategies share the same execution instrument, the
-operator must choose the owner in the submitted allocation. YAML
-`adopted_positions` remains available as an explicit ownership hint for
-non-gated startup paths.
+Each allocation must include an explicit `quantity`; startup no longer assumes
+the strategy's configured entry size is the adoption size. If multiple enabled
+strategies share the same execution instrument, the operator or private config
+must choose the owner. If mapping is required and the control API is disabled,
+live startup fails fast rather than waiting without a mapping path.
+
+`runs/state/position_ownership.json` records bot-created live ownership from
+fills and is used only to remap still-open broker positions on restart. YAML
+`adopted_positions` remains available as an explicit startup ownership mapping
+when the ledger cannot know the owner.
 
 ### Strategy-Owned Exits
 
@@ -143,6 +150,18 @@ Decision logging is controlled by `logging.decision_scope`:
 The shared deployment config uses `trigger_and_interval` with `decision_interval_minutes: 30` to avoid minute-by-minute live log noise while preserving full trigger traces and one historical diagnostic snapshot per 30-minute wall-clock bucket. Duplicate trace folders in the same minute receive a numeric suffix rather than overwriting. Each trace folder contains `decision.csv` plus optional per-timeframe table CSVs, typically current bar plus the previous four bars.
 
 Signal, order, and fill logs remain append-only: `signals.jsonl`, `orders.jsonl`, and `fills.jsonl`.
+
+For protected/customer distribution, use `logging.profile: customer` and
+strategy aliases. Customer profile suppresses full decision traces, minimizes
+API strategy metadata, and redacts known strategy IDs in audit/runtime log
+payloads. Owner profile remains the debugging profile and can reveal strategy
+behavior.
+
+Use `configs/customer.template.yaml` for customer-safe defaults and run
+`python -m tools.customer_package_check` on any assembled customer folder before
+sharing it. The checker is obfuscation-tool agnostic: it rejects runtime/log/data
+artifacts, raw `strategies/` packages, protected Python source files, and any
+private tokens supplied with `--forbidden-token`.
 
 ### IBKR Paper Test Guardrails
 

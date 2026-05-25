@@ -1,0 +1,59 @@
+# Customer/protected runtime template.
+#
+# Keep this file generic. Do not place proprietary strategy IDs, formulas,
+# thresholds, instrument-specific research, account IDs, API keys, or local
+# file paths in a shared customer config.
+
+runtime_profile: customer
+lookback_days: 10
+position_size_shares: 1
+max_order_quantity: 2
+thread_pool_workers: 4
+session_timezone: America/New_York
+
+strategy_packages:
+  - protected_strategies
+
+# Protected/customer strategies should expose neutral public IDs from their
+# StrategySpec, such as strategy_1. Avoid mapping real private IDs in config.
+strategies:
+  - strategy_1
+
+strategy_modes:
+  strategy_1: live
+
+logging:
+  enabled: true
+  log_dir: runs/{mode}
+  run_subdir: true
+  profile: customer
+  strategy_decisions: off
+  decision_scope: trigger_and_interval
+  decision_interval_minutes: 30
+  runtime_level: INFO
+
+api:
+  enabled: true
+  host: 127.0.0.1
+  port: 8550
+  token_env: IBKR_LT_API_TOKEN
+  log_level: warning
+
+execution:
+  provider: ibkr
+  host: 127.0.0.1
+  client_id: 1
+  # Required for live use. Keep account IDs in a private local file.
+  account: ""
+
+data:
+  historical:
+    provider: csv
+    # Replace in a private local config.
+    path: "runs/customer_data_placeholder"
+    timezone: America/New_York
+    rth_only: true
+    market_open: "09:30"
+    market_close: "16:00"
+  live:
+    provider: ibkr

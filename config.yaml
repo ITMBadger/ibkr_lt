@@ -14,8 +14,8 @@ max_order_quantity: 2
 thread_pool_workers: 4
 session_timezone: America/New_York
 
-# Optional per-strategy live sizing. Startup position mapping uses the same
-# configured quantity as new live entries.
+# Optional per-strategy live sizing. Startup position adoption uses explicit
+# adopted_positions.quantity or the persisted ownership ledger, not this value.
 strategy_risk:
   stoch_3m_cross_long:
     position_size_shares: 1
@@ -38,6 +38,12 @@ api:
   port: 8550
   token_env: IBKR_LT_API_TOKEN
   log_level: warning
+
+strategy_packages:
+  - strategies
+  # Add protected_strategies in a private/customer config after placing
+  # PyArmor/Cython-protected strategy modules there.
+  # - protected_strategies
 
 strategies:
   # Public sample only. Replace with a private strategy in a local config before
@@ -74,6 +80,10 @@ adopted_positions:
   - symbol: QQQ
     asset_class: equity
     strategy_id: stoch_3m_cross_long
+    quantity: 1
+    # entry_ts is required only for strategies declaring it in
+    # POSITION_ADOPTION_REQUIRED_FIELDS.
+    # entry_ts: "2026-05-25T10:18:00-04:00"
 
 # Polygon data example:
 #

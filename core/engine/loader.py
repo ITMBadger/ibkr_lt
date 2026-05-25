@@ -10,7 +10,8 @@ Implemented in Phase 4. Stub here so the tradeframe facade is importable from Ph
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
+import pkgutil
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -34,22 +35,30 @@ def register_strategy(cls: type["StrategyKernel"]) -> type["StrategyKernel"]:
     return cls
 
 
-def load_strategies(package: str = "strategies") -> None:
-    """Import all non-underscore .py files from the given package.
+def load_strategies(package: str | Sequence[str] = "strategies") -> None:
+    """Import all non-underscore strategy modules from one or more packages.
 
     Default package is "strategies" — a flat folder at the repo root where
     each file defines one strategy class decorated with @register_strategy.
 
     Each module's @register_strategy decorator fires on import and populates
-    the registry. Compiled .pyd/.so modules import identically when
-    PyArmor/Cython is added later — this function does not change.
+    the registry. Package discovery uses importlib/pkgutil so normal Python
+    files and protected/compiled package outputs can share the same loading path.
     """
+    packages = [package] if isinstance(package, str) else list(package)
+    for package_name in packages:
+        _load_strategy_package(str(package_name))
+
+
+def _load_strategy_package(package: str) -> None:
     pkg = importlib.import_module(package)
-    pkg_path = Path(pkg.__file__).parent  # type: ignore[arg-type]
-    for py_file in sorted(pkg_path.glob("*.py")):
-        if py_file.name.startswith("_"):
+    package_path = getattr(pkg, "__path__", None)
+    if package_path is None:
+        return
+    for module in sorted(pkgutil.iter_modules(package_path), key=lambda item: item.name):
+        if module.name.startswith("_"):
             continue
-        importlib.import_module(f"{package}.{py_file.stem}")
+        importlib.import_module(f"{package}.{module.name}")
 
 
 def get_registry() -> dict[str, type["StrategyKernel"]]:

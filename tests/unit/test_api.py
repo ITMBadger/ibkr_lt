@@ -144,6 +144,7 @@ async def test_startup_gate_endpoints_require_auth_and_use_engine():
                     {
                         "position_id": "position:equity:QQQ:long",
                         "strategy_id": "example_live_strategy",
+                        "quantity": 1,
                         "entry_ts": "2026-05-25T10:18:00-04:00",
                     }
                 ]

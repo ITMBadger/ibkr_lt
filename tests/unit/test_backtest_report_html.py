@@ -64,8 +64,8 @@ def test_html_report_reconstructs_closed_trade_equity(tmp_path):
     assert "Closed Trades" in html
     assert "Max Open Lots" in html
     assert "Max Exposure" in html
-    assert "https://" not in html
-    assert "<script" not in html
+    assert "chart.umd.min.js" in html
+    assert "<script" in html
 
 
 def test_html_report_marks_open_position_to_latest_bar(tmp_path):

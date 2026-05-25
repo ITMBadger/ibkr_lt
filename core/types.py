@@ -127,6 +127,7 @@ class Position:
     quantity: float
     avg_cost: float
     trade_id: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def side(self) -> str:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
@@ -15,6 +15,7 @@ from core.audit import AuditLogger, DecisionTrace, record_decision
 from core.adapters.ibkr.data import IBKRDataProvider
 from core.adapters.paper.broker import PaperBroker
 from core.adapters.paper.data import ReplayDataProvider
+from core.engine.loader import get_registry, load_strategies
 from core.engine.timeframes import TF_1M, TF_5S
 from core.interfaces.strategy import (
     POSITION_MODE_MULTI,
@@ -26,7 +27,8 @@ from core.interfaces.strategy import (
 from core.orders.order_manager import OrderManager
 from core.portfolio.state import PortfolioState
 from core.risk.policy import RiskPolicy
-from core.types import Bar, Instrument, MarketContext, OrderRequest, OrderStatus, Position, Signal
+from core.startup import PositionOwnershipLedger
+from core.types import Bar, Fill, Instrument, MarketContext, OrderRequest, OrderStatus, Position, Signal
 
 QQQ = Instrument(asset_class="equity", symbol="QQQ")
 SPY = Instrument(asset_class="equity", symbol="SPY")
@@ -161,6 +163,10 @@ class _AdoptableQqqStrategy(StrategyKernel):
 
     def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
         return None
+
+    def on_adopt_position(self, position, adoption, state):
+        state["adopted_entry_ts"] = adoption.entry_ts
+        return position
 
 
 class _StaticHistorical:
@@ -491,7 +497,7 @@ def test_startup_gate_ignores_unrelated_positions():
     assert status["unmanaged"][0]["symbol"] == "SPY"
 
 
-def test_startup_gate_allocates_configured_strategy_size():
+def test_startup_gate_uses_operator_quantity():
     engine = Engine(
         broker=PaperBroker(),
         data_feed=DataFeed(None, ReplayDataProvider([])),
@@ -505,14 +511,17 @@ def test_startup_gate_allocates_configured_strategy_size():
     )
     engine._set_startup_gate_status(status)  # noqa: SLF001
 
+    position_id = status["positions"][0]["position_id"]
     result = engine.submit_startup_mappings([
         {
-            "position_id": "position:equity:QQQ:long",
+            "position_id": position_id,
             "strategy_id": "_adoptable_qqq",
+            "quantity": 3,
         }
     ])
 
-    assert result["allocations"][0]["quantity"] == 2.0
+    assert result["phase"] == "mapped"
+    assert result["allocations"][0]["quantity"] == 3.0
 
 
 def test_startup_gate_rejects_insufficient_broker_quantity():
@@ -532,10 +541,195 @@ def test_startup_gate_rejects_insufficient_broker_quantity():
     with pytest.raises(ValueError, match="exceeds broker quantity"):
         engine.submit_startup_mappings([
             {
-                "position_id": "position:equity:QQQ:long",
+                "position_id": status["positions"][0]["position_id"],
+                "strategy_id": "_adoptable_qqq",
+                "quantity": 2,
+            }
+        ])
+
+
+def test_startup_gate_rejects_missing_allocation_quantity():
+    engine = Engine(
+        broker=PaperBroker(),
+        data_feed=DataFeed(None, ReplayDataProvider([])),
+        strategies=[(_AdoptableQqqStrategy(), {})],
+        startup_position_gate_enabled=True,
+    )
+    status = engine._build_startup_gate_status(  # noqa: SLF001
+        [Position(QQQ, quantity=1, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+    )
+    engine._set_startup_gate_status(status)  # noqa: SLF001
+
+    with pytest.raises(ValueError, match="must include quantity"):
+        engine.submit_startup_mappings([
+            {
+                "position_id": status["positions"][0]["position_id"],
                 "strategy_id": "_adoptable_qqq",
             }
         ])
+
+
+def test_startup_gate_blocks_derivative_contract_mismatch():
+    strategy_instrument = Instrument(
+        asset_class="future",
+        symbol="MNQ",
+        exchange="CME",
+        currency="USD",
+        expiry=date(2026, 6, 19),
+        multiplier=2.0,
+    )
+    broker_instrument = Instrument(
+        asset_class="future",
+        symbol="MNQ",
+        exchange="CME",
+        currency="USD",
+        expiry=date(2026, 9, 18),
+        multiplier=2.0,
+    )
+
+    class _AdoptableFutureStrategy(StrategyKernel):
+        SPEC = StrategySpec(
+            id="_adoptable_future",
+            primary_instrument=strategy_instrument,
+            execution_instrument=strategy_instrument,
+            timeframes=("1m",),
+            position_policy=PositionPolicy(supports_position_adoption=True),
+        )
+
+        def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
+            return None
+
+    engine = Engine(
+        broker=PaperBroker(),
+        data_feed=DataFeed(None, ReplayDataProvider([])),
+        strategies=[(_AdoptableFutureStrategy(), {})],
+        startup_position_gate_enabled=True,
+    )
+    status = engine._build_startup_gate_status(  # noqa: SLF001
+        [Position(broker_instrument, quantity=1, avg_cost=100.0)],
+        [(_AdoptableFutureStrategy(), {})],
+    )
+
+    assert status["phase"] == "blocked"
+    assert status["positions"][0]["reason"] == "instrument_contract_not_exactly_declared"
+
+
+def test_startup_gate_uses_configured_adopted_position_mapping():
+    engine = Engine(
+        broker=PaperBroker(),
+        data_feed=DataFeed(None, ReplayDataProvider([])),
+        strategies=[(_AdoptableQqqStrategy(), {})],
+        startup_position_gate_enabled=True,
+        startup_position_allocations=[
+            {
+                "symbol": "QQQ",
+                "asset_class": "equity",
+                "strategy_id": "_adoptable_qqq",
+                "quantity": 1,
+                "source": "config",
+            }
+        ],
+    )
+    status = engine._build_startup_gate_status(  # noqa: SLF001
+        [Position(QQQ, quantity=1, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+    )
+
+    assert status["phase"] == "clear"
+    assert status["allocations"][0]["strategy_id"] == "_adoptable_qqq"
+    assert status["allocations"][0]["source"] == "config"
+
+
+def test_startup_gate_fails_fast_without_mapping_interface():
+    async def run():
+        engine = Engine(
+            broker=PaperBroker(),
+            data_feed=DataFeed(None, ReplayDataProvider([])),
+            strategies=[(_AdoptableQqqStrategy(), {})],
+            startup_position_gate_enabled=True,
+            startup_position_mapping_enabled=False,
+        )
+        with pytest.raises(RuntimeError, match="no mapping interface"):
+            await engine._run_startup_position_gate(  # noqa: SLF001
+                [Position(QQQ, quantity=1, avg_cost=100.0)],
+                [(_AdoptableQqqStrategy(), {})],
+            )
+
+    asyncio.run(run())
+
+
+def test_position_ownership_ledger_recovers_fill_allocation(tmp_path):
+    ledger = PositionOwnershipLedger(tmp_path / "ownership.json")
+    ledger.apply_fill(
+        Fill(
+            broker_order_id="1",
+            instrument=QQQ,
+            side="long",
+            quantity=2,
+            price=100.0,
+            timestamp=datetime(2026, 5, 25, 14, 18, tzinfo=timezone.utc),
+        ),
+        strategy_id="_adoptable_qqq",
+        role="entry",
+        trade_id="lot_a",
+    )
+
+    allocations = ledger.open_allocations()
+
+    assert allocations == [
+        {
+            "strategy_id": "_adoptable_qqq",
+            "quantity": 2.0,
+            "entry_ts": "2026-05-25T14:18:00+00:00",
+            "trade_id": "lot_a",
+            "source": "ownership_ledger",
+            "side": "long",
+            "instrument": {
+                "asset_class": "equity",
+                "symbol": "QQQ",
+                "exchange": None,
+                "currency": None,
+                "expiry": None,
+                "strike": None,
+                "right": None,
+                "multiplier": 1.0,
+            },
+        }
+    ]
+
+
+def test_load_strategies_accepts_protected_package(tmp_path, monkeypatch):
+    package_dir = tmp_path / "protected_pkg"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "demo.py").write_text(
+        "\n".join([
+            "from core import Instrument, MarketContext, Signal",
+            "from core.engine.loader import register_strategy",
+            "from core.interfaces.strategy import StrategyKernel, StrategySpec",
+            "",
+            "QQQ = Instrument(asset_class='equity', symbol='QQQ')",
+            "",
+            "@register_strategy",
+            "class ProtectedLoaderTestStrategy(StrategyKernel):",
+            "    SPEC = StrategySpec(",
+            "        id='_protected_loader_test',",
+            "        primary_instrument=QQQ,",
+            "        execution_instrument=QQQ,",
+            "        timeframes=('1m',),",
+            "    )",
+            "",
+            "    def generate(self, ctx: MarketContext, state: dict) -> Signal | None:",
+            "        return None",
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    load_strategies(["protected_pkg"])
+
+    assert "_protected_loader_test" in get_registry()
 
 
 def test_audit_run_subdir_uses_et_minute_and_unique_suffix(tmp_path):

@@ -37,6 +37,7 @@ class _ChunkPayload:
     end: datetime
     warmup_start: datetime
     bars: list[Bar]
+    strategy_packages: list[str]
     strategy_ids: list[str]
     evaluation_timeframes: dict[str, str]
     lookback_days: int
@@ -83,6 +84,7 @@ def generate_parallel_entry_candidates(
         session_tz=settings.session_tz,
         workers=workers,
         strategy_ids=list(settings.strategy_ids),
+        strategy_packages=list(settings.strategy_packages),
         evaluation_timeframes=dict(evaluation_timeframes),
     )
     if not chunks:
@@ -145,7 +147,7 @@ def candidates_to_engine_map(
 
 
 def _generate_chunk_candidates(payload: _ChunkPayload) -> _ChunkResult:
-    load_strategies()
+    load_strategies(payload.strategy_packages)
     registry = get_registry()
     strategies = instantiate_strategies(registry, payload.strategy_ids)
     data_instruments = _strategy_data_instruments(strategies)
@@ -234,6 +236,7 @@ def _build_chunks(
     lookback_days: int,
     session_tz: str,
     workers: int,
+    strategy_packages: list[str],
     strategy_ids: list[str],
     evaluation_timeframes: dict[str, str],
 ) -> list[_ChunkPayload]:
@@ -259,6 +262,7 @@ def _build_chunks(
                 end=chunk_end,
                 warmup_start=warmup_start,
                 bars=chunk_bars,
+                strategy_packages=list(strategy_packages),
                 strategy_ids=strategy_ids,
                 evaluation_timeframes=evaluation_timeframes,
                 lookback_days=lookback_days,

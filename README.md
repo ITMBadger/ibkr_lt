@@ -32,9 +32,9 @@ This keeps broker SDKs, data-provider SDKs, and private strategy logic outside t
 
 This repository contains the framework, adapters, tests, and public runtime skeleton.
 
-Proprietary strategy implementations, detailed strategy docs, research notebooks, market data, and decision logs are intentionally excluded from Git.
+Proprietary strategy implementations, protected build artifacts, detailed strategy docs, research notebooks, market data, configs, and decision logs are intentionally excluded from Git.
 
-To run the project from a fresh public clone, add your own strategy module under `strategies/` or update `config.yaml` to point at an available local strategy.
+To run the project from a fresh public clone, add your own public/demo strategy module under `strategies/`, or put protected customer/private strategy modules under `protected_strategies/` and add that package to `strategy_packages` in a private config.
 
 ## Strategy Authoring
 
@@ -130,6 +130,22 @@ Signal, order, and fill audit files remain append-only:
 - `orders.jsonl`
 - `fills.jsonl`
 
+Customer/protected builds should use `logging.profile: customer`. In that
+profile, full decision traces are disabled, API strategy metadata is minimized,
+and strategy IDs in audit/runtime log payloads are replaced with configured or
+generated aliases.
+
+Use `configs/customer.template.yaml` as the safe starting point for shared
+customer configs. Before packaging, run the tool-agnostic leak checker with any
+private IDs or tokens you need to block:
+
+```bash
+python -m tools.customer_package_check \
+  --root dist/customer_package \
+  --config configs/customer.template.yaml \
+  --forbidden-token <private_strategy_id>
+```
+
 ## Strategy Modes
 
 Runtime paper/live selection only chooses the IBKR environment and port. Native
@@ -152,6 +168,12 @@ startup continues. Matching positions pause startup at `awaiting_startup_mapping
 until an operator submits allocations through `POST /api/v1/startup/mappings`.
 Only strategies that declare `supports_position_adoption=True` and implement
 `on_adopt_position()` can receive an adopted live position.
+
+Allocations must include an explicit `quantity`. Stored ownership is recovered
+from `runs/state/position_ownership.json` when the bot previously opened the
+position; `adopted_positions` in a private config can provide explicit startup
+ownership when needed. If live startup needs operator mapping and the control
+API is disabled, startup fails fast instead of waiting indefinitely.
 
 ## Event Backtesting
 

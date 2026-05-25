@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Callable
 
 from .strategy_modes import STRATEGY_MODE_DRY_RUN, strategy_mode_map
+from ..privacy import safe_strategy_id
 from ..portfolio.state import PortfolioState
 from ..risk.policy import RiskPolicy
 from ..interfaces.strategy import POSITION_MODE_MULTI, PositionPolicy, ProtectiveStopSpec
@@ -22,6 +23,7 @@ from ..audit import AuditLogger
 
 if TYPE_CHECKING:
     from ..interfaces.broker import BrokerAdapter
+    from ..startup import PositionOwnershipLedger
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +44,9 @@ class OrderManager:
         strategy_modes: Mapping[str, str] | None = None,
         position_policies: Mapping[str, PositionPolicy] | None = None,
         strategy_risk: Mapping[str, RiskPolicy] | None = None,
+        ownership_ledger: "PositionOwnershipLedger | None" = None,
+        metadata_profile: str = "owner",
+        strategy_aliases: Mapping[str, str] | None = None,
         sizing_price_provider: Callable[[Instrument], float | None] | None = None,
         sizing_equity_provider: Callable[[], float | None] | None = None,
         fill_listener: Callable[[Fill], None] | None = None,
@@ -50,6 +55,9 @@ class OrderManager:
         self._portfolio = portfolio
         self._risk = risk
         self._strategy_risk = dict(strategy_risk or {})
+        self._ownership_ledger = ownership_ledger
+        self._metadata_profile = str(metadata_profile or "owner")
+        self._strategy_aliases = dict(strategy_aliases or {})
         self._audit = audit_logger
         self._queue: asyncio.Queue[tuple[Signal, str]] = asyncio.Queue()
         self._signal_log: list[tuple[str, Signal]] = []  # (strategy_id, signal)
@@ -119,7 +127,8 @@ class OrderManager:
             )
             return
         side = "short" if position.quantity > 0 else "long"
-        close_key = f"{strategy_id}-{position.instrument.symbol}-close-{reason}"
+        strategy_ref = self._safe_strategy_id(strategy_id)
+        close_key = f"{strategy_ref}-{position.instrument.symbol}-close-{reason}"
         if position.trade_id:
             close_key = f"{close_key}-{position.trade_id}"
         order = OrderRequest(
@@ -318,7 +327,8 @@ class OrderManager:
             )
             return
 
-        entry_key = f"{strategy_id}-{signal.instrument.symbol}-{signal.side}"
+        strategy_ref = self._safe_strategy_id(strategy_id)
+        entry_key = f"{strategy_ref}-{signal.instrument.symbol}-{signal.side}"
         if trade_id:
             entry_key = f"{entry_key}-{trade_id}"
         order = OrderRequest(
@@ -383,6 +393,16 @@ class OrderManager:
         role = self._order_role.get(fill.broker_order_id, "unknown")
         trade_id = self._order_trade_id.get(fill.broker_order_id)
         self._portfolio.apply_fill(fill, strategy_id=strategy_id, trade_id=trade_id)
+        if self._ownership_ledger is not None:
+            try:
+                self._ownership_ledger.apply_fill(
+                    fill,
+                    strategy_id=strategy_id,
+                    role=role,
+                    trade_id=trade_id,
+                )
+            except Exception as exc:
+                log.warning("Position ownership ledger update failed: %s", exc)
         if self._fill_listener is not None:
             self._fill_listener(fill)
         self._write_fill_event(fill, strategy_id, role, trade_id)
@@ -478,8 +498,9 @@ class OrderManager:
         else:
             raw_stop_price = fill.price * (1.0 + spec.pct)
         stop_price = _round_stop_price(fill.instrument, raw_stop_price)
+        strategy_ref = self._safe_strategy_id(strategy_id)
         stop_key = (
-            f"{strategy_id}-{fill.instrument.symbol}-protective-stop-"
+            f"{strategy_ref}-{fill.instrument.symbol}-protective-stop-"
             f"{fill.broker_order_id}"
         )
         if trade_id:
@@ -589,6 +610,13 @@ class OrderManager:
 
     def _risk_for_strategy(self, strategy_id: str) -> RiskPolicy:
         return self._strategy_risk.get(strategy_id, self._risk)
+
+    def _safe_strategy_id(self, strategy_id: str) -> str:
+        return str(safe_strategy_id(
+            strategy_id,
+            profile=self._metadata_profile,
+            aliases=self._strategy_aliases,
+        ))
 
     def _position_key(
         self,

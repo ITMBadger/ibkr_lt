@@ -94,6 +94,7 @@ class _ClosedTrade:
     exit_price: float
     pnl: float
     return_pct: float
+    close_result: str
 
 
 @dataclass(frozen=True)
@@ -320,6 +321,7 @@ def _apply_fill_to_lots(
                 exit_price=fill.price,
                 pnl=pnl,
                 return_pct=return_pct,
+                close_result=_close_result_label(fill),
             )
         )
         lot.quantity -= closing_signed_qty
@@ -337,6 +339,38 @@ def _apply_fill_to_lots(
         )
     _add_open_lot(open_lots, fill, remaining)
     return closed
+
+
+def _close_result_label(fill: _FillEvent) -> str:
+    result = _close_result_key(fill)
+    labels = {
+        "hold_close": "End of Session",
+        "atr_trailing_stop": "ATR Stop",
+        "protective_stop": "Protective Stop",
+        "stop_loss": "Stop Loss",
+        "close": "Close",
+    }
+    return labels.get(result, result.replace("_", " ").title())
+
+
+def _close_result_key(fill: _FillEvent) -> str:
+    if fill.role == "protective_stop":
+        return "protective_stop"
+
+    order_id = fill.broker_order_id
+    if not order_id:
+        return fill.role or "close"
+
+    suffix = f"-{fill.trade_id}" if fill.trade_id else ""
+    stem = order_id[: -len(suffix)] if suffix and order_id.endswith(suffix) else order_id
+    marker = "-close-"
+    if marker in stem:
+        result = stem.rsplit(marker, 1)[1]
+        if result:
+            return result
+    if "-protective-stop-" in stem:
+        return "protective_stop"
+    return fill.role or "close"
 
 
 def _select_closing_lot(
@@ -466,6 +500,12 @@ def _compute_metrics(series: _AccountSeries, initial_equity: float) -> dict[str,
     positive_years = sum(1 for value in series.yearly_returns.values() if value > 0)
     yearly_count = len(series.yearly_returns)
     max_drawdown = _max_drawdown(equity_values)
+    annualized_return = _annualized_return(
+        initial_equity=initial_equity,
+        final_equity=final_equity,
+        start=series.equity_points[0].timestamp if series.equity_points else None,
+        end=series.equity_points[-1].timestamp if series.equity_points else None,
+    )
     max_exposure_multiple = 0.0
     for point in series.equity_points:
         if abs(point.equity) > _EPSILON:
@@ -478,6 +518,7 @@ def _compute_metrics(series: _AccountSeries, initial_equity: float) -> dict[str,
         "initial_equity": initial_equity,
         "final_equity": final_equity,
         "strategy_return": _safe_return(final_equity, initial_equity),
+        "annualized_return": annualized_return,
         "equity_return": _safe_return(final_equity, initial_equity),
         "closed_trades": len(closed),
         "open_positions": len(series.open_lots),
@@ -762,7 +803,6 @@ def _render_report_html(
       <section class="section">
     <h2 class="section-title">Trade History</h2>
     <div class="tables">
-      {_strategy_table(series.closed_trades)}
       {_closed_trades_table(series.closed_trades, session_tz)}
       {_open_positions_table(series.open_lots, session_tz)}
       {_run_metadata_table(summary, metrics)}
@@ -872,24 +912,34 @@ def _metric_cards(metrics: dict[str, Any]) -> str:
     sr = metrics["strategy_return"]
     sr_cls = "pos" if isinstance(sr, (int, float)) and sr > 0 else "neg" if isinstance(sr, (int, float)) and sr < 0 else ""
     card_data = [
-        ("Trades", escape(str(metrics["closed_trades"])), "closed trades"),
         (
             "Strategy Return",
             _colored(_format_pct(metrics["strategy_return"]), sr_cls),
             "mark-to-market strategy equity curve",
         ),
-        ("Annualized Sharpe", escape(_format_number(metrics["annualized_sharpe"], 2)), "daily equity curve"),
+        (
+            "CAGR",
+            _colored(_format_pct(metrics["annualized_return"]), sr_cls),
+            "annualized strategy return",
+        ),
         (
             "Max Drawdown",
             _colored(_format_pct(metrics["max_drawdown"], decimals=2), "neg"),
             "bar-close equity drawdown",
         ),
+        ("Annualized Sharpe", escape(_format_number(metrics["annualized_sharpe"], 2)), "daily equity curve"),
+        ("Trades", escape(str(metrics["closed_trades"])), "closed trades"),
         ("Win Rate", escape(_format_pct(metrics["win_rate"])), "winners / closed trades"),
         ("Profit Factor", escape(_format_profit_factor(metrics)), "gross profit / gross loss"),
         (
             "Positive Years",
             escape(f"{metrics['positive_years']} / {metrics['year_count']}"),
             "calendar years with positive return",
+        ),
+        (
+            "Max Open Lots",
+            escape(str(metrics["max_concurrent_open_lots"])),
+            "maximum concurrent open trade lots",
         ),
         (
             "Max Exposure",
@@ -941,35 +991,6 @@ def _monthly_heatmap_html(monthly_returns: dict[tuple[int, int], float]) -> str:
 </div>'''
 
 
-def _strategy_table(closed_trades: Sequence[_ClosedTrade]) -> str:
-    grouped: dict[str, list[_ClosedTrade]] = defaultdict(list)
-    for trade in closed_trades:
-        grouped[trade.strategy_id].append(trade)
-    if not grouped:
-        return _table_block("Strategy Summary", "<p class=\"empty-text\">No closed trades.</p>")
-    rows = []
-    for strategy_id, trades in sorted(grouped.items()):
-        wins = sum(1 for trade in trades if trade.pnl > 0)
-        pnl = sum(trade.pnl for trade in trades)
-        sum_return = sum(trade.return_pct for trade in trades)
-        rows.append(
-            "<tr>"
-            f"<td>{escape(strategy_id)}</td>"
-            f"<td>{len(trades)}</td>"
-            f"<td>{escape(_format_pct(wins / len(trades)))}</td>"
-            f"<td class=\"{'col-pos' if pnl > 0 else 'col-neg' if pnl < 0 else ''}\">{escape(_format_money(pnl))}</td>"
-            f"<td>{escape(_format_pct(sum_return))}</td>"
-            "</tr>"
-        )
-    body = (
-        "<table><thead><tr><th>Strategy</th><th>Trades</th><th>Win Rate</th>"
-        "<th>PnL</th><th>Sum Return</th></tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table>"
-    )
-    return _table_block("Strategy Summary", body)
-
-
 def _closed_trades_table(closed_trades: Sequence[_ClosedTrade], session_tz: ZoneInfo) -> str:
     if not closed_trades:
         return _table_block("Closed Trades", "<p class=\"empty-text\">No closed trades.</p>")
@@ -984,7 +1005,7 @@ def _closed_trades_table(closed_trades: Sequence[_ClosedTrade], session_tz: Zone
             f"<td>{escape(trade.strategy_id)}</td>"
             f"<td>{escape(trade.instrument.label)}</td>"
             f"<td>{escape(trade.side)}</td>"
-            f"<td>{trade.quantity:g}</td>"
+            f"<td>{escape(trade.close_result)}</td>"
             f"<td>{trade.entry_price:.3f}</td>"
             f"<td>{trade.exit_price:.3f}</td>"
             f"<td class=\"{'col-pos' if trade.pnl > 0 else 'col-neg' if trade.pnl < 0 else ''}\">{escape(_format_money(trade.pnl))}</td>"
@@ -1005,7 +1026,7 @@ def _closed_trades_table(closed_trades: Sequence[_ClosedTrade], session_tz: Zone
     body = (
         note
         + '<table class="paginated" data-page-size="35"><thead><tr><th>Entry Time (ET)</th><th>Exit Time (ET)</th><th>Strategy</th>'
-        "<th>Symbol</th><th>Side</th><th>Qty</th><th>Entry Price</th><th>Exit Price</th>"
+        "<th>Symbol</th><th>Side</th><th>Close Result</th><th>Entry Price</th><th>Exit Price</th>"
         "<th>PnL</th><th>Return</th><th>Trade ID</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
@@ -1073,7 +1094,7 @@ h1 {
   line-height: 1.6;
 }
 .section {
-  margin-bottom: 24px;
+  margin-bottom: 20px;
 }
 .section-title {
   font-size: 12px;
@@ -1081,18 +1102,18 @@ h1 {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-muted);
-  margin: 0 0 10px;
+  margin: 0 0 8px;
 }
 .cards {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-  margin-bottom: 16px;
+  gap: 10px;
+  margin-bottom: 12px;
 }
 .card {
   background: var(--card);
   border-radius: var(--radius);
-  padding: 16px 18px;
+  padding: 12px 14px;
   box-shadow: var(--shadow);
   border: 1px solid var(--border);
 }
@@ -1123,7 +1144,7 @@ h1 {
 .chart {
   background: var(--card);
   border-radius: var(--radius);
-  padding: 20px;
+  padding: 14px;
   box-shadow: var(--shadow);
   border: 1px solid var(--border);
 }
@@ -1133,11 +1154,11 @@ h1 {
 .chart-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  gap: 10px;
 }
 .chart-grid .chart {
   height: 340px;
-  padding: 18px;
+  padding: 12px;
 }
 canvas {
   width: 100% !important;
@@ -1184,12 +1205,12 @@ canvas {
 /* Tables */
 .tables {
   display: grid;
-  gap: 14px;
+  gap: 10px;
 }
 .table-block {
   background: var(--card);
   border-radius: var(--radius);
-  padding: 18px 20px 22px;
+  padding: 14px 16px 18px;
   box-shadow: var(--shadow);
   border: 1px solid var(--border);
   overflow-x: auto;
@@ -1413,6 +1434,21 @@ def _annualized_sharpe(values: Sequence[float]) -> float | None:
     if std <= _EPSILON:
         return None
     return statistics.mean(values) / std * math.sqrt(252)
+
+
+def _annualized_return(
+    *,
+    initial_equity: float,
+    final_equity: float,
+    start: datetime | None,
+    end: datetime | None,
+) -> float | None:
+    if initial_equity <= _EPSILON or final_equity <= 0 or start is None or end is None:
+        return None
+    years = (end - start).total_seconds() / (365.25 * 24 * 60 * 60)
+    if years <= _EPSILON:
+        return None
+    return (final_equity / initial_equity) ** (1.0 / years) - 1.0
 
 
 def _sortino(values: Sequence[float]) -> float | None:

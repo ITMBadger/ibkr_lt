@@ -3,7 +3,14 @@
 ## Private Strategy Warmup
 
 Use a private local config when running an ignored proprietary strategy that
-needs a longer warmup than the shared sample config:
+needs a longer warmup than the shared sample config. Protected/PyArmor strategy
+modules can be loaded from `protected_strategies/` by setting
+`strategy_packages` in that private config:
+
+```yaml
+strategy_packages:
+  - protected_strategies
+```
 
 ```bash
 ~/.venv/bin/python -u -m backtest.run \

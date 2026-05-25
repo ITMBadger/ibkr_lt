@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -49,6 +49,7 @@ class BacktestSettings:
     sizing_mode: str = "fixed_shares"
     sizing_equity_fraction: float = 1.0
     sizing_max_order_quantity: float | None = None
+    strategy_packages: list[str] = field(default_factory=lambda: ["strategies"])
 
 
 def load_yaml_config(path: str | Path) -> dict[str, Any]:
@@ -147,6 +148,7 @@ def resolve_settings(
             else config.get("lookback_days", 500)
         ),
         session_tz=session_tz,
+        strategy_packages=resolve_strategy_packages(config),
         strategy_ids=strategy_ids,
         strategy_modes=strategy_modes,
         position_size_shares=int(config.get("position_size_shares", 1)),
@@ -209,6 +211,13 @@ def normalize_sizing_mode(value: str) -> str:
         "backtest.sizing.mode must be 'fixed_shares' or 'full_equity'; "
         f"got {value!r}"
     )
+
+
+def resolve_strategy_packages(config: Mapping[str, Any]) -> list[str]:
+    configured = config.get("strategy_packages") or ["strategies"]
+    if isinstance(configured, str):
+        return [configured]
+    return [str(item) for item in configured]
 
 
 def resolve_strategy_ids(

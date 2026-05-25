@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import sys
+from datetime import date, datetime
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any, Sequence
@@ -18,9 +19,11 @@ from core.adapters.polygon.data import PolygonDataProvider
 from core.adapters.csv.data import CSVDataProvider
 from core.audit import AuditLogger, configure_runtime_logging
 from core.exceptions import ConfigError
+from core.privacy import build_strategy_aliases, is_customer_profile
 from core.risk.policy import RiskPolicy
 from core.engine.loader import get_registry
 from core.orders.strategy_modes import strategy_mode_map, validate_strategy_modes
+from core.startup import PositionOwnershipLedger
 from api.server import start_control_api_thread
 
 logging.basicConfig(
@@ -67,16 +70,8 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     config = _config_from_args(args)
-    audit_logger = AuditLogger.from_config(config)
-    logging_cfg = dict(config.get("logging") or {})
-    if audit_logger is not None:
-        configure_runtime_logging(
-            log_dir=audit_logger.log_dir,
-            level=str(logging_cfg.get("runtime_level", "INFO")),
-            enabled=audit_logger.enabled,
-        )
-
-    load_strategies()
+    strategy_packages = _strategy_packages(config)
+    load_strategies(strategy_packages)
     registry = get_registry()
     strategy_ids = config.get("strategies") or list(registry.keys())
     if isinstance(strategy_ids, str):
@@ -84,6 +79,21 @@ def main() -> None:
     strategy_ids = [str(strategy_id) for strategy_id in strategy_ids]
     validate_strategy_modes(config.get("strategy_modes"), registry.keys())
     strategy_modes = strategy_mode_map(config.get("strategy_modes"), strategy_ids)
+    metadata_profile = _metadata_profile(config)
+    strategy_aliases = build_strategy_aliases(
+        strategy_ids,
+        config.get("strategy_aliases") if isinstance(config.get("strategy_aliases"), dict) else {},
+    )
+    audit_logger = AuditLogger.from_config(config, strategy_aliases=strategy_aliases)
+    logging_cfg = dict(config.get("logging") or {})
+    if audit_logger is not None:
+        configure_runtime_logging(
+            log_dir=audit_logger.log_dir,
+            level=str(logging_cfg.get("runtime_level", "INFO")),
+            enabled=audit_logger.enabled,
+            profile=metadata_profile,
+            strategy_aliases=strategy_aliases,
+        )
 
     strategies = []
     for sid in strategy_ids:
@@ -98,8 +108,18 @@ def main() -> None:
     print(f"Execution: {broker.name}")
     print(f"IBKR environment: {config.get('mode', '')}")
     print(f"Data hist/live: {_provider_name(config, 'historical')} / {_provider_name(config, 'live')}")
-    print(f"Strategies: {strategy_ids}")
-    print(f"Strategy modes: {strategy_modes}")
+    if is_customer_profile(metadata_profile):
+        safe_ids = [strategy_aliases.get(strategy_id, "strategy") for strategy_id in strategy_ids]
+        safe_modes = {
+            strategy_aliases.get(strategy_id, "strategy"): mode
+            for strategy_id, mode in strategy_modes.items()
+        }
+        print(f"Strategies: {safe_ids}")
+        print(f"Strategy modes: {safe_modes}")
+        print(f"Runtime profile: {metadata_profile}")
+    else:
+        print(f"Strategies: {strategy_ids}")
+        print(f"Strategy modes: {strategy_modes}")
 
     default_risk = RiskPolicy(
         position_size_shares=int(config.get("position_size_shares", 1)),
@@ -116,11 +136,23 @@ def main() -> None:
         lookback_days=int(config.get("lookback_days", 500)),
         session_tz=str(config.get("session_timezone", "America/New_York")),
         adopted_position_map=_adopted_position_map(config),
+        startup_position_allocations=_adopted_position_allocations(config),
+        startup_position_mapping_enabled=_startup_mapping_enabled(config),
+        ownership_ledger=PositionOwnershipLedger.from_config(config),
         audit_logger=audit_logger,
         strategy_modes=strategy_modes,
+        metadata_profile=metadata_profile,
+        strategy_aliases=strategy_aliases,
         startup_position_gate_enabled=str(config.get("mode", "")).lower() == "live",
     )
-    api_server = _start_control_api(config, engine, strategy_ids, strategy_modes)
+    api_server = _start_control_api(
+        config,
+        engine,
+        strategy_ids,
+        strategy_modes,
+        metadata_profile=metadata_profile,
+        strategy_aliases=strategy_aliases,
+    )
 
     print("Running. Press Ctrl+C to stop.")
     try:
@@ -318,6 +350,23 @@ def _provider_name(config: dict[str, Any], key: str) -> str:
     return str(cfg.get("provider", "ibkr"))
 
 
+def _strategy_packages(config: dict[str, Any]) -> list[str]:
+    configured = config.get("strategy_packages") or ["strategies"]
+    if isinstance(configured, str):
+        return [configured]
+    return [str(item) for item in configured]
+
+
+def _metadata_profile(config: dict[str, Any]) -> str:
+    logging_cfg = dict(config.get("logging") or {})
+    return str(config.get("runtime_profile") or logging_cfg.get("profile") or "owner")
+
+
+def _startup_mapping_enabled(config: dict[str, Any]) -> bool:
+    api_cfg = dict(config.get("api") or {})
+    return bool(api_cfg.get("enabled", True))
+
+
 def _adopted_position_map(config: dict[str, Any]) -> dict[Instrument, str]:
     result: dict[Instrument, str] = {}
     for item in config.get("adopted_positions", []) or []:
@@ -326,10 +375,32 @@ def _adopted_position_map(config: dict[str, Any]) -> dict[Instrument, str]:
             symbol=item["symbol"],
             exchange=item.get("exchange"),
             currency=item.get("currency"),
+            expiry=_optional_date(item.get("expiry")),
+            strike=_optional_float(item.get("strike")),
+            right=item.get("right"),
             multiplier=float(item.get("multiplier", 1.0)),
         )
         result[instrument] = item["strategy_id"]
     return result
+
+
+def _adopted_position_allocations(config: dict[str, Any]) -> list[dict[str, Any]]:
+    allocations: list[dict[str, Any]] = []
+    for item in config.get("adopted_positions", []) or []:
+        allocation = dict(item)
+        allocation.setdefault("source", "config")
+        allocation["instrument"] = {
+            "asset_class": allocation.get("asset_class", "equity"),
+            "symbol": allocation.get("symbol"),
+            "exchange": allocation.get("exchange"),
+            "currency": allocation.get("currency"),
+            "expiry": allocation.get("expiry"),
+            "strike": allocation.get("strike"),
+            "right": allocation.get("right"),
+            "multiplier": allocation.get("multiplier", 1.0),
+        }
+        allocations.append(allocation)
+    return allocations
 
 
 def _strategy_risk(
@@ -362,11 +433,35 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _optional_date(value: Any) -> date | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if len(text) == 8 and text.isdigit():
+        return datetime.strptime(text, "%Y%m%d").date()
+    if len(text) == 6 and text.isdigit():
+        return datetime.strptime(text + "01", "%Y%m%d").date()
+    return date.fromisoformat(text)
+
+
 def _start_control_api(
     config: dict[str, Any],
     engine: Engine,
     strategy_ids: list[str],
     strategy_modes: Mapping[str, str] | None = None,
+    *,
+    metadata_profile: str = "owner",
+    strategy_aliases: Mapping[str, str] | None = None,
 ):
     api_cfg = dict(config.get("api") or {})
     if not bool(api_cfg.get("enabled", True)):
@@ -379,7 +474,13 @@ def _start_control_api(
         port=port,
         token_env=str(api_cfg.get("token_env", "IBKR_LT_API_TOKEN")),
         log_level=str(api_cfg.get("log_level", "warning")),
-        metadata=_api_metadata(config, strategy_ids, strategy_modes),
+        metadata=_api_metadata(
+            config,
+            strategy_ids,
+            strategy_modes,
+            metadata_profile=metadata_profile,
+            strategy_aliases=strategy_aliases,
+        ),
     )
     print(f"Control API: http://{host}:{port}")
     _warn_if_heartbeat_monitor_missing()
@@ -451,13 +552,23 @@ def _api_metadata(
     config: dict[str, Any],
     strategy_ids: list[str],
     strategy_modes: Mapping[str, str] | None = None,
+    *,
+    metadata_profile: str = "owner",
+    strategy_aliases: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     data = dict(config.get("data") or {})
     modes = dict(strategy_modes or strategy_mode_map(config.get("strategy_modes"), strategy_ids))
+    aliases = dict(strategy_aliases or {})
+    if is_customer_profile(metadata_profile):
+        safe_ids = [aliases.get(strategy_id, "strategy") for strategy_id in strategy_ids]
+        modes = {aliases.get(strategy_id, "strategy"): mode for strategy_id, mode in modes.items()}
+    else:
+        safe_ids = list(strategy_ids)
     return {
         "mode": str(config.get("mode", "")),
+        "runtime_profile": metadata_profile,
         "strategy_modes": modes,
-        "strategies": list(strategy_ids),
+        "strategies": safe_ids,
         "execution_provider": str(dict(config.get("execution") or {}).get("provider", "ibkr")),
         "historical_provider": str(dict(data.get("historical") or {}).get("provider", "ibkr")),
         "live_provider": str(dict(data.get("live") or {}).get("provider", "ibkr")),

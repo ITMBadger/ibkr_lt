@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, AsyncIterator
 
 from ...types import (
@@ -142,14 +142,12 @@ class IBKRBroker:
                     break
                 if self._account and item.get("account") != self._account:
                     continue
-                instr = Instrument(
-                    asset_class=_sec_type_to_asset_class(item.get("sec_type", "STK")),
-                    symbol=item["symbol"],
-                )
+                instr = _instrument_from_ibkr_item(item)
                 positions.append(Position(
                     instrument=instr,
                     quantity=item["position"],
                     avg_cost=item["avg_cost"],
+                    metadata=_broker_metadata(item),
                 ))
         except asyncio.TimeoutError:
             log.warning("positions request timed out")
@@ -231,10 +229,7 @@ class IBKRBroker:
         while True:
             item = await self._client.fill_queue.get()
             side = "long" if item.get("side", "").upper() in ("BOT", "B") else "short"
-            instr = Instrument(
-                asset_class=_sec_type_to_asset_class(item.get("sec_type", "STK")),
-                symbol=item["symbol"],
-            )
+            instr = _instrument_from_ibkr_item(item)
             yield Fill(
                 broker_order_id=item["order_id"],
                 instrument=instr,
@@ -255,3 +250,68 @@ def _sec_type_to_asset_class(sec_type: str) -> str:
         "CRYPTO": "crypto_spot",
     }
     return mapping.get(sec_type.upper(), "equity")
+
+
+def _instrument_from_ibkr_item(item: dict) -> Instrument:
+    asset_class = _sec_type_to_asset_class(str(item.get("sec_type", "STK")))
+    return Instrument(
+        asset_class=asset_class,
+        symbol=str(item["symbol"]),
+        exchange=_non_empty(item.get("exchange")),
+        currency=_non_empty(item.get("currency")),
+        expiry=_parse_ibkr_expiry(item.get("last_trade_date")),
+        strike=_parse_optional_float(item.get("strike")),
+        right=_non_empty(item.get("right")),  # type: ignore[arg-type]
+        multiplier=_parse_multiplier(item.get("multiplier")),
+    )
+
+
+def _broker_metadata(item: dict) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    con_id = _non_empty(item.get("con_id"))
+    local_symbol = _non_empty(item.get("local_symbol"))
+    if con_id:
+        metadata["broker_con_id"] = con_id
+    if local_symbol:
+        metadata["local_symbol"] = local_symbol
+    return metadata
+
+
+def _parse_ibkr_expiry(value) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if len(text) == 8 and text.isdigit():
+            return datetime.strptime(text, "%Y%m%d").date()
+        if len(text) == 6 and text.isdigit():
+            return datetime.strptime(text + "01", "%Y%m%d").date()
+        return date.fromisoformat(text)
+    except ValueError:
+        log.warning("Ignoring unparsable IBKR contract expiry %r", value)
+        return None
+
+
+def _parse_optional_float(value) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed != 0.0 else None
+
+
+def _parse_multiplier(value) -> float:
+    if value is None or value == "":
+        return 1.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return parsed if parsed > 0 else 1.0
+
+
+def _non_empty(value) -> str | None:
+    text = str(value or "").strip()
+    return text or None

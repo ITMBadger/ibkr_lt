@@ -27,9 +27,15 @@ from core.audit.logger import allocate_run_log_dir
 from core.engine.loader import get_registry
 from core.engine.timeframes import Timeframe
 from core.exceptions import ConfigError
+from core.privacy import build_strategy_aliases, redact_payload
 from core.risk.policy import SIZING_MODE_FULL_EQUITY, RiskPolicy
 
-from .config import BacktestSettings, load_yaml_config, resolve_settings
+from .config import (
+    BacktestSettings,
+    load_yaml_config,
+    resolve_settings,
+    resolve_strategy_packages,
+)
 from .loaders import (
     build_csv_provider,
     instantiate_strategies,
@@ -140,7 +146,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     try:
         args = parse_args(argv)
         config = load_yaml_config(args.config)
-        load_strategies()
+        load_strategies(resolve_strategy_packages(config))
         registry = get_registry()
         settings = resolve_settings(
             args=args,
@@ -244,12 +250,24 @@ def run_backtest(
             parallel_stats.get("workers") if parallel_stats else None,
         )
 
-    audit_logger, run_dir = _build_audit_logger(settings)
+    profile = str(dict(settings.logging or {}).get("profile", "owner"))
+    strategy_aliases = build_strategy_aliases(
+        settings.strategy_ids,
+        dict(settings.logging or {}).get("strategy_aliases")
+        if isinstance(dict(settings.logging or {}).get("strategy_aliases"), dict)
+        else {},
+    )
+    audit_logger, run_dir = _build_audit_logger(
+        settings,
+        strategy_aliases=strategy_aliases,
+    )
     logging_cfg = dict(settings.logging or {})
     configure_runtime_logging(
         log_dir=run_dir,
         level=str(logging_cfg.get("runtime_level", "INFO")),
         enabled=settings.audit_enabled,
+        profile=profile,
+        strategy_aliases=strategy_aliases,
     )
 
     clock = SimulatedClock()
@@ -284,6 +302,8 @@ def run_backtest(
         progress_total_bars=len(replay_bars),
         progress_interval_bars=settings.progress_interval_bars,
         progress_interval_seconds=settings.progress_interval_seconds,
+        metadata_profile=profile,
+        strategy_aliases=strategy_aliases,
     )
 
     log.info(
@@ -359,11 +379,16 @@ def run_backtest(
             ),
         },
     }
-    summary_path = write_summary(run_dir, summary)
+    summary_to_write = redact_payload(
+        summary,
+        profile=profile,
+        aliases=strategy_aliases,
+    )
+    summary_path = write_summary(run_dir, summary_to_write)
     try:
         report = write_html_report(
             run_dir=run_dir,
-            summary=summary,
+            summary=summary_to_write,
             replay_bars=replay_bars,
             initial_equity=float(initial_account.net_liquidation),
         )
@@ -378,7 +403,12 @@ def run_backtest(
         "metrics": report.metrics,
         "warnings": report.warnings,
     }
-    summary_path = write_summary(run_dir, summary)
+    summary_to_write = redact_payload(
+        summary,
+        profile=profile,
+        aliases=strategy_aliases,
+    )
+    summary_path = write_summary(run_dir, summary_to_write)
     return BacktestResult(
         run_dir=run_dir,
         summary_path=summary_path,
@@ -388,7 +418,11 @@ def run_backtest(
     )
 
 
-def _build_audit_logger(settings: BacktestSettings) -> tuple[AuditLogger | None, Path]:
+def _build_audit_logger(
+    settings: BacktestSettings,
+    *,
+    strategy_aliases: dict[str, str] | None = None,
+) -> tuple[AuditLogger | None, Path]:
     if not settings.audit_enabled:
         return None, allocate_run_log_dir(settings.output_dir)
     cfg = dict(settings.logging or {})
@@ -400,6 +434,7 @@ def _build_audit_logger(settings: BacktestSettings) -> tuple[AuditLogger | None,
         decision_scope=str(cfg.get("decision_scope", "trigger_and_interval")),
         decision_interval_minutes=int(cfg.get("decision_interval_minutes", 30)),
         run_subdir=True,
+        strategy_aliases=strategy_aliases,
     )
     return audit_logger, audit_logger.log_dir
 
