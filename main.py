@@ -101,21 +101,24 @@ def main() -> None:
     print(f"Strategies: {strategy_ids}")
     print(f"Strategy modes: {strategy_modes}")
 
+    default_risk = RiskPolicy(
+        position_size_shares=int(config.get("position_size_shares", 1)),
+        max_order_quantity=_optional_int(config.get("max_order_quantity", 2)),
+    )
     engine = Engine(
         broker=broker,
         data_feed=data_feed,
         clock=WallClock(),
         strategies=strategies,
-        risk=RiskPolicy(
-            position_size_shares=int(config.get("position_size_shares", 1)),
-            max_order_quantity=int(config.get("max_order_quantity", 2)),
-        ),
+        risk=default_risk,
+        strategy_risk=_strategy_risk(config, strategy_ids, default_risk),
         thread_pool_workers=int(config.get("thread_pool_workers", 4)),
         lookback_days=int(config.get("lookback_days", 500)),
         session_tz=str(config.get("session_timezone", "America/New_York")),
         adopted_position_map=_adopted_position_map(config),
         audit_logger=audit_logger,
         strategy_modes=strategy_modes,
+        startup_position_gate_enabled=str(config.get("mode", "")).lower() == "live",
     )
     api_server = _start_control_api(config, engine, strategy_ids, strategy_modes)
 
@@ -327,6 +330,36 @@ def _adopted_position_map(config: dict[str, Any]) -> dict[Instrument, str]:
         )
         result[instrument] = item["strategy_id"]
     return result
+
+
+def _strategy_risk(
+    config: dict[str, Any],
+    strategy_ids: Sequence[str],
+    default_risk: RiskPolicy,
+) -> dict[str, RiskPolicy]:
+    configured = dict(config.get("strategy_risk") or {})
+    result: dict[str, RiskPolicy] = {}
+    for strategy_id in strategy_ids:
+        item = configured.get(strategy_id)
+        if not isinstance(item, dict):
+            continue
+        result[str(strategy_id)] = RiskPolicy(
+            position_size_shares=int(
+                item.get("position_size_shares", default_risk.position_size_shares)
+            ),
+            max_order_quantity=_optional_int(
+                item.get("max_order_quantity", default_risk.max_order_quantity)
+            ),
+            sizing_mode=default_risk.sizing_mode,
+            equity_fraction=default_risk.equity_fraction,
+        )
+    return result
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 def _start_control_api(

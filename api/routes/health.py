@@ -17,7 +17,10 @@ async def health(
     connection = dict(snap.get("connection") or {})
     connected = bool(connection.get("connected"))
     running = bool(snap.get("running"))
-    if not running:
+    if snap.get("phase") == "awaiting_startup_mapping":
+        next_endpoint = "/api/v1/startup/gate"
+        operator_message = "Live startup is waiting for broker position mapping."
+    elif not running:
         next_endpoint = "/api/v1/health"
         operator_message = "Engine is not running yet. Start the runtime or poll health again."
     elif not connected:

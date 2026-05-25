@@ -33,6 +33,29 @@ class _SnapshotEngine:
     def snapshot_state(self) -> dict:
         return dict(self.snapshot)
 
+    def startup_gate_status(self) -> dict:
+        return {
+            "enabled": True,
+            "phase": "awaiting_mapping",
+            "positions": [{"position_id": "position:equity:QQQ:long"}],
+            "allocations": [],
+            "unmanaged": [],
+        }
+
+    def submit_startup_mappings(self, allocations: list[dict]) -> dict:
+        if not allocations:
+            raise ValueError("at least one allocation is required")
+        return {
+            **self.startup_gate_status(),
+            "allocations": allocations,
+        }
+
+    def request_startup_gate_refresh(self) -> dict:
+        return {
+            **self.startup_gate_status(),
+            "message": "Startup position refresh requested.",
+        }
+
 
 async def _client(app):
     transport = httpx.ASGITransport(app=app)
@@ -94,6 +117,45 @@ async def test_positions_and_events_use_engine_snapshot():
         assert positions.json()["broker"][0]["instrument"]["symbol"] == "MES"
         assert events.status_code == 200
         assert events.json()[0]["message"] == "ready"
+
+
+@pytest.mark.anyio
+async def test_startup_gate_endpoints_require_auth_and_use_engine():
+    app = create_control_api_app(_SnapshotEngine(), api_token="secret")
+    async for client in _client(app):
+        assert (await client.get("/api/v1/startup/gate")).status_code == 401
+
+        headers = {"Authorization": "Bearer secret"}
+        gate = await client.get("/api/v1/startup/gate", headers=headers)
+        assert gate.status_code == 200
+        assert gate.json()["phase"] == "awaiting_mapping"
+
+        bad = await client.post(
+            "/api/v1/startup/mappings",
+            json={"allocations": []},
+            headers=headers,
+        )
+        assert bad.status_code == 400
+
+        mapped = await client.post(
+            "/api/v1/startup/mappings",
+            json={
+                "allocations": [
+                    {
+                        "position_id": "position:equity:QQQ:long",
+                        "strategy_id": "example_live_strategy",
+                        "entry_ts": "2026-05-25T10:18:00-04:00",
+                    }
+                ]
+            },
+            headers=headers,
+        )
+        assert mapped.status_code == 200
+        assert mapped.json()["allocations"][0]["strategy_id"] == "example_live_strategy"
+
+        refresh = await client.post("/api/v1/startup/refresh", headers=headers)
+        assert refresh.status_code == 200
+        assert refresh.json()["message"] == "Startup position refresh requested."
 
 
 def test_local_control_hosts_can_run_without_token(monkeypatch):

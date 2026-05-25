@@ -1,6 +1,8 @@
 # Guardrails
 
-This document lists the safety controls currently active in the MVP framework, and what is deferred to later phases.
+This document lists the safety controls currently active in the MVP framework.
+Deferred controls and future hardening work are tracked in the local roadmap
+area under `docs/roadmap/`.
 
 ## What Is Active (MVP)
 
@@ -167,30 +169,6 @@ The FastAPI control API is read-only in the current framework. It exposes health
 - The missing-monitor warning is built into API startup and is skipped only when `--no-api` disables the API.
 - The missing-monitor warning is non-blocking; the engine still starts and runs when API is enabled.
 - Never calls broker adapters, `OrderManager`, strategies, or mutating endpoints.
-
----
-
-## What Is Deferred (Phase 7+)
-
-These controls existed in the archived legacy system and will be ported back once the framework spine is proven.
-
-| Control | Legacy location | Status |
-|---|---|---|
-| Centralized entry window gate (`min_entry_time`, `max_entry_time`) | archived runtime policy | Deferred; bundled strategies still apply their own local entry windows |
-| Daily drawdown kill switch | archived runtime state + heartbeat | Deferred |
-| Priority pairs (long/short conflict prevention) | archived priority-pair policy | Deferred |
-| Additional portfolio/trade policies beyond `single_position`, `multi_position`, and entry frequency | archived trade policy | Deferred |
-| Trigger dedup (same `trigger_ts` across bars) | archived dispatcher | Deferred |
-| L1 session filters | archived central runtime | Deferred |
-| Manual startup adoption review workflow | archived adoption workflow | Deferred |
-| Open-order reconciliation | archived open-order workflow | Deferred |
-| Broker-native bracket management | archived execution service | Deferred |
-| General runtime close-percent protective stops | strategy/runtime policy | Deferred; configured broker-side fill-price stops are active |
-| JSON state persistence | archived runtime persistence | Deferred |
-| Buying-power check (warning) | archived central runtime | Deferred |
-| Mutating Hermes/API command bus | archived `RuntimeCommandBus` | Deferred; current API is read-only |
-
----
 
 ## Infrastructure Safety
 

@@ -41,7 +41,7 @@ from ..interfaces.strategy import (
     StrategyKernel,
 )
 from ..risk.policy import RiskPolicy
-from ..types import Bar, Fill, Instrument, Position, Signal
+from ..types import Bar, Fill, Instrument, Position, PositionAdoption, Signal
 from .clock import Clock, SimulatedClock, WallClock
 from .scheduler import Scheduler
 
@@ -55,6 +55,7 @@ _ORDER_TASK_YIELD_SECONDS = 0.001
 _DISPATCH_MODE_EVENT = "event"
 _DISPATCH_MODE_FAST_EVENT = "fast_event"
 _DISPATCH_MODE_PARALLEL = "parallel"
+_PHASE_AWAITING_STARTUP_MAPPING = "awaiting_startup_mapping"
 
 
 class Engine:
@@ -72,6 +73,7 @@ class Engine:
         clock: Clock | None = None,
         strategies: list[tuple[StrategyKernel, dict]] | None = None,
         risk: RiskPolicy | None = None,
+        strategy_risk: Mapping[str, RiskPolicy] | None = None,
         thread_pool_workers: int = 4,
         lookback_days: int = 500,
         session_tz: str = "America/New_York",
@@ -86,6 +88,7 @@ class Engine:
         progress_total_bars: int | None = None,
         progress_interval_bars: int = 1000,
         progress_interval_seconds: float = 30.0,
+        startup_position_gate_enabled: bool = False,
     ) -> None:
         self._broker = broker
         if data_feed is not None:
@@ -113,6 +116,7 @@ class Engine:
             interval_seconds=progress_interval_seconds,
         )
         self._risk = risk or RiskPolicy()
+        self._strategy_risk = dict(strategy_risk or {})
         self._pool_workers = thread_pool_workers
         self._lookback_days = lookback_days
         self._session_tz = session_tz
@@ -130,6 +134,20 @@ class Engine:
         self._managers: dict[Instrument, DataManager] = {}
         self._portfolio: PortfolioState | None = None
         self._recent_events: list[dict[str, Any]] = []
+        self._startup_position_gate_enabled = bool(startup_position_gate_enabled)
+        self._startup_gate_status: dict[str, Any] = {
+            "enabled": self._startup_position_gate_enabled,
+            "phase": "inactive",
+            "message": "",
+            "positions": [],
+            "allocations": [],
+            "unmanaged": [],
+            "last_error": None,
+        }
+        self._startup_gate_event: asyncio.Event | None = None
+        self._startup_gate_loop: asyncio.AbstractEventLoop | None = None
+        self._startup_gate_action: str | None = None
+        self._startup_gate_submitted_allocations: list[dict[str, Any]] | None = None
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -152,7 +170,11 @@ class Engine:
             state = {
                 "timestamp_utc": now.isoformat(),
                 "phase": self._phase,
-                "running": self._phase in {"starting", "running"},
+                "running": self._phase in {
+                    "starting",
+                    "running",
+                    _PHASE_AWAITING_STARTUP_MAPPING,
+                },
                 "started_at": to_jsonable(self._started_at),
                 "stopped_at": to_jsonable(self._stopped_at),
                 "last_error": self._last_error,
@@ -210,7 +232,15 @@ class Engine:
                 "risk": {
                     "position_size_shares": self._risk.position_size_shares,
                     "max_order_quantity": self._risk.max_order_quantity,
+                    "strategy_risk": {
+                        strategy_id: {
+                            "position_size_shares": risk.position_size_shares,
+                            "max_order_quantity": risk.max_order_quantity,
+                        }
+                        for strategy_id, risk in sorted(self._strategy_risk.items())
+                    },
                 },
+                "startup_gate": to_jsonable(dict(self._startup_gate_status)),
                 "recent_events": list(self._recent_events),
             }
 
@@ -265,6 +295,11 @@ class Engine:
         self._set_managers(managers)
         features = FeatureRegistry(managers)
         bar_builders: dict[Instrument, BarBuilder] = {}
+        strategy_entries: list[tuple[StrategyKernel, dict]] = []
+        for kernel, initial_state in self._strategies:
+            state: dict = dict(initial_state)
+            kernel.on_start(state)
+            strategy_entries.append((kernel, state))
 
         self._progress.info(
             "Engine setup starting strategies=%s dispatch_mode=%s progress_total_bars=%s",
@@ -288,18 +323,41 @@ class Engine:
         sizing_account = _MarkToMarketSizingState(account_snapshot.net_liquidation)
         adopted = await self._broker.get_positions()
         if adopted:
-            strategy_map = self._resolve_adopted_position_map(adopted)
-            portfolio.adopt_positions(adopted, strategy_map)
-            for position in adopted:
-                sid = strategy_map.get(position.instrument)
-                owner = sid if sid else "unmapped"
-                log.warning(
-                    "Adopted broker position: %s %.4f avg_cost=%.4f owner=%s",
-                    position.instrument.symbol,
-                    position.quantity,
-                    position.avg_cost,
-                    owner,
+            if self._startup_position_gate_enabled:
+                portfolio.adopt_positions(adopted)
+                allocations = await self._run_startup_position_gate(
+                    adopted,
+                    strategy_entries,
                 )
+                self._adopt_startup_position_allocations(
+                    allocations,
+                    adopted,
+                    strategy_entries,
+                    portfolio,
+                )
+            else:
+                strategy_map = self._resolve_adopted_position_map(adopted)
+                portfolio.adopt_positions(adopted, strategy_map)
+                for position in adopted:
+                    sid = strategy_map.get(position.instrument)
+                    owner = sid if sid else "unmapped"
+                    log.warning(
+                        "Adopted broker position: %s %.4f avg_cost=%.4f owner=%s",
+                        position.instrument.symbol,
+                        position.quantity,
+                        position.avg_cost,
+                        owner,
+                    )
+        elif self._startup_position_gate_enabled:
+            self._set_startup_gate_status({
+                "enabled": True,
+                "phase": "clear",
+                "message": "No broker positions found; startup can continue.",
+                "positions": [],
+                "allocations": [],
+                "unmanaged": [],
+                "last_error": None,
+            })
         protective_stops = {
             kernel.SPEC.id: kernel.SPEC.protective_stop
             for kernel, _ in self._strategies
@@ -388,10 +446,8 @@ class Engine:
 
         # Register strategies in scheduler
         scheduler = Scheduler(features)
-        for kernel, initial_state in self._strategies:
-            state: dict = dict(initial_state)
+        for kernel, state in strategy_entries:
             scheduler.register(kernel, state)
-            kernel.on_start(state)
         last_evaluation_bars: dict[str, datetime] = {}
 
         # Start background tasks
@@ -766,6 +822,42 @@ class Engine:
             return []
         return list(by_timestamp.get(_normalize_precomputed_timestamp(timestamp), ()))
 
+    def startup_gate_status(self) -> dict[str, Any]:
+        with self._state_lock:
+            return to_jsonable(dict(self._startup_gate_status))
+
+    def submit_startup_mappings(self, allocations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        with self._state_lock:
+            try:
+                normalized = self._validate_startup_allocations_locked(allocations)
+            except ValueError as exc:
+                self._startup_gate_status["last_error"] = str(exc)
+                self._write_startup_order_event(
+                    "startup_position_mapping_rejected",
+                    reason=str(exc),
+                    allocations=list(allocations),
+                )
+                raise
+            self._startup_gate_submitted_allocations = normalized
+            self._startup_gate_action = "continue"
+            self._startup_gate_status["allocations"] = normalized
+            self._startup_gate_status["last_error"] = None
+            event = self._startup_gate_event
+            loop = self._startup_gate_loop
+        if event is not None and loop is not None:
+            loop.call_soon_threadsafe(event.set)
+        return self.startup_gate_status()
+
+    def request_startup_gate_refresh(self) -> dict[str, Any]:
+        with self._state_lock:
+            self._startup_gate_action = "refresh"
+            self._startup_gate_status["message"] = "Startup position refresh requested."
+            event = self._startup_gate_event
+            loop = self._startup_gate_loop
+        if event is not None and loop is not None:
+            loop.call_soon_threadsafe(event.set)
+        return self.startup_gate_status()
+
     def _has_entry_capacity(self, kernel: StrategyKernel, open_positions: int) -> bool:
         limit = kernel.SPEC.position_policy.max_concurrent_positions
         if limit is None:
@@ -843,6 +935,10 @@ class Engine:
             **fields,
         })
 
+    def _write_startup_order_event(self, event: str, **fields: Any) -> None:
+        if self._audit is not None:
+            self._audit.order({"event": event, **fields})
+
     def _set_managers(self, managers: dict[Instrument, DataManager]) -> None:
         with self._state_lock:
             self._managers = dict(managers)
@@ -888,6 +984,264 @@ class Engine:
         with self._state_lock:
             self._recent_events.append(event)
             self._recent_events = self._recent_events[-200:]
+
+    def _set_startup_gate_status(self, status: Mapping[str, Any]) -> None:
+        with self._state_lock:
+            self._startup_gate_status = to_jsonable(dict(status))
+
+    async def _run_startup_position_gate(
+        self,
+        positions: list[Position],
+        strategy_entries: list[tuple[StrategyKernel, dict]],
+    ) -> list[dict[str, Any]]:
+        self._startup_gate_loop = asyncio.get_running_loop()
+        self._startup_gate_event = asyncio.Event()
+        current_positions = list(positions)
+        while True:
+            status = self._build_startup_gate_status(current_positions, strategy_entries)
+            self._set_startup_gate_status(status)
+            self._log_startup_gate_status(status)
+            if status["phase"] == "clear":
+                return []
+
+            self._set_runtime_state(phase=_PHASE_AWAITING_STARTUP_MAPPING)
+            log.warning(
+                "Startup paused: %s",
+                status.get("message", "broker positions require mapping"),
+            )
+            while True:
+                await self._startup_gate_event.wait()
+                self._startup_gate_event.clear()
+                with self._state_lock:
+                    action = self._startup_gate_action
+                    self._startup_gate_action = None
+                    allocations = list(self._startup_gate_submitted_allocations or [])
+                    if action == "continue":
+                        self._startup_gate_submitted_allocations = None
+                if action == "refresh":
+                    current_positions = await self._broker.get_positions()
+                    break
+                if action == "continue":
+                    self._write_startup_order_event(
+                        "startup_gate_released",
+                        allocations=allocations,
+                    )
+                    self._set_runtime_state(phase="starting")
+                    return allocations
+
+    def _build_startup_gate_status(
+        self,
+        positions: list[Position],
+        strategy_entries: list[tuple[StrategyKernel, dict]],
+    ) -> dict[str, Any]:
+        candidates_by_key: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for kernel, _ in strategy_entries:
+            strategy_id = kernel.SPEC.id
+            risk = self._risk_for_strategy(strategy_id)
+            candidates_by_key[_instrument_match_key(kernel.SPEC.execution_instrument)].append({
+                "strategy_id": strategy_id,
+                "position_mode": kernel.SPEC.position_policy.position_mode,
+                "mode": self._strategy_modes.get(strategy_id, "live"),
+                "supports_position_adoption": (
+                    kernel.SPEC.position_policy.supports_position_adoption
+                ),
+                "required_fields": list(kernel.POSITION_ADOPTION_REQUIRED_FIELDS),
+                "position_size_shares": float(risk.position_size_shares),
+                "max_order_quantity": risk.max_order_quantity,
+            })
+
+        required: list[dict[str, Any]] = []
+        unmanaged: list[dict[str, Any]] = []
+        for position in positions:
+            item = _position_gate_item(position)
+            candidates = candidates_by_key.get(_instrument_match_key(position.instrument), [])
+            if not candidates:
+                unmanaged.append({**item, "reason": "instrument_not_used_by_enabled_strategies"})
+                continue
+            required.append({**item, "candidates": candidates})
+
+        phase = "awaiting_mapping" if required else "clear"
+        message = (
+            "Broker positions require API mapping before live startup can continue."
+            if required
+            else "No broker positions match enabled strategy execution instruments."
+        )
+        return {
+            "enabled": True,
+            "phase": phase,
+            "message": message,
+            "positions": required,
+            "allocations": [],
+            "unmanaged": unmanaged,
+            "last_error": None,
+        }
+
+    def _log_startup_gate_status(self, status: Mapping[str, Any]) -> None:
+        for item in status.get("unmanaged", []) or []:
+            self._write_startup_order_event("startup_position_unmanaged", position=item)
+            log.warning(
+                "Startup broker position unmanaged: %s %.4f reason=%s",
+                item.get("symbol"),
+                item.get("quantity"),
+                item.get("reason"),
+            )
+        for item in status.get("positions", []) or []:
+            self._write_startup_order_event("startup_position_mapping_required", position=item)
+            log.warning(
+                "Startup broker position requires mapping: %s %.4f candidates=%s",
+                item.get("symbol"),
+                item.get("quantity"),
+                [c.get("strategy_id") for c in item.get("candidates", [])],
+            )
+
+    def _validate_startup_allocations_locked(
+        self,
+        allocations: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if self._startup_gate_status.get("phase") != "awaiting_mapping":
+            raise ValueError("startup gate is not awaiting position mappings")
+        if not allocations:
+            raise ValueError("at least one allocation is required")
+
+        positions = {
+            item["position_id"]: item
+            for item in self._startup_gate_status.get("positions", [])
+        }
+        allocated_by_position: dict[str, float] = defaultdict(float)
+        allocated_by_strategy_position: dict[tuple[str, str], int] = defaultdict(int)
+        normalized: list[dict[str, Any]] = []
+
+        for raw in allocations:
+            position_id = str(raw.get("position_id", "")).strip()
+            strategy_id = str(raw.get("strategy_id", "")).strip()
+            if position_id not in positions:
+                raise ValueError(f"unknown startup position_id: {position_id!r}")
+            position = positions[position_id]
+            candidates = {
+                item["strategy_id"]: item
+                for item in position.get("candidates", [])
+            }
+            candidate = candidates.get(strategy_id)
+            if candidate is None:
+                raise ValueError(
+                    f"strategy {strategy_id!r} cannot adopt position {position_id!r}"
+                )
+            if candidate.get("mode") == "dry_run":
+                raise ValueError(f"dry-run strategy {strategy_id!r} cannot adopt live positions")
+            if not candidate.get("supports_position_adoption"):
+                raise ValueError(f"strategy {strategy_id!r} does not support position adoption")
+
+            required_fields = set(candidate.get("required_fields", []))
+            entry_ts = raw.get("entry_ts")
+            parsed_entry_ts = _parse_optional_timestamp(entry_ts)
+            if "entry_ts" in required_fields and parsed_entry_ts is None:
+                raise ValueError(f"strategy {strategy_id!r} requires entry_ts for adoption")
+
+            quantity = float(candidate.get("position_size_shares", 0.0))
+            if quantity <= 0:
+                raise ValueError(f"strategy {strategy_id!r} has invalid position size {quantity}")
+            allocated_by_position[position_id] += quantity
+            available = abs(float(position.get("quantity", 0.0)))
+            if allocated_by_position[position_id] - available > 1e-9:
+                raise ValueError(
+                    f"allocated quantity {allocated_by_position[position_id]} exceeds "
+                    f"broker quantity {available} for {position_id}"
+                )
+
+            strategy_position_key = (position_id, strategy_id)
+            allocated_by_strategy_position[strategy_position_key] += 1
+            if (
+                allocated_by_strategy_position[strategy_position_key] > 1
+                and candidate.get("position_mode") != POSITION_MODE_MULTI
+            ):
+                raise ValueError(
+                    f"strategy {strategy_id!r} is not multi-position and cannot adopt multiple lots"
+                )
+
+            normalized.append({
+                "position_id": position_id,
+                "strategy_id": strategy_id,
+                "quantity": quantity,
+                "entry_ts": parsed_entry_ts.isoformat() if parsed_entry_ts else None,
+                "trade_id": str(raw.get("trade_id") or "") or None,
+            })
+        return normalized
+
+    def _adopt_startup_position_allocations(
+        self,
+        allocations: Sequence[Mapping[str, Any]],
+        broker_positions: list[Position],
+        strategy_entries: list[tuple[StrategyKernel, dict]],
+        portfolio: PortfolioState,
+    ) -> None:
+        if not allocations:
+            return
+        positions_by_id = {
+            _position_id(position): position
+            for position in broker_positions
+        }
+        strategy_by_id = {
+            kernel.SPEC.id: (kernel, state)
+            for kernel, state in strategy_entries
+        }
+        allocated_by_position: dict[str, float] = defaultdict(float)
+        for allocation in allocations:
+            position_id = str(allocation["position_id"])
+            strategy_id = str(allocation["strategy_id"])
+            broker_position = positions_by_id[position_id]
+            kernel, state = strategy_by_id[strategy_id]
+            quantity = float(allocation["quantity"])
+            signed_quantity = quantity if broker_position.quantity > 0 else -quantity
+            entry_ts = _parse_optional_timestamp(allocation.get("entry_ts"))
+            adoption = PositionAdoption(
+                strategy_id=strategy_id,
+                quantity=quantity,
+                entry_ts=entry_ts,
+                trade_id=allocation.get("trade_id"),
+                source_position_id=position_id,
+            )
+            candidate_position = Position(
+                instrument=broker_position.instrument,
+                quantity=signed_quantity,
+                avg_cost=broker_position.avg_cost,
+                trade_id=adoption.trade_id,
+            )
+            adopted_position = kernel.on_adopt_position(candidate_position, adoption, state)
+            if adopted_position is None:
+                raise RuntimeError(f"strategy {strategy_id!r} rejected adopted position")
+            portfolio.adopt_strategy_position(strategy_id, adopted_position)
+            allocated_by_position[position_id] += quantity
+            self._write_startup_order_event(
+                "startup_position_mapped",
+                strategy_id=strategy_id,
+                position=adopted_position,
+                adoption=adoption,
+            )
+            log.warning(
+                "Startup mapped broker position: %s %.4f to %s trade_id=%s",
+                adopted_position.instrument.symbol,
+                adopted_position.quantity,
+                strategy_id,
+                adopted_position.trade_id,
+            )
+
+        for position_id, position in positions_by_id.items():
+            remaining = abs(position.quantity) - allocated_by_position.get(position_id, 0.0)
+            if remaining > 1e-9:
+                self._write_startup_order_event(
+                    "startup_position_unmanaged",
+                    position=_position_gate_item(position),
+                    unmanaged_quantity=remaining,
+                    reason="unallocated_remainder",
+                )
+                log.warning(
+                    "Startup broker position remainder unmanaged: %s %.4f",
+                    position.instrument.symbol,
+                    remaining,
+                )
+
+    def _risk_for_strategy(self, strategy_id: str) -> RiskPolicy:
+        return self._strategy_risk.get(strategy_id, self._risk)
 
 
 class _EngineProgress:
@@ -1128,7 +1482,45 @@ class _MarkToMarketSizingState:
             self._positions.pop(fill.instrument, None)
         else:
             self._positions[fill.instrument] = new_qty
-        self._latest_prices.setdefault(fill.instrument, float(fill.price))
+            self._latest_prices.setdefault(fill.instrument, float(fill.price))
+
+
+def _instrument_match_key(instrument: Instrument) -> tuple[str, str]:
+    return (str(instrument.asset_class).lower(), str(instrument.symbol).upper())
+
+
+def _position_id(position: Position) -> str:
+    return (
+        f"position:{position.instrument.asset_class}:"
+        f"{str(position.instrument.symbol).upper()}:{position.side}"
+    )
+
+
+def _position_gate_item(position: Position) -> dict[str, Any]:
+    return {
+        "position_id": _position_id(position),
+        "asset_class": position.instrument.asset_class,
+        "symbol": position.instrument.symbol,
+        "side": position.side,
+        "quantity": position.quantity,
+        "avg_cost": position.avg_cost,
+        "instrument": position.instrument,
+    }
+
+
+def _parse_optional_timestamp(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        ts = value
+    else:
+        try:
+            ts = datetime.fromisoformat(str(value))
+        except ValueError as exc:
+            raise ValueError(f"invalid entry_ts: {value!r}") from exc
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 def _signed_fill_quantity(fill: Fill) -> float:

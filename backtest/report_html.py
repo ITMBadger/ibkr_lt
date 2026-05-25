@@ -503,6 +503,12 @@ def _compute_metrics(series: _AccountSeries, initial_equity: float) -> dict[str,
     }
 
 
+
+
+# =============================================================================
+# HTML RENDERING  (Chart.js + Modern CSS)
+# =============================================================================
+
 def _render_report_html(
     *,
     summary: dict[str, Any],
@@ -517,18 +523,193 @@ def _render_report_html(
     if not strategy_label:
         strategy_label = "Backtest"
 
-    equity_series = [
-        (
-            point.timestamp.astimezone(session_tz).strftime("%Y-%m-%d %H:%M"),
-            point.equity / initial_equity if initial_equity else 1.0,
-        )
-        for point in series.equity_points
-    ]
-    drawdown_series = _compute_drawdown_series(series.equity_points, session_tz)
-    monthly_values = list(series.monthly_returns.values())
+    # --- Data preparation for charts ---
+    equity_labels: list[str] = []
+    equity_values: list[float] = []
+    for point in series.equity_points:
+        equity_labels.append(point.timestamp.astimezone(session_tz).strftime("%Y-%m-%d"))
+        equity_values.append(round(point.equity / initial_equity, 4) if initial_equity else 1.0)
+    equity_labels, equity_values = _downsample_pairs(list(zip(equity_labels, equity_values)), 900)
+
+    dd_labels: list[str] = []
+    dd_values: list[float] = []
+    for point in series.equity_points:
+        dd_labels.append(point.timestamp.astimezone(session_tz).strftime("%Y-%m-%d"))
+    dd_labels, dd_values = _downsample_pairs(list(zip(dd_labels, _drawdown_values(series.equity_points))), 900)
+
     rolling = _rolling_monthly(series.monthly_returns)
+    rolling_labels = [r[0] for r in rolling]
+    rolling_rets = [round(r[1], 4) for r in rolling]
+    rolling_vols = [round(r[2], 4) for r in rolling]
+
+    yearly_data = [(str(y), round(v, 4)) for y, v in sorted(series.yearly_returns.items())]
+    monthly_dist = [round(v, 4) for v in series.monthly_returns.values()]
+    monthly_dist_labels = [f"{y}-{m:02d}" for (y, m), v in sorted(series.monthly_returns.items())]
+
+    # --- Chart configurations as JSON ---
+    equity_config = json.dumps({
+        "type": "line",
+        "data": {
+            "labels": equity_labels,
+            "datasets": [{
+                "label": "Equity Multiple",
+                "data": equity_values,
+                "borderColor": "#0f5e9c",
+                "backgroundColor": "rgba(15, 94, 156, 0.08)",
+                "fill": True,
+                "tension": 0.15,
+                "pointRadius": 0,
+                "pointHoverRadius": 5,
+                "borderWidth": 2,
+            }]
+        },
+        "options": {
+            "responsive": True,
+            "maintainAspectRatio": False,
+            "interaction": {"intersect": False, "mode": "index"},
+            "plugins": {
+                "legend": {"display": False},
+                "tooltip": {
+                    "callbacks": {"label": "ctx => 'Equity: ' + ctx.parsed.y.toFixed(2)"}
+                }
+            },
+            "scales": {
+                "x": {"grid": {"display": False}, "ticks": {"maxTicksLimit": 8, "maxRotation": 0}},
+                "y": {"grid": {"color": "#f1f5f9"}, "ticks": {"callback": "v => v.toFixed(2)"}}
+            }
+        }
+    })
+
+    yearly_config = json.dumps({
+        "type": "bar",
+        "data": {
+            "labels": [y for y, _ in yearly_data],
+            "datasets": [{
+                "label": "Return",
+                "data": [v for _, v in yearly_data],
+                "backgroundColor": ["#0f5e9c" if v >= 0 else "#dc2626" for _, v in yearly_data],
+                "borderRadius": 0,
+            }]
+        },
+        "options": {
+            "responsive": True,
+            "maintainAspectRatio": False,
+            "indexAxis": "y",
+            "plugins": {"legend": {"display": False}},
+            "scales": {
+                "x": {"grid": {"display": False}, "ticks": {"callback": "v => (v*100).toFixed(1)+'%'"}},
+                "y": {"grid": {"display": False}}
+            }
+        }
+    })
+
+    # Histogram bins
+    hist_labels, hist_values = _histogram_data(monthly_dist)
+    dist_config = json.dumps({
+        "type": "bar",
+        "data": {
+            "labels": hist_labels,
+            "datasets": [{
+                "label": "Count",
+                "data": hist_values,
+                "backgroundColor": "#0f5e9c",
+                "borderRadius": 0,
+            }]
+        },
+        "options": {
+            "responsive": True,
+            "maintainAspectRatio": False,
+            "plugins": {"legend": {"display": False}},
+            "scales": {
+                "x": {"grid": {"display": False}, "title": {"display": True, "text": "Monthly Return"}},
+                "y": {"grid": {"color": "#f1f5f9"}, "title": {"display": True, "text": "Count"}}
+            }
+        }
+    })
+
+    dd_config = json.dumps({
+        "type": "line",
+        "data": {
+            "labels": dd_labels,
+            "datasets": [{
+                "label": "Drawdown",
+                "data": dd_values,
+                "borderColor": "#dc2626",
+                "backgroundColor": "rgba(220, 38, 38, 0.08)",
+                "fill": True,
+                "tension": 0.15,
+                "pointRadius": 0,
+                "pointHoverRadius": 4,
+                "borderWidth": 1.5,
+            }]
+        },
+        "options": {
+            "responsive": True,
+            "maintainAspectRatio": False,
+            "interaction": {"intersect": False, "mode": "index"},
+            "plugins": {
+                "legend": {"display": False},
+                "tooltip": {
+                    "callbacks": {"label": "ctx => 'DD: ' + (ctx.parsed.y*100).toFixed(1)+'%'"}
+                }
+            },
+            "scales": {
+                "x": {"grid": {"display": False}, "ticks": {"maxTicksLimit": 8}},
+                "y": {
+                    "grid": {"color": "#f1f5f9"},
+                    "ticks": {"callback": "v => (v*100).toFixed(1)+'%'"},
+                    "max": 0,
+                }
+            }
+        }
+    })
+
+    rolling_config = json.dumps({
+        "type": "line",
+        "data": {
+            "labels": rolling_labels,
+            "datasets": [
+                {
+                    "label": "Rolling Return",
+                    "data": rolling_rets,
+                    "borderColor": "#0f5e9c",
+                    "backgroundColor": "rgba(15, 94, 156, 0.08)",
+                    "fill": True,
+                    "tension": 0.15,
+                    "pointRadius": 0,
+                    "borderWidth": 2,
+                },
+                {
+                    "label": "Rolling Volatility",
+                    "data": rolling_vols,
+                    "borderColor": "#64748b",
+                    "backgroundColor": "transparent",
+                    "fill": False,
+                    "tension": 0.15,
+                    "pointRadius": 0,
+                    "borderWidth": 2,
+                    "borderDash": [5, 5],
+                }
+            ]
+        },
+        "options": {
+            "responsive": True,
+            "maintainAspectRatio": False,
+            "interaction": {"intersect": False, "mode": "index"},
+            "plugins": {
+                "legend": {"position": "top", "align": "end", "labels": {"usePointStyle": True}}
+            },
+            "scales": {
+                "x": {"grid": {"display": False}, "ticks": {"maxTicksLimit": 8}},
+                "y": {"grid": {"color": "#f1f5f9"}, "ticks": {"callback": "v => (v*100).toFixed(0)+'%'"}}
+            }
+        }
+    })
+
     cards = _metric_cards(metrics)
     warnings = _warnings_html(series.warnings)
+    charts_script = _charts_js(equity_config, yearly_config, dist_config, dd_config, rolling_config)
+
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -553,29 +734,131 @@ def _render_report_html(
   </header>
   {warnings}
   <section class="cards">{cards}</section>
-  <section class="chart chart-wide">
-    {_line_svg(equity_series, "Strategy Performance", y_formatter="{:.2f}")}
+
+  <section class="section">
+    <h2 class="section-title">Strategy Performance</h2>
+    <div class="chart chart-wide">
+      <canvas id="equityChart"></canvas>
+    </div>
   </section>
-  <section class="chart-grid">
-    <div class="chart">{_monthly_heatmap_svg(series.monthly_returns)}</div>
-    <div class="chart">{_yearly_bar_svg(series.yearly_returns)}</div>
-    <div class="chart">{_histogram_svg(monthly_values)}</div>
-    <div class="chart">{_drawdown_svg(drawdown_series)}</div>
+
+  <section class="section">
+    <h2 class="section-title">Period Returns</h2>
+    <div class="chart-grid">
+      <div class="chart">{_monthly_heatmap_html(series.monthly_returns)}</div>
+      <div class="chart"><canvas id="yearlyChart"></canvas></div>
+      <div class="chart"><canvas id="distributionChart"></canvas></div>
+      <div class="chart"><canvas id="drawdownChart"></canvas></div>
+    </div>
   </section>
-  <section class="chart chart-wide">
-    {_rolling_svg(rolling)}
+
+  <section class="section">
+    <h2 class="section-title">Rolling Statistics</h2>
+    <div class="chart chart-wide">
+      <canvas id="rollingChart"></canvas>
+    </div>
   </section>
-  <section class="tables">
-    {_strategy_table(series.closed_trades)}
-    {_closed_trades_table(series.closed_trades)}
-    {_open_positions_table(series.open_lots)}
-    {_run_metadata_table(summary, metrics)}
+
+      <section class="section">
+    <h2 class="section-title">Trade History</h2>
+    <div class="tables">
+      {_strategy_table(series.closed_trades)}
+      {_closed_trades_table(series.closed_trades, session_tz)}
+      {_open_positions_table(series.open_lots, session_tz)}
+      {_run_metadata_table(summary, metrics)}
+    </div>
   </section>
 </main>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+{charts_script}
+</script>
+{_pagination_js()}
 </body>
 </html>
 """
     return html
+
+
+def _downsample_pairs(pairs: list[tuple[str, Any]], max_points: int) -> tuple[list[str], list[Any]]:
+    if len(pairs) <= max_points:
+        return [p[0] for p in pairs], [p[1] for p in pairs]
+    step = (len(pairs) - 1) / (max_points - 1)
+    sampled = [pairs[round(i * step)] for i in range(max_points)]
+    return [p[0] for p in sampled], [p[1] for p in sampled]
+
+
+def _drawdown_values(equity_points: Sequence[_EquityPoint]) -> list[float]:
+    if not equity_points:
+        return []
+    peak = equity_points[0].equity
+    result: list[float] = []
+    for point in equity_points:
+        peak = max(peak, point.equity)
+        dd = point.equity / peak - 1.0 if peak > _EPSILON else 0.0
+        result.append(round(dd, 6))
+    return result
+
+
+def _histogram_data(values: Sequence[float]) -> tuple[list[str], list[int]]:
+    if len(values) < 2:
+        return [], []
+    bins = max(5, min(14, int(math.sqrt(len(values))) + 2))
+    min_v, max_v = min(values), max(values)
+    if abs(max_v - min_v) <= _EPSILON:
+        min_v -= 0.01
+        max_v += 0.01
+    step = (max_v - min_v) / bins
+    counts = [0] * bins
+    for value in values:
+        idx = min(bins - 1, int((value - min_v) / step))
+        counts[idx] += 1
+    labels = []
+    for i in range(bins):
+        lo = min_v + i * step
+        hi = min_v + (i + 1) * step
+        labels.append(f"{_format_pct(lo, decimals=0, force_sign=False)} to {_format_pct(hi, decimals=0, force_sign=False)}")
+    return labels, counts
+
+
+def _charts_js(equity_cfg: str, yearly_cfg: str, dist_cfg: str, dd_cfg: str, rolling_cfg: str) -> str:
+    # Chart.js config objects need JavaScript functions for callbacks.
+    # We injected them as strings inside the JSON; now strip the quotes
+    # around function bodies so they become real JS functions.
+    def _fix_callbacks(cfg: str) -> str:
+        import re
+        # Replace only arrow-function callback values, leaving ordinary dataset
+        # labels like "Equity Multiple" as quoted strings.
+        return re.sub(
+            r'("(?:callback|label)":\s*)"([^"]*=>[^"]*)"',
+            r"\1\2",
+            cfg,
+        )
+
+    equity_cfg = _fix_callbacks(equity_cfg)
+    yearly_cfg = _fix_callbacks(yearly_cfg)
+    dist_cfg = _fix_callbacks(dist_cfg)
+    dd_cfg = _fix_callbacks(dd_cfg)
+    rolling_cfg = _fix_callbacks(rolling_cfg)
+
+    return f"""
+(function() {{
+  var commonOptions = {{
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {{
+      legend: {{ labels: {{ font: {{ family: 'Inter, sans-serif', size: 12 }} }} }},
+      tooltip: {{ titleFont: {{ family: 'Inter, sans-serif', size: 13 }}, bodyFont: {{ family: 'Inter, sans-serif', size: 12 }} }}
+    }}
+  }};
+
+  new Chart(document.getElementById('equityChart'), {equity_cfg});
+  new Chart(document.getElementById('yearlyChart'), {yearly_cfg});
+  new Chart(document.getElementById('distributionChart'), {dist_cfg});
+  new Chart(document.getElementById('drawdownChart'), {dd_cfg});
+  new Chart(document.getElementById('rollingChart'), {rolling_cfg});
+}})();
+"""
 
 
 def _metric_cards(metrics: dict[str, Any]) -> str:
@@ -609,11 +892,6 @@ def _metric_cards(metrics: dict[str, Any]) -> str:
             "calendar years with positive return",
         ),
         (
-            "Max Open Lots",
-            escape(str(metrics["max_concurrent_open_lots"])),
-            "maximum concurrent strategy lots",
-        ),
-        (
             "Max Exposure",
             escape(f"{float(metrics['max_exposure_multiple']):.2f}x"),
             "gross exposure / marked equity",
@@ -629,283 +907,38 @@ def _metric_cards(metrics: dict[str, Any]) -> str:
     )
 
 
-def _line_svg(
-    points: Sequence[tuple[str, float]],
-    title: str,
-    *,
-    y_formatter: str = "{:.1%}",
-) -> str:
-    points = _downsample(points, 900)
-    if len(points) < 2:
-        return _empty_svg(title, "Not enough equity points")
-    width, height = 920, 300
-    left, right, top, bottom = 58, 20, 38, 38
-    plot_w = width - left - right
-    plot_h = height - top - bottom
-    values = [value for _, value in points]
-    min_y, max_y = _padded_range(values)
-
-    def sx(index: int) -> float:
-        return left + (index / max(1, len(points) - 1)) * plot_w
-
-    def sy(value: float) -> float:
-        return top + ((max_y - value) / (max_y - min_y)) * plot_h
-
-    path = " ".join(
-        ("M" if index == 0 else "L") + f"{sx(index):.2f},{sy(value):.2f}"
-        for index, (_, value) in enumerate(points)
-    )
-    grid = _y_grid(left, top, plot_w, plot_h, min_y, max_y, y_formatter)
-    start_label = escape(points[0][0][:10])
-    end_label = escape(points[-1][0][:10])
-    return f"""<svg viewBox="0 0 {width} {height}" role="img" aria-label="{escape(title)}">
-  <text x="{width / 2:.0f}" y="22" text-anchor="middle" class="svg-title">{escape(title)}</text>
-  {grid}
-  <path d="{path}" fill="none" stroke="{_CARD_BLUE}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
-  <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" class="axis"/>
-  <text x="{left}" y="{height - 12}" class="axis-label">{start_label}</text>
-  <text x="{width - right}" y="{height - 12}" text-anchor="end" class="axis-label">{end_label}</text>
-</svg>"""
-
-
-def _monthly_heatmap_svg(monthly_returns: dict[tuple[int, int], float]) -> str:
-    title = "Monthly Returns"
-    if not monthly_returns:
-        return _empty_svg(title, "No monthly returns")
+def _monthly_heatmap_html(monthly_returns: dict[tuple[int, int], float]) -> str:
     months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     years = sorted({year for year, _ in monthly_returns})
-    width = 920
-    cell_w = 62
-    cell_h = 31
-    left, top = 66, 54
-    height = top + len(years) * cell_h + 28
-    month_labels = "\n".join(
-        f'<text x="{left + index * cell_w + cell_w / 2:.1f}" y="44" text-anchor="middle" class="axis-label">{month}</text>'
-        for index, month in enumerate(months)
-    )
+    if not years:
+        return '<div class="heatmap"><p class="empty-text">No monthly returns</p></div>'
+
+    header = "".join(f'<div class="hm-month">{m}</div>' for m in months)
     rows: list[str] = []
-    for row_index, year in enumerate(years):
-        y = top + row_index * cell_h
-        rows.append(f'<text x="14" y="{y + 20:.1f}" class="axis-label">{year}</text>')
+    for year in years:
+        cells = []
         for month in range(1, 13):
             value = monthly_returns.get((year, month))
-            x = left + (month - 1) * cell_w
             if value is None:
-                fill = "#f4f6f8"
-                label = ""
-                text_class = "heat-text"
+                cells.append('<div class="hm-cell hm-empty"></div>')
             else:
-                fill = _heat_color(value)
+                intensity = min(1.0, abs(value) / 0.15)
+                if value >= 0:
+                    bg = f"rgba(15, 94, 156, {0.08 + intensity * 0.92})"
+                    text = "#ffffff" if intensity > 0.5 else "#0f5e9c"
+                else:
+                    bg = f"rgba(220, 38, 38, {0.08 + intensity * 0.92})"
+                    text = "#ffffff" if intensity > 0.5 else "#dc2626"
                 label = _format_pct(value, decimals=1, force_sign=False)
-                text_class = "heat-text heat-strong" if abs(value) >= 0.08 else "heat-text"
-            rows.append(
-                f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_w - 3}" height="{cell_h - 3}" rx="2" fill="{fill}"/>'
-            )
-            rows.append(
-                f'<text x="{x + cell_w / 2:.1f}" y="{y + 19:.1f}" text-anchor="middle" class="{text_class}">{escape(label)}</text>'
-            )
-    return f"""<svg viewBox="0 0 {width} {height}" role="img" aria-label="{title}">
-  <text x="{width / 2:.0f}" y="22" text-anchor="middle" class="svg-title">{title}</text>
-  {month_labels}
-  {"".join(rows)}
-</svg>"""
+                cells.append(f'<div class="hm-cell" style="background:{bg};color:{text}">{escape(label)}</div>')
+        rows.append(
+            f'<div class="hm-row"><div class="hm-year">{year}</div>{"".join(cells)}</div>'
+        )
 
-
-def _yearly_bar_svg(yearly_returns: dict[int, float]) -> str:
-    title = "Yearly Returns"
-    if not yearly_returns:
-        return _empty_svg(title, "No yearly returns")
-    years = sorted(yearly_returns)
-    values = [yearly_returns[year] for year in years]
-    width, height = 920, max(230, 58 + len(years) * 32)
-    left, right, top, bottom = 74, 28, 42, 34
-    plot_w = width - left - right
-    min_x = min(0.0, min(values))
-    max_x = max(0.0, max(values))
-    if abs(max_x - min_x) <= _EPSILON:
-        max_x = 0.01
-        min_x = -0.01
-    zero_x = left + ((0.0 - min_x) / (max_x - min_x)) * plot_w
-    row_h = (height - top - bottom) / len(years)
-    parts = [
-        f'<text x="{width / 2:.0f}" y="22" text-anchor="middle" class="svg-title">{title}</text>',
-        f'<line x1="{zero_x:.1f}" y1="{top}" x2="{zero_x:.1f}" y2="{height - bottom}" class="axis"/>',
-    ]
-    for index, year in enumerate(years):
-        value = yearly_returns[year]
-        y = top + index * row_h + row_h * 0.25
-        bar_h = max(6, row_h * 0.5)
-        x = left + ((min(value, 0.0) - min_x) / (max_x - min_x)) * plot_w
-        bar_w = abs(value) / (max_x - min_x) * plot_w
-        color = _CARD_BLUE if value >= 0 else "#b42318"
-        label_x = x + bar_w + 6 if value >= 0 else x - 6
-        anchor = "start" if value >= 0 else "end"
-        parts.append(f'<text x="14" y="{y + bar_h - 1:.1f}" class="axis-label">{year}</text>')
-        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{max(1, bar_w):.1f}" height="{bar_h:.1f}" fill="{color}"/>')
-        parts.append(f'<text x="{label_x:.1f}" y="{y + bar_h - 1:.1f}" text-anchor="{anchor}" class="axis-label">{escape(_format_pct(value, decimals=1, force_sign=False))}</text>')
-    return f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="{title}">{"".join(parts)}</svg>'
-
-
-def _histogram_svg(values: Sequence[float]) -> str:
-    title = "Distribution of Monthly Returns"
-    if len(values) < 2:
-        return _empty_svg(title, "Not enough monthly returns")
-    width, height = 920, 280
-    left, right, top, bottom = 58, 20, 42, 38
-    plot_w = width - left - right
-    plot_h = height - top - bottom
-    bins = max(5, min(14, int(math.sqrt(len(values))) + 2))
-    min_v, max_v = min(values), max(values)
-    if abs(max_v - min_v) <= _EPSILON:
-        min_v -= 0.01
-        max_v += 0.01
-    step = (max_v - min_v) / bins
-    counts = [0] * bins
-    for value in values:
-        index = min(bins - 1, int((value - min_v) / step))
-        counts[index] += 1
-    max_count = max(counts) or 1
-    parts = [
-        f'<text x="{width / 2:.0f}" y="22" text-anchor="middle" class="svg-title">{title}</text>',
-        f'<line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" class="axis"/>',
-    ]
-    bar_gap = 4
-    bar_w = plot_w / bins - bar_gap
-    for index, count in enumerate(counts):
-        x = left + index * (plot_w / bins)
-        bar_h = count / max_count * plot_h
-        y = top + plot_h - bar_h
-        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{bar_h:.1f}" fill="{_CARD_BLUE}"/>')
-    parts.append(f'<text x="{left}" y="{height - 12}" class="axis-label">{escape(_format_pct(min_v, decimals=1, force_sign=False))}</text>')
-    parts.append(f'<text x="{width - right}" y="{height - 12}" text-anchor="end" class="axis-label">{escape(_format_pct(max_v, decimals=1, force_sign=False))}</text>')
-    return f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="{title}">{"".join(parts)}</svg>'
-
-
-def _qq_svg(values: Sequence[float]) -> str:
-    title = "Normal Distribution Q-Q"
-    if len(values) < 3:
-        return _empty_svg(title, "Not enough monthly returns")
-    width, height = 920, 280
-    left, right, top, bottom = 58, 20, 42, 38
-    plot_w = width - left - right
-    plot_h = height - top - bottom
-    sorted_values = sorted(value * 100 for value in values)
-    normal = NormalDist()
-    n = len(sorted_values)
-    quantiles = [normal.inv_cdf((index + 0.5) / n) for index in range(n)]
-    min_x, max_x = _padded_range(quantiles)
-    min_y, max_y = _padded_range(sorted_values)
-
-    def sx(value: float) -> float:
-        return left + ((value - min_x) / (max_x - min_x)) * plot_w
-
-    def sy(value: float) -> float:
-        return top + ((max_y - value) / (max_y - min_y)) * plot_h
-
-    points = "".join(
-        f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="3.2" fill="{_CARD_BLUE}"/>'
-        for x, y in zip(quantiles, sorted_values, strict=True)
-    )
-    line = f'<line x1="{sx(min_x):.1f}" y1="{sy(min_y):.1f}" x2="{sx(max_x):.1f}" y2="{sy(max_y):.1f}" stroke="#777" stroke-width="2"/>'
-    zero_x = sx(0.0) if min_x <= 0 <= max_x else None
-    zero_y = sy(0.0) if min_y <= 0 <= max_y else None
-    axes = ""
-    if zero_x is not None:
-        axes += f'<line x1="{zero_x:.1f}" y1="{top}" x2="{zero_x:.1f}" y2="{height - bottom}" class="axis"/>'
-    if zero_y is not None:
-        axes += f'<line x1="{left}" y1="{zero_y:.1f}" x2="{width - right}" y2="{zero_y:.1f}" class="axis"/>'
-    return f"""<svg viewBox="0 0 {width} {height}" role="img" aria-label="{title}">
-  <text x="{width / 2:.0f}" y="22" text-anchor="middle" class="svg-title">{title}</text>
-  {axes}{line}{points}
-  <text x="{left}" y="{height - 12}" class="axis-label">normal quantile</text>
-  <text x="{width - right}" y="{height - 12}" text-anchor="end" class="axis-label">monthly return %</text>
-</svg>"""
-
-
-def _drawdown_svg(points: Sequence[tuple[str, float]]) -> str:
-    title = "Drawdown"
-    points = _downsample(points, 900)
-    if len(points) < 2:
-        return _empty_svg(title, "Not enough equity points")
-    width, height = 920, 280
-    left, right, top, bottom = 58, 20, 42, 38
-    plot_w = width - left - right
-    plot_h = height - top - bottom
-    values = [value for _, value in points]
-    min_y = min(values)
-    max_y = min(max(values), 0.0)
-    if abs(max_y - min_y) <= _EPSILON:
-        pad = max(abs(min_y) * 0.05, 0.01)
-    else:
-        pad = (max_y - min_y) * 0.08
-    min_y = min_y - pad
-    max_y = max_y + pad * 0.3
-
-    def sx(index: int) -> float:
-        return left + (index / max(1, len(points) - 1)) * plot_w
-
-    def sy(value: float) -> float:
-        return top + ((max_y - value) / (max_y - min_y)) * plot_h
-
-    line_path = " ".join(
-        ("M" if index == 0 else "L") + f"{sx(index):.2f},{sy(value):.2f}"
-        for index, (_, value) in enumerate(points)
-    )
-    zero_y = sy(0.0)
-    area_path = line_path + f" L{sx(len(points)-1):.2f},{zero_y:.2f} L{sx(0):.2f},{zero_y:.2f} Z"
-
-    grid = _y_grid(left, top, plot_w, plot_h, min_y, max_y, "{:.1%}")
-    start_label = escape(points[0][0][:10])
-    end_label = escape(points[-1][0][:10])
-    return f"""<svg viewBox="0 0 {width} {height}" role="img" aria-label="{escape(title)}">
-  <text x="{width / 2:.0f}" y="24" text-anchor="middle" class="svg-title">{escape(title)}</text>
-  {grid}
-  <path d="{area_path}" fill="rgba(180, 35, 24, 0.10)" stroke="none"/>
-  <path d="{line_path}" fill="none" stroke="#b42318" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
-  <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" class="axis"/>
-  <text x="{left}" y="{height - 10}" class="axis-label">{start_label}</text>
-  <text x="{width - right}" y="{height - 10}" text-anchor="end" class="axis-label">{end_label}</text>
-</svg>"""
-
-
-def _rolling_svg(rows: Sequence[tuple[str, float, float]]) -> str:
-    title = "Rolling Statistics (6 Months)"
-    if len(rows) < 2:
-        return _empty_svg(title, "Not enough monthly returns")
-    rows = _downsample(rows, 900)
-    width, height = 920, 300
-    left, right, top, bottom = 58, 20, 38, 38
-    plot_w = width - left - right
-    plot_h = height - top - bottom
-    all_values = [row[1] for row in rows] + [row[2] for row in rows]
-    min_y, max_y = _padded_range(all_values)
-
-    def sx(index: int) -> float:
-        return left + (index / max(1, len(rows) - 1)) * plot_w
-
-    def sy(value: float) -> float:
-        return top + ((max_y - value) / (max_y - min_y)) * plot_h
-
-    ret_path = " ".join(
-        ("M" if index == 0 else "L") + f"{sx(index):.2f},{sy(row[1]):.2f}"
-        for index, row in enumerate(rows)
-    )
-    vol_path = " ".join(
-        ("M" if index == 0 else "L") + f"{sx(index):.2f},{sy(row[2]):.2f}"
-        for index, row in enumerate(rows)
-    )
-    grid = _y_grid(left, top, plot_w, plot_h, min_y, max_y, "{:.0%}")
-    return f"""<svg viewBox="0 0 {width} {height}" role="img" aria-label="{title}">
-  <text x="{width / 2:.0f}" y="22" text-anchor="middle" class="svg-title">{title}</text>
-  {grid}
-  <path d="{ret_path}" fill="none" stroke="{_CARD_BLUE}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
-  <path d="{vol_path}" fill="none" stroke="#737373" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
-  <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" class="axis"/>
-  <line x1="{width - 210}" y1="51" x2="{width - 192}" y2="51" stroke="{_CARD_BLUE}" stroke-width="3"/>
-  <text x="{width - 186}" y="55" class="legend">Rolling Return</text>
-  <line x1="{width - 210}" y1="71" x2="{width - 192}" y2="71" stroke="#737373" stroke-width="3"/>
-  <text x="{width - 186}" y="75" class="legend">Rolling Volatility</text>
-</svg>"""
+    return f'''<div class="heatmap">
+  <div class="hm-header"><div class="hm-year"></div>{header}</div>
+  {''.join(rows)}
+</div>'''
 
 
 def _strategy_table(closed_trades: Sequence[_ClosedTrade]) -> str:
@@ -924,7 +957,7 @@ def _strategy_table(closed_trades: Sequence[_ClosedTrade]) -> str:
             f"<td>{escape(strategy_id)}</td>"
             f"<td>{len(trades)}</td>"
             f"<td>{escape(_format_pct(wins / len(trades)))}</td>"
-            f"<td>{escape(_format_money(pnl))}</td>"
+            f"<td class=\"{'col-pos' if pnl > 0 else 'col-neg' if pnl < 0 else ''}\">{escape(_format_money(pnl))}</td>"
             f"<td>{escape(_format_pct(sum_return))}</td>"
             "</tr>"
         )
@@ -937,7 +970,7 @@ def _strategy_table(closed_trades: Sequence[_ClosedTrade]) -> str:
     return _table_block("Strategy Summary", body)
 
 
-def _closed_trades_table(closed_trades: Sequence[_ClosedTrade]) -> str:
+def _closed_trades_table(closed_trades: Sequence[_ClosedTrade], session_tz: ZoneInfo) -> str:
     if not closed_trades:
         return _table_block("Closed Trades", "<p class=\"empty-text\">No closed trades.</p>")
     limit = 500
@@ -946,15 +979,15 @@ def _closed_trades_table(closed_trades: Sequence[_ClosedTrade]) -> str:
     for trade in trades:
         rows.append(
             "<tr>"
-            f"<td>{escape(trade.entry_time.isoformat())}</td>"
-            f"<td>{escape(trade.exit_time.isoformat())}</td>"
+            f"<td>{escape(_format_table_datetime(trade.entry_time, session_tz))}</td>"
+            f"<td>{escape(_format_table_datetime(trade.exit_time, session_tz))}</td>"
             f"<td>{escape(trade.strategy_id)}</td>"
             f"<td>{escape(trade.instrument.label)}</td>"
             f"<td>{escape(trade.side)}</td>"
             f"<td>{trade.quantity:g}</td>"
-            f"<td>{trade.entry_price:.4f}</td>"
-            f"<td>{trade.exit_price:.4f}</td>"
-            f"<td>{escape(_format_money(trade.pnl))}</td>"
+            f"<td>{trade.entry_price:.3f}</td>"
+            f"<td>{trade.exit_price:.3f}</td>"
+            f"<td class=\"{'col-pos' if trade.pnl > 0 else 'col-neg' if trade.pnl < 0 else ''}\">{escape(_format_money(trade.pnl))}</td>"
             f"<td>{escape(_format_pct(trade.return_pct))}</td>"
             f"<td>{escape(trade.trade_id or '')}</td>"
             "</tr>"
@@ -962,18 +995,316 @@ def _closed_trades_table(closed_trades: Sequence[_ClosedTrade]) -> str:
     total = len(closed_trades)
     showing = len(trades)
     note = "" if total <= limit else f"<p class=\"empty-text\">Showing latest {limit} of {total} trades.</p>"
+    pagination = (
+        '<div class="pagination">'
+        '<button class="page-btn" data-action="prev">← Prev</button>'
+        '<span class="page-info">Page 1 of 1</span>'
+        '<button class="page-btn" data-action="next">Next →</button>'
+        "</div>"
+    )
     body = (
         note
-        + "<table><thead><tr><th>Entry</th><th>Exit</th><th>Strategy</th>"
-        "<th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th>"
+        + '<table class="paginated" data-page-size="35"><thead><tr><th>Entry Time (ET)</th><th>Exit Time (ET)</th><th>Strategy</th>'
+        "<th>Symbol</th><th>Side</th><th>Qty</th><th>Entry Price</th><th>Exit Price</th>"
         "<th>PnL</th><th>Return</th><th>Trade ID</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
+        + pagination
     )
     return _table_block("Closed Trades", body)
 
 
-def _open_positions_table(open_lots: Sequence[_OpenLot]) -> str:
+def _style_css() -> str:
+    return """
+:root {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --text: #172033;
+  --text-muted: #5f6b7a;
+  --primary: #0b5f8f;
+  --positive: #059669;
+  --negative: #dc2626;
+  --border: #d8dee8;
+  --border-strong: #b8c2d0;
+  --shadow: 0 1px 1px rgba(15, 23, 42, 0.04);
+  --radius: 0;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+.report {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 28px 24px 44px;
+}
+.report-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border-strong);
+}
+.eyebrow {
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--primary);
+}
+h1 {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 750;
+  color: var(--text);
+  letter-spacing: 0;
+}
+.meta {
+  text-align: right;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.section {
+  margin-bottom: 24px;
+}
+.section-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin: 0 0 10px;
+}
+.cards {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.card {
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+}
+.card:hover {
+  border-color: var(--border-strong);
+}
+.card-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.card-value {
+  margin-top: 6px;
+  font-size: 25px;
+  font-weight: 750;
+  color: var(--text);
+  letter-spacing: 0;
+}
+.card-help {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.val-pos { color: var(--positive); }
+.val-neg { color: var(--negative); }
+.chart {
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: 20px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+}
+.chart-wide {
+  height: 400px;
+}
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.chart-grid .chart {
+  height: 340px;
+  padding: 18px;
+}
+canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Heatmap */
+.heatmap {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  height: 100%;
+  justify-content: center;
+}
+.hm-header, .hm-row {
+  display: grid;
+  grid-template-columns: 36px repeat(12, 1fr);
+  gap: 3px;
+  align-items: center;
+}
+.hm-month, .hm-year {
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+.hm-year {
+  text-align: left;
+}
+.hm-cell {
+  aspect-ratio: 1.4;
+  border-radius: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+}
+.hm-empty {
+  background: #f8fafc;
+}
+
+/* Tables */
+.tables {
+  display: grid;
+  gap: 14px;
+}
+.table-block {
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: 18px 20px 22px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  overflow-x: auto;
+}
+.table-block h2 {
+  margin: 0 0 14px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+th, td {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+th {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  font-weight: 700;
+  background: #f8fafc;
+}
+tbody tr:hover td {
+  background: #f8fafc;
+}
+.col-pos { color: var(--positive); font-weight: 700; }
+.col-neg { color: var(--negative); font-weight: 700; }
+.kv th {
+  width: 200px;
+}
+.empty-text {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* Pagination */
+.pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  font-size: 13px;
+}
+.page-btn {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 14px;
+  cursor: pointer;
+  color: var(--primary);
+  font-weight: 600;
+  font-size: 13px;
+  transition: background 0.1s;
+}
+.page-btn:hover {
+  background: var(--bg);
+}
+.page-btn:disabled {
+  color: #b0b8c4;
+  cursor: not-allowed;
+  background: var(--card);
+}
+.page-info {
+  color: var(--text-muted);
+  font-weight: 600;
+  min-width: 160px;
+  text-align: center;
+}
+
+/* Warnings */
+.warnings {
+  background: #fff8f7;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  margin-bottom: 16px;
+}
+.warnings h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: var(--negative);
+}
+.warnings ul {
+  margin: 0;
+  padding-left: 20px;
+  color: #7f1d1d;
+  font-size: 13px;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+  .report-header { display: block; }
+  .meta { text-align: left; margin-top: 12px; }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .chart-grid { grid-template-columns: 1fr; }
+  .chart-wide { height: 300px; }
+  .chart-grid .chart { height: 280px; }
+}
+@media print {
+  body { background: #ffffff; }
+  .report { width: 100%; padding: 0; }
+  .chart, .table-block, .warnings, .card { break-inside: avoid; }
+  .pagination { display: none; }
+}
+"""
+def _open_positions_table(open_lots: Sequence[_OpenLot], session_tz: ZoneInfo) -> str:
     lots = [lot for lot in open_lots if abs(lot.quantity) > _EPSILON]
     if not lots:
         return _table_block("Open Positions", "<p class=\"empty-text\">No open positions.</p>")
@@ -981,17 +1312,17 @@ def _open_positions_table(open_lots: Sequence[_OpenLot]) -> str:
     for lot in lots:
         rows.append(
             "<tr>"
-            f"<td>{escape(lot.entry_time.isoformat())}</td>"
+            f"<td>{escape(_format_table_datetime(lot.entry_time, session_tz))}</td>"
             f"<td>{escape(lot.strategy_id)}</td>"
             f"<td>{escape(lot.instrument.label)}</td>"
             f"<td>{escape('long' if lot.quantity > 0 else 'short')}</td>"
             f"<td>{abs(lot.quantity):g}</td>"
-            f"<td>{lot.entry_price:.4f}</td>"
+            f"<td>{lot.entry_price:.3f}</td>"
             f"<td>{escape(lot.trade_id or '')}</td>"
             "</tr>"
         )
     body = (
-        "<table><thead><tr><th>Entry</th><th>Strategy</th><th>Symbol</th>"
+        "<table><thead><tr><th>Entry Time (ET)</th><th>Strategy</th><th>Symbol</th>"
         "<th>Side</th><th>Qty</th><th>Avg Entry</th><th>Trade ID</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
@@ -1022,7 +1353,6 @@ def _run_metadata_table(summary: dict[str, Any], metrics: dict[str, Any]) -> str
 
 def _table_block(title: str, content: str) -> str:
     return f"<section class=\"table-block\"><h2>{escape(title)}</h2>{content}</section>"
-
 
 def _pagination_js() -> str:
     return """<script>
@@ -1062,8 +1392,6 @@ def _warnings_html(warnings: Sequence[str]) -> str:
     items = "".join(f"<li>{escape(message)}</li>" for message in warnings[:20])
     extra = "" if len(warnings) <= 20 else f"<li>{len(warnings) - 20} more warnings omitted.</li>"
     return f'<section class="warnings"><h2>Report Warnings</h2><ul>{items}{extra}</ul></section>'
-
-
 def _rolling_monthly(monthly_returns: dict[tuple[int, int], float]) -> list[tuple[str, float, float]]:
     rows = sorted(monthly_returns.items())
     result: list[tuple[str, float, float]] = []
@@ -1109,68 +1437,8 @@ def _max_drawdown(values: Sequence[float]) -> float:
     return max_dd
 
 
-def _y_grid(
-    left: float,
-    top: float,
-    width: float,
-    height: float,
-    min_y: float,
-    max_y: float,
-    formatter: str,
-) -> str:
-    parts = []
-    for index in range(5):
-        ratio = index / 4
-        value = max_y - ratio * (max_y - min_y)
-        y = top + ratio * height
-        parts.append(
-            f'<line x1="{left}" y1="{y:.1f}" x2="{left + width}" y2="{y:.1f}" class="grid"/>'
-        )
-        parts.append(
-            f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" class="axis-label">{escape(formatter.format(value))}</text>'
-        )
-    return "".join(parts)
-
-
-def _empty_svg(title: str, message: str) -> str:
-    return f"""<svg viewBox="0 0 920 240" role="img" aria-label="{escape(title)}">
-  <text x="460" y="24" text-anchor="middle" class="svg-title">{escape(title)}</text>
-  <rect x="24" y="48" width="872" height="150" fill="#f6f8fb" stroke="#e2e8f0"/>
-  <text x="460" y="126" text-anchor="middle" class="empty-svg">{escape(message)}</text>
-</svg>"""
-
-
-def _padded_range(values: Sequence[float]) -> tuple[float, float]:
-    min_v = min(values)
-    max_v = max(values)
-    if abs(max_v - min_v) <= _EPSILON:
-        pad = max(abs(max_v) * 0.05, 0.01)
-        return min_v - pad, max_v + pad
-    pad = (max_v - min_v) * 0.08
-    return min_v - pad, max_v + pad
-
-
-def _downsample(rows: Sequence[Any], max_points: int) -> list[Any]:
-    rows = list(rows)
-    if len(rows) <= max_points:
-        return rows
-    step = (len(rows) - 1) / (max_points - 1)
-    return [rows[round(index * step)] for index in range(max_points)]
-
-
-def _heat_color(value: float) -> str:
-    intensity = min(1.0, abs(value) / 0.15)
-    if value >= 0:
-        return _blend("#f8fbff", "#1f77b4", intensity)
-    return _blend("#fff8f8", "#c43c39", intensity)
-
-
-def _blend(start: str, end: str, ratio: float) -> str:
-    ratio = max(0.0, min(1.0, ratio))
-    s = tuple(int(start[index : index + 2], 16) for index in (1, 3, 5))
-    e = tuple(int(end[index : index + 2], 16) for index in (1, 3, 5))
-    rgb = tuple(round(sv + (ev - sv) * ratio) for sv, ev in zip(s, e, strict=True))
-    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+def _format_table_datetime(value: datetime, session_tz: ZoneInfo) -> str:
+    return value.astimezone(session_tz).strftime("%Y-%m-%d %H:%M")
 
 
 def _format_pct(value: Any, *, decimals: int = 1, force_sign: bool = True) -> str:
@@ -1289,243 +1557,3 @@ def _stringify(value: Any) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
-
-
-def _style_css() -> str:
-    return """
-:root {
-  color-scheme: light;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  color: #243447;
-  background: #f3f6fa;
-}
-* { box-sizing: border-box; }
-body { margin: 0; background: #f3f6fa; }
-.report {
-  width: min(1180px, calc(100vw - 28px));
-  margin: 0 auto;
-  padding: 22px 0 42px;
-}
-.report-header {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
-  align-items: flex-end;
-  margin-bottom: 14px;
-}
-.eyebrow {
-  margin: 0 0 4px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-size: 12px;
-  font-weight: 700;
-  color: #3c5068;
-}
-h1 {
-  margin: 0;
-  font-size: 28px;
-  line-height: 1.15;
-}
-.meta {
-  text-align: right;
-  color: #516174;
-  font-size: 13px;
-  line-height: 1.45;
-}
-.cards {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-  margin: 16px 0;
-}
-.card {
-  background: #ffffff;
-  border: 1px solid #d9e1ea;
-  border-left: 4px solid #0f5e9c;
-  border-radius: 8px;
-  padding: 14px 14px 12px;
-  min-height: 88px;
-  box-shadow: 0 1px 2px rgba(15, 54, 87, 0.05);
-  transition: transform 0.12s ease, box-shadow 0.12s ease;
-}
-.card:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 16px rgba(15, 54, 87, 0.10);
-}
-.card-label {
-  font-size: 11px;
-  line-height: 1.2;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: #516174;
-  font-weight: 800;
-}
-.card-value {
-  margin-top: 10px;
-  font-size: 24px;
-  line-height: 1;
-  font-weight: 800;
-  color: #0f3657;
-}
-.val-pos { color: #157a43; }
-.val-neg { color: #b42318; }
-.card-help {
-  margin-top: 8px;
-  font-size: 11px;
-  line-height: 1.3;
-  color: #768395;
-}
-.chart, .table-block, .warnings {
-  background: #ffffff;
-  border: 1px solid #d9e1ea;
-  border-radius: 8px;
-  box-shadow: 0 1px 3px rgba(15, 54, 87, 0.05);
-}
-.chart {
-  padding: 14px 16px;
-}
-.chart-wide {
-  margin-top: 12px;
-}
-.chart-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 12px;
-}
-svg {
-  display: block;
-  width: 100%;
-  height: auto;
-}
-.svg-title {
-  font-size: 19px;
-  font-weight: 800;
-  fill: #1f2937;
-}
-.grid {
-  stroke: #d9dde3;
-  stroke-width: 1;
-}
-.axis {
-  stroke: #333333;
-  stroke-width: 1.2;
-}
-.axis-label, .legend {
-  fill: #4b5563;
-  font-size: 13px;
-}
-.heat-text {
-  fill: #172033;
-  font-size: 12px;
-  font-weight: 700;
-}
-.heat-strong {
-  fill: #ffffff;
-}
-.empty-svg {
-  fill: #6b7280;
-  font-size: 14px;
-}
-.warnings {
-  padding: 12px 16px;
-  margin: 12px 0;
-  border-left: 4px solid #b42318;
-}
-.warnings h2 {
-  margin: 0 0 6px;
-  font-size: 15px;
-}
-.warnings ul {
-  margin: 0;
-  padding-left: 20px;
-  color: #5b1e17;
-  font-size: 13px;
-}
-.tables {
-  display: grid;
-  gap: 12px;
-  margin-top: 12px;
-}
-.table-block {
-  padding: 14px 16px 16px;
-  overflow-x: auto;
-}
-.table-block h2 {
-  margin: 0 0 10px;
-  font-size: 17px;
-}
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-}
-th, td {
-  border-bottom: 1px solid #e5e9ef;
-  padding: 8px 10px;
-  text-align: left;
-  white-space: nowrap;
-}
-tbody tr:hover td {
-  background: #f6f8fb;
-}
-th {
-  color: #526173;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  font-size: 10px;
-}
-.kv th {
-  width: 220px;
-}
-.empty-text {
-  margin: 0;
-  color: #6b7280;
-  font-size: 13px;
-}
-@media (max-width: 900px) {
-  .report-header { display: block; }
-  .meta { text-align: left; margin-top: 8px; }
-  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-  .chart-grid { grid-template-columns: 1fr; }
-}
-.pagination {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  gap: 12px;
-  margin-top: 14px;
-  font-size: 13px;
-}
-.page-btn {
-  background: #ffffff;
-  border: 1px solid #d9e1ea;
-  border-radius: 6px;
-  padding: 6px 14px;
-  cursor: pointer;
-  color: #0f5e9c;
-  font-weight: 600;
-  font-size: 13px;
-  transition: background 0.1s;
-}
-.page-btn:hover {
-  background: #f3f6fa;
-}
-.page-btn:disabled {
-  color: #b0b8c4;
-  cursor: not-allowed;
-  background: #ffffff;
-}
-.page-info {
-  color: #516174;
-  font-weight: 600;
-  min-width: 150px;
-  text-align: center;
-}
-@media print {
-  body { background: #ffffff; }
-  .report { width: 100%; padding: 0; }
-  .chart, .table-block, .warnings, .card { break-inside: avoid; }
-  .pagination { display: none; }
-}
-"""

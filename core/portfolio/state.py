@@ -74,6 +74,25 @@ class PortfolioState:
             self._positions[position.instrument] = position
             if strategy_id:
                 self._strategy_positions[(strategy_id, position.instrument)] = position
+                if position.trade_id:
+                    self._strategy_position_lots[
+                        (strategy_id, position.instrument, position.trade_id)
+                    ] = position
+
+    def adopt_strategy_position(self, strategy_id: str, position: Position) -> None:
+        """Seed strategy-owned exposure without changing broker-wide position."""
+        with self._lock:
+            key = (strategy_id, position.instrument)
+            self._strategy_positions[key] = _apply_signed_qty(
+                self._strategy_positions.get(key),
+                position.instrument,
+                position.quantity,
+                position.avg_cost,
+            )
+            if position.trade_id:
+                self._strategy_position_lots[
+                    (strategy_id, position.instrument, position.trade_id)
+                ] = position
 
     def adopt_positions(
         self,

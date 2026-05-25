@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import pytest
 
 from core import DataFeed, Engine, SimulatedClock, WallClock
 from core.audit import AuditLogger, DecisionTrace, record_decision
@@ -146,6 +147,19 @@ class _TraceStrategy(StrategyKernel):
         trace.add_condition("always_false", False, lhs=1, op=">", rhs=2)
         trace.set_decision("no_signal", reason="test")
         record_decision(state, trace)
+        return None
+
+
+class _AdoptableQqqStrategy(StrategyKernel):
+    SPEC = StrategySpec(
+        id="_adoptable_qqq",
+        primary_instrument=QQQ,
+        execution_instrument=QQQ,
+        timeframes=("1m",),
+        position_policy=PositionPolicy(supports_position_adoption=True),
+    )
+
+    def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
         return None
 
 
@@ -457,6 +471,71 @@ def test_engine_writes_strategy_decision_trace(tmp_path):
         row = next(csv.DictReader(fh))
     assert row["strategy_id"] == "_phase6_trace"
     assert row["condition_always_false"] == "False"
+
+
+def test_startup_gate_ignores_unrelated_positions():
+    engine = Engine(
+        broker=PaperBroker(),
+        data_feed=DataFeed(None, ReplayDataProvider([])),
+        strategies=[(_AdoptableQqqStrategy(), {})],
+        startup_position_gate_enabled=True,
+    )
+
+    status = engine._build_startup_gate_status(  # noqa: SLF001
+        [Position(SPY, quantity=5, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+    )
+
+    assert status["phase"] == "clear"
+    assert status["positions"] == []
+    assert status["unmanaged"][0]["symbol"] == "SPY"
+
+
+def test_startup_gate_allocates_configured_strategy_size():
+    engine = Engine(
+        broker=PaperBroker(),
+        data_feed=DataFeed(None, ReplayDataProvider([])),
+        strategies=[(_AdoptableQqqStrategy(), {})],
+        strategy_risk={"_adoptable_qqq": RiskPolicy(position_size_shares=2)},
+        startup_position_gate_enabled=True,
+    )
+    status = engine._build_startup_gate_status(  # noqa: SLF001
+        [Position(QQQ, quantity=5, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+    )
+    engine._set_startup_gate_status(status)  # noqa: SLF001
+
+    result = engine.submit_startup_mappings([
+        {
+            "position_id": "position:equity:QQQ:long",
+            "strategy_id": "_adoptable_qqq",
+        }
+    ])
+
+    assert result["allocations"][0]["quantity"] == 2.0
+
+
+def test_startup_gate_rejects_insufficient_broker_quantity():
+    engine = Engine(
+        broker=PaperBroker(),
+        data_feed=DataFeed(None, ReplayDataProvider([])),
+        strategies=[(_AdoptableQqqStrategy(), {})],
+        strategy_risk={"_adoptable_qqq": RiskPolicy(position_size_shares=2)},
+        startup_position_gate_enabled=True,
+    )
+    status = engine._build_startup_gate_status(  # noqa: SLF001
+        [Position(QQQ, quantity=1, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+    )
+    engine._set_startup_gate_status(status)  # noqa: SLF001
+
+    with pytest.raises(ValueError, match="exceeds broker quantity"):
+        engine.submit_startup_mappings([
+            {
+                "position_id": "position:equity:QQQ:long",
+                "strategy_id": "_adoptable_qqq",
+            }
+        ])
 
 
 def test_audit_run_subdir_uses_et_minute_and_unique_suffix(tmp_path):

@@ -41,6 +41,7 @@ class OrderManager:
         protective_stops: Mapping[str, ProtectiveStopSpec] | None = None,
         strategy_modes: Mapping[str, str] | None = None,
         position_policies: Mapping[str, PositionPolicy] | None = None,
+        strategy_risk: Mapping[str, RiskPolicy] | None = None,
         sizing_price_provider: Callable[[Instrument], float | None] | None = None,
         sizing_equity_provider: Callable[[], float | None] | None = None,
         fill_listener: Callable[[Fill], None] | None = None,
@@ -48,6 +49,7 @@ class OrderManager:
         self._broker = broker
         self._portfolio = portfolio
         self._risk = risk
+        self._strategy_risk = dict(strategy_risk or {})
         self._audit = audit_logger
         self._queue: asyncio.Queue[tuple[Signal, str]] = asyncio.Queue()
         self._signal_log: list[tuple[str, Signal]] = []  # (strategy_id, signal)
@@ -284,7 +286,8 @@ class OrderManager:
         allow_existing_position = (
             policy is not None and policy.position_mode == POSITION_MODE_MULTI
         )
-        qty_float = self._risk.size_order(
+        risk = self._risk_for_strategy(strategy_id)
+        qty_float = risk.size_order(
             signal,
             self._portfolio,
             allow_existing_position=allow_existing_position,
@@ -583,6 +586,9 @@ class OrderManager:
         if signal.trade_id:
             return signal.trade_id
         return f"{signal.instrument.symbol.lower()}_{next(self._trade_counter)}"
+
+    def _risk_for_strategy(self, strategy_id: str) -> RiskPolicy:
+        return self._strategy_risk.get(strategy_id, self._risk)
 
     def _position_key(
         self,

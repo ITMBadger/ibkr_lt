@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, Mapping
 
-from ..types import Instrument, MarketContext, Position, Signal
+from ..types import Instrument, MarketContext, Position, PositionAdoption, Signal
 
 POSITION_MODE_SINGLE = "single_position"
 POSITION_MODE_MULTI = "multi_position"
@@ -44,6 +44,7 @@ class PositionPolicy:
     position_mode: PositionMode = POSITION_MODE_SINGLE
     entry_frequency: EntryFrequency = ENTRY_FREQUENCY_UNLIMITED
     max_concurrent_positions: int | None = 1
+    supports_position_adoption: bool = False
 
     def __post_init__(self) -> None:
         valid_modes = {POSITION_MODE_SINGLE, POSITION_MODE_MULTI}
@@ -101,6 +102,7 @@ class StrategyKernel:
     """
 
     SPEC: ClassVar[StrategySpec]
+    POSITION_ADOPTION_REQUIRED_FIELDS: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, params: Mapping[str, Any] | None = None) -> None:
         self.params: Mapping[str, Any] = params or {}
@@ -132,5 +134,17 @@ class StrategyKernel:
         """Optional. Called once when the engine starts.
 
         Use to initialise state keys before the first generate() call.
+        """
+        return None
+
+    def on_adopt_position(
+        self,
+        position: Position,
+        adoption: PositionAdoption,
+        state: dict,
+    ) -> Position | None:
+        """Optional. Seed strategy state for an operator-mapped broker position.
+
+        Return the strategy-owned position lot to adopt, or None to reject.
         """
         return None

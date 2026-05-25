@@ -67,6 +67,8 @@ strategies/**
 
 # Internal strategy documentation/tests can reveal IDs, instruments,
 # thresholds, scoring formulas, exits, or adopted-position ownership.
+# `docs/roadmap/` is the local backlog/review/deferred-work area and remains
+# ignored unless a note is deliberately sanitized for public docs.
 *.md
 !README.md
 docs/**

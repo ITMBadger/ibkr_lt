@@ -25,6 +25,7 @@ from core.adapters.paper.data import ReplayDataProvider
 from core.audit import AuditLogger, configure_runtime_logging
 from core.audit.logger import allocate_run_log_dir
 from core.engine.loader import get_registry
+from core.engine.timeframes import Timeframe
 from core.exceptions import ConfigError
 from core.risk.policy import SIZING_MODE_FULL_EQUITY, RiskPolicy
 
@@ -167,6 +168,7 @@ def run_backtest(
 ) -> BacktestResult:
     run_started = time.perf_counter()
     strategies = list(strategies)
+    _validate_warmup_lookback(settings, strategies)
     instruments = required_instruments(strategies)
     validate_csv_path(settings.csv_path, instruments)
     evaluation_timeframes = (
@@ -400,6 +402,85 @@ def _build_audit_logger(settings: BacktestSettings) -> tuple[AuditLogger | None,
         run_subdir=True,
     )
     return audit_logger, audit_logger.log_dir
+
+
+def _validate_warmup_lookback(settings: BacktestSettings, strategies) -> None:
+    problems: list[str] = []
+    for kernel, _ in strategies:
+        spec = kernel.SPEC
+        for timeframe_label, warmup_bars in spec.warmup_bars.items():
+            required = _minimum_calendar_lookback_days(
+                timeframe_label=str(timeframe_label),
+                warmup_bars=int(warmup_bars),
+                settings=settings,
+            )
+            if required is not None and settings.lookback_days < required:
+                problems.append(
+                    f"{spec.id} warmup_bars[{timeframe_label}]={warmup_bars} "
+                    f"needs about {required} calendar lookback days; "
+                    f"configured lookback_days={settings.lookback_days}"
+                )
+    if problems:
+        detail = "; ".join(problems)
+        raise ConfigError(
+            "Configured lookback_days is too short for the selected strategy warmup. "
+            f"{detail}. Use --lookback-days or the correct --config file."
+        )
+
+
+def _minimum_calendar_lookback_days(
+    *,
+    timeframe_label: str,
+    warmup_bars: int,
+    settings: BacktestSettings,
+) -> int | None:
+    if warmup_bars <= 0:
+        return None
+    try:
+        timeframe = Timeframe.parse(timeframe_label)
+    except ValueError:
+        return None
+
+    if timeframe.seconds < 86400:
+        session_seconds = _session_seconds(settings.market_open, settings.market_close)
+        bars_per_session = max(1, session_seconds // timeframe.seconds)
+        required_trading_days = _ceil_div(warmup_bars, bars_per_session)
+    else:
+        required_trading_days = _ceil_div(warmup_bars, max(1, timeframe.seconds // 86400))
+
+    return _trading_days_to_calendar_days(required_trading_days)
+
+
+def _session_seconds(market_open: str, market_close: str) -> int:
+    open_hour, open_minute = _parse_hhmm(market_open)
+    close_hour, close_minute = _parse_hhmm(market_close)
+    seconds = ((close_hour * 60 + close_minute) - (open_hour * 60 + open_minute)) * 60
+    if seconds <= 0:
+        raise ConfigError(
+            f"market_close must be after market_open: {market_open!r} to {market_close!r}"
+        )
+    return seconds
+
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    try:
+        hour_text, minute_text = value.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid market time {value!r}; expected HH:MM") from exc
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ConfigError(f"Invalid market time {value!r}; expected HH:MM")
+    return hour, minute
+
+
+def _trading_days_to_calendar_days(required_trading_days: int) -> int:
+    # Convert weekday-only sessions to calendar days and leave a small holiday buffer.
+    return _ceil_div(required_trading_days * 7, 5) + 10
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return -(-numerator // denominator)
 
 
 def _ensure_utc(timestamp: datetime) -> datetime:

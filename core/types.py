@@ -142,6 +142,17 @@ class Position:
 
 
 @dataclass(frozen=True)
+class PositionAdoption:
+    """Operator-approved mapping for adopting an existing broker position lot."""
+
+    strategy_id: str
+    quantity: float
+    entry_ts: datetime | None
+    trade_id: str | None
+    source_position_id: str
+
+
+@dataclass(frozen=True)
 class AccountSnapshot:
     """Point-in-time account summary from the broker."""
 

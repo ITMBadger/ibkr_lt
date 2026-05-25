@@ -1,8 +1,11 @@
-"""Stoch 3m Cross Long -- simple QQQ stochastic-D cross strategy.
+"""Stoch 3m Cross Long -- simple QQQ stochastic-D cross sample.
 
 Signal: QQQ 3-minute Stochastic slowD crosses from below 20 to above 20.
 Entry window: 10:00-15:30 America/New_York, end-exclusive.
 Execution: QQQ long. Protection: broker-side 1.5% stop after entry fill.
+
+This is a public sample strategy for framework/testing workflows. It is not
+approved for live capital deployment.
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ MARKET_TZ = ZoneInfo("America/New_York")
 
 @register_strategy
 class Stoch3mCrossLong(StrategyKernel):
-    """Buy QQQ when 3-minute stochastic slowD crosses up through 20."""
+    """Sample: buy QQQ when 3-minute stochastic slowD crosses up through 20."""
 
     _BAR_SIZE = "3m"
     _PARALLEL_BACKTEST_SAFE = True
