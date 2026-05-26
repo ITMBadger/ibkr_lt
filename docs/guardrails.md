@@ -75,15 +75,17 @@ not match any enabled strategy execution instrument are logged as unmanaged and
 startup continues. Broker positions that match one or more enabled strategy
 execution instruments either use a stored ownership-ledger/config allocation or
 pause startup at `awaiting_startup_mapping` until an operator submits protected
-API allocations. A strategy can adopt a live broker position only when its
+allocations through the API or dashboard. A strategy can adopt a live broker
+position only when its
 `PositionPolicy.supports_position_adoption` is `True` and
 `on_adopt_position()` returns the strategy-owned `Position`.
 
 Each allocation must include an explicit `quantity`; startup no longer assumes
 the strategy's configured entry size is the adoption size. If multiple enabled
 strategies share the same execution instrument, the operator or private config
-must choose the owner. If mapping is required and the control API is disabled,
-live startup fails fast rather than waiting without a mapping path.
+must choose the owner. If mapping is required and neither the control API nor
+the protected dashboard is available, live startup fails fast rather than
+waiting without a mapping path.
 
 `runs/state/position_ownership.json` records bot-created live ownership from
 fills and is used only to remap still-open broker positions on restart. YAML
@@ -187,10 +189,33 @@ Hermes agent/operator.
 - Local-only hosts (`127.0.0.1`, `localhost`, `::1`) may run without a token.
 - Non-local hosts such as `0.0.0.0` or LAN IPs require `IBKR_LT_API_TOKEN` before startup.
 - Protected when a token is set: `/api/v1/runtime/*`, `/api/v1/positions`, `/api/v1/events`, `/api/v1/startup/*`, `/ws/events`.
-- API routes read through `Engine.snapshot_state()`.
+- API routes read through `core/operator/OperatorService`, which delegates to
+  safe engine methods such as `Engine.snapshot_state()`.
 - API routes must not call broker adapters, `OrderManager`, or strategies directly.
 - No manual trade or order-cancel endpoints are active.
 - Startup mutation is limited to `/api/v1/startup/mappings` and `/api/v1/startup/refresh`.
+
+### Optional Protected Dashboard
+
+The runtime auto-detects an optional proprietary dashboard plugin named
+`protected_dashboard`. When present and licensed, it mounts on the same
+FastAPI/uvicorn process under `/dashboard`. Missing, expired, disabled, or
+broken dashboard packages are non-fatal; the runtime continues API-only.
+
+- Public code owns only the loader/contract under `dashboard/`.
+- Protected dashboard code must stay outside git and should later be shipped as
+  a compiled protected module.
+- The dashboard uses the same `OperatorService` facade as the API.
+- The dashboard can display runtime status, broker positions, strategy-owned
+  positions, recent events, net liquidation from the broker account snapshot,
+  and startup gate state.
+- Dashboard startup mapping submits the same allocation payload as the API and
+  must include explicit `quantity`.
+- Dashboard routes use the same bearer-token policy as protected API endpoints
+  when `IBKR_LT_API_TOKEN` is set.
+- `IBKR_LT_DASHBOARD_DISABLED=1` disables dashboard probing for troubleshooting.
+- Dashboard code must not call broker adapters, `OrderManager`, strategies, or
+  manual trade/order-cancel functionality directly.
 
 ### Heartbeat Monitor
 

@@ -14,6 +14,7 @@ from typing import Any, Sequence
 from core import DataFeed, Engine, Instrument, WallClock, load_strategies
 from core.adapters.ibkr.broker import IBKRBroker
 from core.adapters.ibkr.client import IBKRClient
+from core.adapters.ibkr.contracts import IBKRInstrumentResolver
 from core.adapters.ibkr.data import IBKRDataProvider
 from core.adapters.polygon.data import PolygonDataProvider
 from core.adapters.csv.data import CSVDataProvider
@@ -102,10 +103,11 @@ def main() -> None:
         if sid not in registry:
             print(f"Unknown strategy '{sid}'. Available: {list(registry.keys())}")
             sys.exit(1)
-        strategies.append((registry[sid](), {}))
+        strategies.append((registry[sid](_strategy_params(config, sid)), {}))
 
     broker, shared = _build_broker(config)
     data_feed = _build_data_feed(config, shared)
+    instrument_resolver = _build_instrument_resolver(config, shared)
 
     print(f"Execution: {broker.name}")
     print(f"IBKR environment: {config.get('mode', '')}")
@@ -146,6 +148,7 @@ def main() -> None:
         metadata_profile=metadata_profile,
         strategy_aliases=strategy_aliases,
         startup_position_gate_enabled=str(config.get("mode", "")).lower() == "live",
+        instrument_resolver=instrument_resolver,
     )
     api_metadata = _api_metadata(
         config,
@@ -332,6 +335,21 @@ def _build_data_feed(config: dict[str, Any], shared: dict[str, Any]) -> DataFeed
     return DataFeed(historical, live)
 
 
+def _build_instrument_resolver(config: dict[str, Any], shared: dict[str, Any]):
+    execution = dict(config.get("execution") or {})
+    if execution.get("provider", "ibkr") != "ibkr":
+        return None
+    client = shared.get("ibkr_client")
+    if client is None:
+        return None
+    cfg = dict(config.get("instrument_resolution") or {})
+    return IBKRInstrumentResolver(
+        client,
+        min_days_to_expiry=int(cfg.get("min_days_to_expiry", 7)),
+        lookahead_contracts=int(cfg.get("lookahead_contracts", 2)),
+    )
+
+
 def _build_data_provider(cfg: dict[str, Any], shared: dict[str, Any]):
     provider = cfg.get("provider", "ibkr")
     if provider == "ibkr":
@@ -373,6 +391,16 @@ def _strategy_packages(config: dict[str, Any]) -> list[str]:
     if isinstance(configured, str):
         return [configured]
     return [str(item) for item in configured]
+
+
+def _strategy_params(config: dict[str, Any], strategy_id: str) -> dict[str, Any]:
+    configured = config.get("strategy_params") or {}
+    if not isinstance(configured, Mapping):
+        raise ValueError("strategy_params must be a mapping of strategy_id to params")
+    raw = configured.get(strategy_id) or {}
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"strategy_params.{strategy_id} must be a mapping")
+    return dict(raw)
 
 
 def _metadata_profile(config: dict[str, Any]) -> str:

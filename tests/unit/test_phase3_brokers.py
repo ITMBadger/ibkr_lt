@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from core.types import (
-    Bar, Fill, Instrument, OrderRequest, QuantityRules,
+    AccountSnapshot, Bar, Fill, Instrument, OrderRequest, QuantityRules,
 )
 from core.engine.timeframes import TF_1M
 from core.portfolio.state import PortfolioState
@@ -129,6 +129,18 @@ class TestPortfolioState:
         pos = ps.get_position(QQQ)
         assert pos is not None
         assert pos.quantity == pytest.approx(-2.0)
+
+    def test_account_snapshot_updates_net_liquidation(self):
+        ps = PortfolioState()
+
+        ps.update_account(AccountSnapshot(
+            account_id="DU123",
+            net_liquidation=123_456.78,
+            buying_power=200_000.0,
+            available_funds=150_000.0,
+        ))
+
+        assert ps.net_liquidation() == pytest.approx(123_456.78)
 
 
 # ---------------------------------------------------------------------------

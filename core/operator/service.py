@@ -37,8 +37,15 @@ class OperatorService:
     def submit_startup_mappings(
         self,
         allocations: Sequence[Mapping[str, Any]],
+        *,
+        ack_unmanaged_remainders: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        return dict(self.engine.submit_startup_mappings(allocations))
+        return dict(
+            self.engine.submit_startup_mappings(
+                allocations,
+                ack_unmanaged_remainders=ack_unmanaged_remainders,
+            )
+        )
 
     def request_startup_gate_refresh(self) -> dict[str, Any]:
         return dict(self.engine.request_startup_gate_refresh())

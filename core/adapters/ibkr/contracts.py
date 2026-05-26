@@ -26,6 +26,31 @@ except ImportError:
     _IBContract = object  # type: ignore[assignment,misc]
 
 
+class IBKRInstrumentResolver:
+    """Resolve IBKR-traded instruments that need broker contract discovery."""
+
+    def __init__(
+        self,
+        client: "IBKRClient",
+        *,
+        min_days_to_expiry: int = 7,
+        lookahead_contracts: int = 2,
+    ) -> None:
+        self._client = client
+        self._min_days_to_expiry = int(min_days_to_expiry)
+        self._lookahead_contracts = int(lookahead_contracts)
+
+    async def resolve(self, instrument: Instrument) -> Instrument:
+        if instrument.asset_class != "future" or instrument.expiry is not None:
+            return instrument
+        return await resolve_front_month_future(
+            self._client,
+            instrument,
+            min_days_to_expiry=self._min_days_to_expiry,
+            lookahead_contracts=self._lookahead_contracts,
+        )
+
+
 def instrument_to_contract(instrument: Instrument) -> "_IBContract":
     """Build an ibapi Contract from an Instrument.
 

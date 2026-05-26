@@ -25,8 +25,17 @@ async def submit_startup_mappings(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="payload must include allocations list",
         )
+    ack_unmanaged_remainders = payload.get("ack_unmanaged_remainders", [])
+    if not isinstance(ack_unmanaged_remainders, list):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ack_unmanaged_remainders must be a list",
+        )
     try:
-        return operator.submit_startup_mappings(allocations)
+        return operator.submit_startup_mappings(
+            allocations,
+            ack_unmanaged_remainders=ack_unmanaged_remainders,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

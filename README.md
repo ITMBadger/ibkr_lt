@@ -114,9 +114,21 @@ The runtime auto-detects an optional proprietary dashboard plugin named
 it is mounted on the same FastAPI/uvicorn host under `/dashboard`. When it is
 missing, expired, disabled, or broken, startup continues in API-only mode.
 
-The dashboard uses the same safe operator facade as the API. It can read broker
-positions and submit startup position mappings, but it must not call broker
-adapters, submit trades, cancel orders, or inspect strategy internals directly.
+The dashboard uses the same safe `OperatorService` facade as the API. It can
+show runtime status, broker positions, strategy-owned positions, recent events,
+net liquidation from the broker account snapshot, and startup gate state. It can
+submit startup position mappings, but it must not call broker adapters, submit
+trades, cancel orders, or inspect strategy internals directly.
+
+Default dashboard URL when the protected plugin is present:
+
+```text
+http://127.0.0.1:8550/dashboard
+```
+
+If `IBKR_LT_API_TOKEN` is set, the dashboard API calls require the same bearer
+token as protected API endpoints. Paste the token into the dashboard token field
+for a local browser session.
 
 Disable dashboard probing for troubleshooting with:
 
@@ -182,15 +194,17 @@ strategy_modes:
 Live mode checks broker positions after connecting. Broker positions that do
 not match enabled strategy execution instruments are logged as unmanaged and
 startup continues. Matching positions pause startup at `awaiting_startup_mapping`
-until an operator submits allocations through `POST /api/v1/startup/mappings`.
+until an operator submits allocations through `POST /api/v1/startup/mappings`
+or the protected dashboard mapping panel.
 Only strategies that declare `supports_position_adoption=True` and implement
 `on_adopt_position()` can receive an adopted live position.
 
 Allocations must include an explicit `quantity`. Stored ownership is recovered
 from `runs/state/position_ownership.json` when the bot previously opened the
 position; `adopted_positions` in a private config can provide explicit startup
-ownership when needed. If live startup needs operator mapping and the control
-API is disabled, startup fails fast instead of waiting indefinitely.
+ownership when needed. If live startup needs operator mapping and neither the
+control API nor the protected dashboard is available, startup fails fast instead
+of waiting indefinitely.
 
 ## Event Backtesting
 

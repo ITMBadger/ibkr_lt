@@ -15,9 +15,11 @@ from core.orders.strategy_modes import validate_strategy_modes
 from main import (
     _api_metadata,
     _build_broker,
+    _build_instrument_resolver,
     _config_from_args,
     _legacy_cli_config,
     _start_control_api,
+    _strategy_params,
     _startup_mapping_enabled,
 )
 
@@ -121,6 +123,48 @@ def test_api_metadata_uses_normalized_strategy_modes_argument():
     )
 
     assert metadata["strategy_modes"] == {"a": "dry_run"}
+
+
+def test_strategy_params_returns_per_strategy_mapping():
+    params = _strategy_params(
+        {
+            "strategy_params": {
+                "sample_futures_strategy": {
+                    "execution_instrument": {
+                        "asset_class": "future",
+                        "symbol": "MNQ",
+                    }
+                }
+            }
+        },
+        "sample_futures_strategy",
+    )
+
+    assert params == {
+        "execution_instrument": {
+            "asset_class": "future",
+            "symbol": "MNQ",
+        }
+    }
+
+
+def test_build_instrument_resolver_uses_shared_ibkr_client():
+    client = object()
+    resolver = _build_instrument_resolver(
+        {
+            "execution": {"provider": "ibkr"},
+            "instrument_resolution": {
+                "min_days_to_expiry": 9,
+                "lookahead_contracts": 3,
+            },
+        },
+        {"ibkr_client": client},
+    )
+
+    assert resolver is not None
+    assert resolver._client is client
+    assert resolver._min_days_to_expiry == 9
+    assert resolver._lookahead_contracts == 3
 
 
 def test_strategy_modes_reject_unknown_strategy_id():

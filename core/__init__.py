@@ -32,6 +32,7 @@ from .interfaces.strategy import (
     StrategyKernel,
     StrategySpec,
 )
+from .interfaces.instruments import InstrumentResolver
 from .engine.loader import register_strategy, load_strategies
 from .engine.runner import Engine
 from .engine.clock import WallClock, SimulatedClock
@@ -64,6 +65,7 @@ __all__ = [
     "ProtectiveStopUpdate",
     "StrategyKernel",
     "StrategySpec",
+    "InstrumentResolver",
     "register_strategy",
     "load_strategies",
     "Engine",

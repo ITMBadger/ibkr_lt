@@ -42,13 +42,31 @@ api:
 strategy_packages:
   - strategies
   # Add protected_strategies in a private/customer config after placing
-  # PyArmor/Cython-protected strategy modules there.
+  # compiled/obfuscated protected strategy modules there.
   # - protected_strategies
 
 strategies:
   # Public sample only. Replace with a private strategy in a local config before
   # any live-capital deployment.
   - stoch_3m_cross_long
+
+# Optional per-strategy params. Keep protected strategy rules private, but
+# instrument/contract identifiers may be configured here or in a private config.
+# strategy_params:
+#   my_futures_strategy:
+#     primary_instrument:
+#       asset_class: equity
+#       symbol: QQQ
+#       exchange: NASDAQ
+#       currency: USD
+#     execution_instrument:
+#       asset_class: future
+#       symbol: MNQ
+#       exchange: CME
+#       currency: USD
+#       # Optional for IBKR futures: omit expiry to resolve front month at startup.
+#       expiry: "202606"
+#       multiplier: 2
 
 # Strategy modes are enforced inside OrderManager.
 # live submits native orders; dry_run logs intent without broker submission.

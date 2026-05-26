@@ -11,7 +11,7 @@ import asyncio
 import itertools
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable
 
 from .strategy_modes import STRATEGY_MODE_DRY_RUN, strategy_mode_map
@@ -57,6 +57,7 @@ class OrderManager:
         sizing_price_provider: Callable[[Instrument], float | None] | None = None,
         sizing_equity_provider: Callable[[], float | None] | None = None,
         fill_listener: Callable[[Fill], None] | None = None,
+        strategy_execution_instruments: Mapping[str, Instrument] | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -77,6 +78,7 @@ class OrderManager:
         self._sizing_price_provider = sizing_price_provider
         self._sizing_equity_provider = sizing_equity_provider
         self._fill_listener = fill_listener
+        self._strategy_execution_instruments = dict(strategy_execution_instruments or {})
         self._dry_run_counter = itertools.count(1)
         self._trade_counter = itertools.count(1)
         self._order_trade_id: dict[str, str | None] = {}
@@ -224,11 +226,11 @@ class OrderManager:
         position: Position,
         stop_price: float,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """Submit or tighten the broker-side protective stop for an open lot."""
         spec = self._protective_stops.get(strategy_id)
         if spec is None:
-            return
+            return False
         if self._is_dry_run_strategy(strategy_id):
             self._write_order_event(
                 "protective_stop_update_dropped",
@@ -237,7 +239,7 @@ class OrderManager:
                 position=position,
                 requested_stop_price=stop_price,
             )
-            return
+            return False
         if position.quantity == 0 or stop_price <= 0:
             self._write_order_event(
                 "protective_stop_update_dropped",
@@ -246,7 +248,7 @@ class OrderManager:
                 position=position,
                 requested_stop_price=stop_price,
             )
-            return
+            return False
 
         position_key = self._position_key(
             strategy_id,
@@ -272,7 +274,7 @@ class OrderManager:
                     requested_stop_price=rounded_stop,
                     position=position,
                 )
-                return
+                return True
             order = OrderRequest(
                 instrument=position.instrument,
                 side=stop_side,
@@ -291,7 +293,7 @@ class OrderManager:
                     order=order,
                     position=position,
                 )
-                return
+                return False
             self._write_order_event(
                 "protective_stop_update_intent",
                 strategy_id=strategy_id,
@@ -323,7 +325,7 @@ class OrderManager:
                 current_record.order_id,
                 status.status,
             )
-            return
+            return status.status not in _UNACCEPTED_ORDER_STATUSES
 
         strategy_ref = self._safe_strategy_id(strategy_id)
         stop_key = f"{strategy_ref}-{position.instrument.symbol}-protective-stop-update"
@@ -347,7 +349,7 @@ class OrderManager:
                 order=order,
                 position=position,
             )
-            return
+            return False
         self._write_order_event(
             "protective_stop_update_intent",
             strategy_id=strategy_id,
@@ -371,6 +373,7 @@ class OrderManager:
             status=status,
             position=position,
         )
+        return status.status not in _UNACCEPTED_ORDER_STATUSES
 
     # ------------------------------------------------------------------
     # Drain tasks (run as asyncio tasks by Engine)
@@ -459,6 +462,8 @@ class OrderManager:
                 broker=self._broker.name,
             )
             return
+
+        signal = self._normalize_signal_instrument(signal, strategy_id)
 
         # Size the order
         trade_id = self._resolve_trade_id(signal, strategy_id)
@@ -954,6 +959,14 @@ class OrderManager:
             return None
         return self._sizing_equity_provider()
 
+    def _normalize_signal_instrument(self, signal: Signal, strategy_id: str) -> Signal:
+        execution = self._strategy_execution_instruments.get(strategy_id)
+        if execution is None or signal.instrument == execution:
+            return signal
+        if not _same_underlying(signal.instrument, execution):
+            return signal
+        return replace(signal, instrument=execution)
+
     def _dry_run_status(self, strategy_id: str) -> OrderStatus:
         return OrderStatus(
             broker_order_id=f"dry-run-{strategy_id}-{next(self._dry_run_counter)}",
@@ -1004,6 +1017,13 @@ def _round_stop_price(instrument, price: float) -> float:
     if instrument.asset_class in {"equity", "option"}:
         return round(price, 2)
     return round(price, 4)
+
+
+def _same_underlying(left: Instrument, right: Instrument) -> bool:
+    return (
+        str(left.asset_class).lower() == str(right.asset_class).lower()
+        and left.symbol.upper() == right.symbol.upper()
+    )
 
 
 def _protective_stop_improves(side: str, requested_stop: float, current_stop: float) -> bool:

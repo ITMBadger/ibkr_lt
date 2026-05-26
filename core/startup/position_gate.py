@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -21,11 +22,18 @@ PHASE_AWAITING_MAPPING = "awaiting_mapping"
 PHASE_BLOCKED = "blocked"
 PHASE_MAPPED = "mapped"
 PHASE_RELEASED = "released"
+_QTY_EPSILON = 1e-9
 
 _DERIVATIVE_REQUIRED_FIELDS = {
     "future": ("exchange", "currency", "expiry", "multiplier"),
     "option": ("exchange", "currency", "expiry", "strike", "right", "multiplier"),
 }
+
+
+@dataclass(frozen=True)
+class StartupMappingSubmission:
+    allocations: list[dict[str, Any]]
+    unmanaged_remainder_acknowledgements: list[dict[str, Any]]
 
 
 def build_startup_gate_status(
@@ -106,6 +114,7 @@ def build_startup_gate_status(
             "message": "Broker positions match enabled strategies but cannot be adopted safely.",
             "positions": required,
             "allocations": [],
+            "unmanaged_remainder_acknowledgements": [],
             "unmanaged": unmanaged,
             "last_error": None,
         }
@@ -117,6 +126,7 @@ def build_startup_gate_status(
             "message": "No broker positions match enabled strategy execution instruments.",
             "positions": [],
             "allocations": [],
+            "unmanaged_remainder_acknowledgements": [],
             "unmanaged": unmanaged,
             "last_error": None,
         }
@@ -127,6 +137,7 @@ def build_startup_gate_status(
         "message": "Broker positions require ownership mapping before live startup can continue.",
         "positions": required,
         "allocations": [],
+        "unmanaged_remainder_acknowledgements": [],
         "unmanaged": unmanaged,
         "last_error": None,
     }
@@ -146,6 +157,7 @@ def build_startup_gate_status(
             status,
             auto_allocations,
             require_awaiting=False,
+            require_remainder_ack=False,
         )
     except ValueError as exc:
         status["phase"] = PHASE_BLOCKED
@@ -153,11 +165,16 @@ def build_startup_gate_status(
         status["last_error"] = str(exc)
         return status
 
-    covered_positions = {allocation["position_id"] for allocation in normalized}
+    allocated_by_position: dict[str, float] = defaultdict(float)
+    for allocation in normalized:
+        allocated_by_position[str(allocation["position_id"])] += float(allocation["quantity"])
     missing = [
         item["position_id"]
         for item in required
-        if item["position_id"] not in covered_positions
+        if (
+            abs(float(item.get("quantity", 0.0)))
+            - allocated_by_position.get(str(item["position_id"]), 0.0)
+        ) > _QTY_EPSILON
     ]
     status["allocations"] = normalized
     if not missing:
@@ -170,8 +187,27 @@ def validate_startup_allocations(
     status: Mapping[str, Any],
     allocations: Sequence[Mapping[str, Any]],
     *,
+    ack_unmanaged_remainders: Sequence[Mapping[str, Any]] | None = None,
     require_awaiting: bool = True,
+    require_remainder_ack: bool = True,
 ) -> list[dict[str, Any]]:
+    return validate_startup_mapping_submission(
+        status,
+        allocations,
+        ack_unmanaged_remainders=ack_unmanaged_remainders,
+        require_awaiting=require_awaiting,
+        require_remainder_ack=require_remainder_ack,
+    ).allocations
+
+
+def validate_startup_mapping_submission(
+    status: Mapping[str, Any],
+    allocations: Sequence[Mapping[str, Any]],
+    *,
+    ack_unmanaged_remainders: Sequence[Mapping[str, Any]] | None = None,
+    require_awaiting: bool = True,
+    require_remainder_ack: bool = True,
+) -> StartupMappingSubmission:
     if require_awaiting and status.get("phase") != PHASE_AWAITING_MAPPING:
         raise ValueError("startup gate is not awaiting position mappings")
     if not allocations:
@@ -265,6 +301,92 @@ def validate_startup_allocations(
             "trade_id": str(raw.get("trade_id") or "") or None,
             "source": str(raw.get("source") or "operator"),
         })
+    remainder_acknowledgements = _validate_unmanaged_remainder_acknowledgements(
+        positions,
+        allocated_by_position,
+        ack_unmanaged_remainders or [],
+        require_remainder_ack=require_remainder_ack,
+    )
+    return StartupMappingSubmission(
+        allocations=normalized,
+        unmanaged_remainder_acknowledgements=remainder_acknowledgements,
+    )
+
+
+def _validate_unmanaged_remainder_acknowledgements(
+    positions: Mapping[str, Mapping[str, Any]],
+    allocated_by_position: Mapping[str, float],
+    acknowledgements: Sequence[Mapping[str, Any]],
+    *,
+    require_remainder_ack: bool,
+) -> list[dict[str, Any]]:
+    remainders: dict[str, float] = {}
+    for position_id_key, position in positions.items():
+        available = abs(float(position.get("quantity", 0.0)))
+        remaining = available - float(allocated_by_position.get(position_id_key, 0.0))
+        if remaining > _QTY_EPSILON:
+            remainders[position_id_key] = remaining
+
+    if not require_remainder_ack:
+        return []
+    if not remainders:
+        if acknowledgements:
+            raise ValueError("unmanaged remainder acknowledgement has no matching remainder")
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    acknowledged: set[str] = set()
+    for raw in acknowledgements:
+        position_id_key = str(raw.get("position_id", "")).strip()
+        if not position_id_key:
+            raise ValueError("unmanaged remainder acknowledgement is missing position_id")
+        if position_id_key not in remainders:
+            raise ValueError(
+                f"unmanaged remainder acknowledgement for {position_id_key!r} "
+                "has no matching remainder"
+            )
+        if position_id_key in acknowledged:
+            raise ValueError(
+                f"duplicate unmanaged remainder acknowledgement for {position_id_key!r}"
+            )
+        try:
+            quantity = float(raw.get("quantity"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"unmanaged remainder acknowledgement for {position_id_key!r} "
+                "has invalid quantity"
+            ) from exc
+        if quantity <= 0:
+            raise ValueError(
+                f"unmanaged remainder acknowledgement for {position_id_key!r} "
+                "must have quantity > 0"
+            )
+        expected = remainders[position_id_key]
+        if abs(quantity - expected) > _QTY_EPSILON:
+            raise ValueError(
+                f"unmanaged remainder acknowledgement for {position_id_key!r} "
+                f"must cover remaining quantity {expected}"
+            )
+        reason = str(raw.get("reason") or "").strip()
+        if not reason:
+            raise ValueError(
+                f"unmanaged remainder acknowledgement for {position_id_key!r} "
+                "is missing reason"
+            )
+        acknowledged.add(position_id_key)
+        normalized.append({
+            "position_id": position_id_key,
+            "quantity": quantity,
+            "reason": reason,
+            "source": str(raw.get("source") or "operator"),
+        })
+
+    missing = sorted(set(remainders) - acknowledged)
+    if missing:
+        raise ValueError(
+            "startup allocation leaves unmanaged remainder; acknowledgement "
+            f"required for {', '.join(missing)}"
+        )
     return normalized
 
 
@@ -276,6 +398,13 @@ def instruments_match(position_instrument: Instrument, strategy_instrument: Inst
         return _simple_fields_match(position_instrument, strategy_instrument)
     required_fields = _DERIVATIVE_REQUIRED_FIELDS[asset_class]
     for field in required_fields:
+        if asset_class == "future" and field == "expiry":
+            if not _future_contract_month_equal(
+                position_instrument.expiry,
+                strategy_instrument.expiry,
+            ):
+                return False
+            continue
         if not _instrument_field_equal(
             getattr(position_instrument, field),
             getattr(strategy_instrument, field),
@@ -506,6 +635,17 @@ def _instrument_field_equal(left: Any, right: Any) -> bool:
     if isinstance(left, float | int) or isinstance(right, float | int):
         return _normalize_float(left) == _normalize_float(right)
     return str(left).upper() == str(right).upper()
+
+
+def _future_contract_month_equal(left: Any, right: Any) -> bool:
+    left_date = _parse_optional_date(left)
+    right_date = _parse_optional_date(right)
+    if left_date is None or right_date is None:
+        return False
+    return (
+        left_date.year == right_date.year
+        and left_date.month == right_date.month
+    )
 
 
 def _normalize_optional(value: Any, *, upper: bool = False) -> str | None:

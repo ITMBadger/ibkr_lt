@@ -23,7 +23,7 @@ from .position_gate import (
     parse_optional_timestamp,
     position_gate_item,
     position_id,
-    validate_startup_allocations,
+    validate_startup_mapping_submission,
 )
 
 if TYPE_CHECKING:
@@ -41,6 +41,7 @@ WriteStartupEvent = Callable[..., None]
 class StartupGateResult:
     allocations: list[dict[str, Any]]
     positions: list[Position]
+    unmanaged_remainder_acknowledgements: list[dict[str, Any]]
 
 
 class StartupPositionGateController:
@@ -76,6 +77,7 @@ class StartupPositionGateController:
             "message": "",
             "positions": [],
             "allocations": [],
+            "unmanaged_remainder_acknowledgements": [],
             "unmanaged": [],
             "last_error": None,
         }
@@ -83,6 +85,9 @@ class StartupPositionGateController:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._action: str | None = None
         self._submitted_allocations: list[dict[str, Any]] | None = None
+        self._submitted_unmanaged_remainder_acknowledgements: (
+            list[dict[str, Any]] | None
+        ) = None
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -95,23 +100,36 @@ class StartupPositionGateController:
     def submit_mappings(
         self,
         allocations: Sequence[Mapping[str, Any]],
+        *,
+        ack_unmanaged_remainders: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             try:
-                normalized = validate_startup_allocations(self._status, allocations)
+                submission = validate_startup_mapping_submission(
+                    self._status,
+                    allocations,
+                    ack_unmanaged_remainders=ack_unmanaged_remainders,
+                )
             except ValueError as exc:
                 self._status["last_error"] = str(exc)
                 self._write_startup_event(
                     "startup_position_mapping_rejected",
                     reason=str(exc),
                     allocations=list(allocations),
+                    ack_unmanaged_remainders=list(ack_unmanaged_remainders or []),
                 )
                 raise
-            self._submitted_allocations = normalized
+            self._submitted_allocations = submission.allocations
+            self._submitted_unmanaged_remainder_acknowledgements = (
+                submission.unmanaged_remainder_acknowledgements
+            )
             self._action = "continue"
             self._status["phase"] = PHASE_MAPPED
             self._status["message"] = "Startup position mappings accepted."
-            self._status["allocations"] = normalized
+            self._status["allocations"] = submission.allocations
+            self._status["unmanaged_remainder_acknowledgements"] = (
+                submission.unmanaged_remainder_acknowledgements
+            )
             self._status["last_error"] = None
             event = self._event
             loop = self._loop
@@ -134,6 +152,7 @@ class StartupPositionGateController:
             "message": message,
             "positions": [],
             "allocations": [],
+            "unmanaged_remainder_acknowledgements": [],
             "unmanaged": [],
             "last_error": None,
         })
@@ -158,6 +177,9 @@ class StartupPositionGateController:
                 return StartupGateResult(
                     allocations=list(status.get("allocations", [])),
                     positions=list(current_positions),
+                    unmanaged_remainder_acknowledgements=list(
+                        status.get("unmanaged_remainder_acknowledgements", [])
+                    ),
                 )
             if status["phase"] == PHASE_BLOCKED:
                 detail = (
@@ -186,8 +208,12 @@ class StartupPositionGateController:
                     action = self._action
                     self._action = None
                     allocations = list(self._submitted_allocations or [])
+                    unmanaged_remainder_acknowledgements = list(
+                        self._submitted_unmanaged_remainder_acknowledgements or []
+                    )
                     if action == "continue":
                         self._submitted_allocations = None
+                        self._submitted_unmanaged_remainder_acknowledgements = None
                 if action == "refresh":
                     current_positions = list(await refresh_positions())
                     break
@@ -195,12 +221,18 @@ class StartupPositionGateController:
                     self._write_startup_event(
                         "startup_gate_released",
                         allocations=allocations,
+                        unmanaged_remainder_acknowledgements=(
+                            unmanaged_remainder_acknowledgements
+                        ),
                     )
                     self._set_status({
                         **self.status(),
                         "phase": PHASE_RELEASED,
                         "message": "Startup position mappings released the engine.",
                         "allocations": allocations,
+                        "unmanaged_remainder_acknowledgements": (
+                            unmanaged_remainder_acknowledgements
+                        ),
                         "last_error": None,
                     })
                     if on_released is not None:
@@ -208,6 +240,9 @@ class StartupPositionGateController:
                     return StartupGateResult(
                         allocations=allocations,
                         positions=list(current_positions),
+                        unmanaged_remainder_acknowledgements=(
+                            unmanaged_remainder_acknowledgements
+                        ),
                     )
 
     def build_status(
@@ -304,6 +339,7 @@ def apply_startup_position_allocations(
     strategy_entries: Sequence[tuple["StrategyKernel", dict]],
     portfolio: "PortfolioState",
     *,
+    unmanaged_remainder_acknowledgements: Sequence[Mapping[str, Any]] | None = None,
     ownership_ledger: "PositionOwnershipLedger | None" = None,
     write_event: WriteStartupEvent | None = None,
 ) -> None:
@@ -368,21 +404,38 @@ def apply_startup_position_allocations(
             adopted_position.trade_id,
         )
 
+    remainder_ack_by_position = {
+        str(item.get("position_id")): dict(item)
+        for item in (unmanaged_remainder_acknowledgements or [])
+    }
     for current_position_id, position in positions_by_id.items():
         remaining = (
             abs(position.quantity)
             - allocated_by_position.get(current_position_id, 0.0)
         )
         if remaining > 1e-9:
+            acknowledgement = remainder_ack_by_position.get(current_position_id)
+            event_name = (
+                "startup_position_unmanaged_acknowledged"
+                if acknowledgement is not None
+                else "startup_position_unmanaged"
+            )
+            reason = (
+                str(acknowledgement.get("reason"))
+                if acknowledgement is not None
+                else "unallocated_remainder"
+            )
             if write_event is not None:
                 write_event(
-                    "startup_position_unmanaged",
+                    event_name,
                     position=position_gate_item(position),
                     unmanaged_quantity=remaining,
-                    reason="unallocated_remainder",
+                    reason=reason,
+                    acknowledgement=acknowledgement,
                 )
             log.warning(
-                "Startup broker position remainder unmanaged: %s %.4f",
+                "Startup broker position remainder unmanaged: %s %.4f reason=%s",
                 position.instrument.symbol,
                 remaining,
+                reason,
             )

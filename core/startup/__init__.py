@@ -14,12 +14,14 @@ from .position_gate import (
     PHASE_INACTIVE,
     PHASE_MAPPED,
     PHASE_RELEASED,
+    StartupMappingSubmission,
     build_startup_gate_status,
     instrument_identity_key,
     parse_optional_timestamp,
     position_gate_item,
     position_id,
     validate_startup_allocations,
+    validate_startup_mapping_submission,
 )
 
 __all__ = [
@@ -31,6 +33,7 @@ __all__ = [
     "PHASE_RELEASED",
     "PositionOwnershipLedger",
     "StartupGateResult",
+    "StartupMappingSubmission",
     "StartupPositionGateController",
     "apply_startup_position_allocations",
     "build_startup_gate_status",
@@ -40,4 +43,5 @@ __all__ = [
     "position_id",
     "resolve_adopted_position_map",
     "validate_startup_allocations",
+    "validate_startup_mapping_submission",
 ]

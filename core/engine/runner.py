@@ -18,6 +18,7 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import TYPE_CHECKING, Any
@@ -48,13 +49,14 @@ from ..interfaces.strategy import (
     StrategyKernel,
 )
 from ..risk.policy import RiskPolicy
-from ..types import Bar, Fill, Instrument, Position, Signal
+from ..types import Bar, Fill, Instrument, MarketContext, Position, Signal
 from .clock import Clock, SimulatedClock, WallClock
 from .scheduler import Scheduler
 
 if TYPE_CHECKING:
     from ..interfaces.broker import BrokerAdapter
     from ..interfaces.data import HistoricalDataProvider, StreamingDataProvider
+    from ..interfaces.instruments import InstrumentResolver
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +103,7 @@ class Engine:
         progress_interval_bars: int = 1000,
         progress_interval_seconds: float = 30.0,
         startup_position_gate_enabled: bool = False,
+        instrument_resolver: "InstrumentResolver | None" = None,
     ) -> None:
         self._broker = broker
         if data_feed is not None:
@@ -111,6 +114,7 @@ class Engine:
             self._data_feed = DataFeed(historical, streaming)
         self._clock = clock or WallClock()
         self._strategies = strategies or []
+        self._instrument_resolver = instrument_resolver
         strategy_ids = [kernel.SPEC.id for kernel, _ in self._strategies]
         self._strategy_modes = strategy_mode_map(strategy_modes, strategy_ids)
         self._dispatch_mode = _normalize_dispatch_mode(dispatch_mode)
@@ -315,6 +319,22 @@ class Engine:
         loop = asyncio.get_running_loop()
         is_simulated = isinstance(self._clock, SimulatedClock)
 
+        # Connect before instrument resolution so adapter-backed resolvers can
+        # query broker contract details without strategies importing adapters.
+        setup_t0 = time.perf_counter()
+        await self._broker.connect()
+        self._set_runtime_state(broker_connected=True)
+        await self._data_feed.connect()
+        self._set_runtime_state(data_connected=True)
+        self._progress.add_timing("setup_connect", time.perf_counter() - setup_t0)
+
+        await self._resolve_runtime_instruments(
+            require_resolved_futures=(
+                not is_simulated
+                and str(getattr(self._broker, "name", "")).lower() == "ibkr"
+            )
+        )
+
         # Build DataManagers for strategy data. Simulated paper replay also
         # needs execution-instrument bars so PaperBroker can resolve fills.
         strategy_data_instruments: set[Instrument] = set()
@@ -347,18 +367,11 @@ class Engine:
             self._progress.total_bars,
         )
 
-        # Connect broker
-        setup_t0 = time.perf_counter()
-        await self._broker.connect()
-        self._set_runtime_state(broker_connected=True)
-        await self._data_feed.connect()
-        self._set_runtime_state(data_connected=True)
-        self._progress.add_timing("setup_connect", time.perf_counter() - setup_t0)
-
         # Portfolio state and order manager
         portfolio = PortfolioState()
         self._set_portfolio(portfolio)
         account_snapshot = await self._broker.get_account()
+        portfolio.update_account(account_snapshot)
         sizing_account = _MarkToMarketSizingState(account_snapshot.net_liquidation)
         adopted = await self._broker.get_positions()
         if self._startup_position_gate_enabled:
@@ -378,6 +391,9 @@ class Engine:
                     gate_result.positions,
                     strategy_entries,
                     portfolio,
+                    unmanaged_remainder_acknowledgements=(
+                        gate_result.unmanaged_remainder_acknowledgements
+                    ),
                     ownership_ledger=self._ownership_ledger,
                     write_event=self._write_startup_order_event,
                 )
@@ -411,6 +427,10 @@ class Engine:
             kernel.SPEC.id: kernel.SPEC.position_policy
             for kernel, _ in self._strategies
         }
+        strategy_execution_instruments = {
+            kernel.SPEC.id: kernel.SPEC.execution_instrument
+            for kernel, _ in self._strategies
+        }
         order_manager = OrderManager(
             self._broker,
             portfolio,
@@ -426,6 +446,7 @@ class Engine:
             sizing_price_provider=sizing_account.latest_price,
             sizing_equity_provider=sizing_account.equity,
             fill_listener=sizing_account.apply_fill,
+            strategy_execution_instruments=strategy_execution_instruments,
         )
 
         # Backfill historical data. Split feeds may load offline history first
@@ -477,6 +498,14 @@ class Engine:
                 len(self._feature_preload_bars),
             )
         features_are_replay_preloaded = is_simulated and bool(self._feature_preload_bars)
+
+        await self._seed_startup_protective_stops(
+            strategy_entries,
+            portfolio,
+            managers,
+            features,
+            order_manager,
+        )
 
         # Subscribe streaming
         for instr in all_instruments:
@@ -869,6 +898,178 @@ class Engine:
         last_evaluation_bars[kernel.SPEC.id] = latest_bar
         return True
 
+    async def _resolve_runtime_instruments(
+        self,
+        *,
+        require_resolved_futures: bool,
+    ) -> None:
+        cache: dict[Instrument, Instrument] = {}
+
+        async def resolve(instrument: Instrument) -> Instrument:
+            if instrument in cache:
+                return cache[instrument]
+            resolved = instrument
+            if self._instrument_resolver is not None:
+                resolved = await self._instrument_resolver.resolve(instrument)
+            elif require_resolved_futures and _future_requires_resolution(instrument):
+                raise RuntimeError(
+                    "unresolved future instrument requires an instrument resolver: "
+                    f"{instrument.symbol}"
+                )
+            if require_resolved_futures and _future_requires_resolution(resolved):
+                raise RuntimeError(
+                    "future instrument was not resolved to a concrete contract: "
+                    f"{resolved.symbol}"
+                )
+            cache[instrument] = resolved
+            if resolved != instrument:
+                self._record_event(
+                    "engine",
+                    "instrument_resolved",
+                    original=instrument,
+                    resolved=resolved,
+                )
+                log.info(
+                    "Resolved instrument %s -> %s expiry=%s",
+                    instrument.symbol,
+                    resolved.symbol,
+                    resolved.expiry,
+                )
+            return resolved
+
+        for kernel, _ in self._strategies:
+            spec = kernel.SPEC
+            primary = await resolve(spec.primary_instrument)
+            execution = await resolve(spec.execution_instrument)
+            resolved_references: list[Instrument] = []
+            for instrument in spec.reference_instruments:
+                resolved_references.append(await resolve(instrument))
+            references = tuple(resolved_references)
+            if (
+                primary != spec.primary_instrument
+                or execution != spec.execution_instrument
+                or references != spec.reference_instruments
+            ):
+                kernel.SPEC = replace(
+                    spec,
+                    primary_instrument=primary,
+                    execution_instrument=execution,
+                    reference_instruments=references,
+                )
+
+    async def _seed_startup_protective_stops(
+        self,
+        strategy_entries: Sequence[tuple[StrategyKernel, dict]],
+        portfolio: PortfolioState,
+        managers: Mapping[Instrument, DataManager],
+        features: FeatureRegistry,
+        order_manager: OrderManager,
+    ) -> None:
+        strategy_lots = portfolio.strategy_position_lots()
+        lot_strategy_ids = {strategy_id for strategy_id, _ in strategy_lots}
+        strategy_positions = [
+            (strategy_id, position)
+            for strategy_id, position in portfolio.strategy_positions()
+            if strategy_id not in lot_strategy_ids
+        ]
+        startup_positions = [*strategy_lots, *strategy_positions]
+        if not startup_positions:
+            return
+
+        entries_by_strategy = {
+            kernel.SPEC.id: (kernel, state)
+            for kernel, state in strategy_entries
+        }
+        for strategy_id, position in startup_positions:
+            entry = entries_by_strategy.get(strategy_id)
+            if entry is None:
+                continue
+            kernel, state = entry
+            if kernel.SPEC.protective_stop is None:
+                continue
+            ctx = self._startup_context(kernel, managers, features)
+            stop_update = kernel.on_protective_stop_update(ctx, position, state)
+            self._write_decision_trace(state)
+            if stop_update is None:
+                raise RuntimeError(
+                    "startup adopted position is missing protective stop update: "
+                    f"strategy={strategy_id} instrument={position.instrument.symbol} "
+                    f"trade_id={position.trade_id}"
+                )
+            self._write_signal_event(
+                strategy_id,
+                "startup_protective_stop_update",
+                ctx.timestamp,
+                stop_update=stop_update,
+                instrument=position.instrument,
+                side=position.side,
+                trade_id=position.trade_id,
+            )
+            submitted = await order_manager.ensure_protective_stop(
+                strategy_id,
+                position,
+                stop_update.stop_price,
+                stop_update.reason,
+            )
+            if not submitted:
+                raise RuntimeError(
+                    "startup adopted position protective stop was not accepted: "
+                    f"strategy={strategy_id} instrument={position.instrument.symbol} "
+                    f"trade_id={position.trade_id}"
+                )
+            self._write_startup_order_event(
+                "startup_protective_stop_seeded",
+                strategy_id=strategy_id,
+                position=position,
+                stop_update=stop_update,
+            )
+
+    def _startup_context(
+        self,
+        kernel: StrategyKernel,
+        managers: Mapping[Instrument, DataManager],
+        features: FeatureRegistry,
+    ) -> MarketContext:
+        primary_manager = managers.get(kernel.SPEC.primary_instrument)
+        if primary_manager is None:
+            raise RuntimeError(
+                f"startup context missing data manager for {kernel.SPEC.primary_instrument.symbol}"
+            )
+        timestamp = primary_manager.latest_timestamp()
+        if timestamp is None:
+            raise RuntimeError(
+                f"startup context has no bars for {kernel.SPEC.primary_instrument.symbol}"
+            )
+        bars: dict[Instrument, dict[str, Any]] = {}
+        for instrument in [
+            kernel.SPEC.primary_instrument,
+            *list(kernel.SPEC.reference_instruments),
+        ]:
+            manager = managers.get(instrument)
+            if manager is None:
+                bars[instrument] = {}
+                continue
+            instrument_bars: dict[str, Any] = {"1m": manager.bars_1m()}
+            for label in kernel.SPEC.timeframes:
+                if label == "1m":
+                    continue
+                instrument_bars[label] = manager.resampled(Timeframe.parse(label))
+            bars[instrument] = instrument_bars
+        feature_view = features.as_of(timestamp)
+        indicators: dict[str, Any] = {}
+        for indicator_id in kernel.SPEC.indicators:
+            try:
+                indicators[indicator_id] = feature_view.get_id(indicator_id)
+            except Exception:
+                log.debug("Could not compute startup indicator %s", indicator_id)
+        return MarketContext(
+            primary=kernel.SPEC.primary_instrument,
+            timestamp=timestamp,
+            bars=bars,
+            indicators=indicators,
+            features=feature_view,
+        )
+
     def _has_precomputed_signal_at(self, strategy_id: str, timestamp: datetime) -> bool:
         return bool(self._precomputed_signals_at(strategy_id, timestamp))
 
@@ -885,8 +1086,16 @@ class Engine:
     def startup_gate_status(self) -> dict[str, Any]:
         return self._startup_gate.status()
 
-    def submit_startup_mappings(self, allocations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-        return self._startup_gate.submit_mappings(allocations)
+    def submit_startup_mappings(
+        self,
+        allocations: Sequence[Mapping[str, Any]],
+        *,
+        ack_unmanaged_remainders: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return self._startup_gate.submit_mappings(
+            allocations,
+            ack_unmanaged_remainders=ack_unmanaged_remainders,
+        )
 
     def request_startup_gate_refresh(self) -> dict[str, Any]:
         return self._startup_gate.request_refresh()
@@ -1267,6 +1476,13 @@ def _signed_fill_quantity(fill: Fill) -> float:
     if fill.side.upper() in {"BOT", "BUY", "B", "LONG"}:
         return float(fill.quantity)
     return -float(fill.quantity)
+
+
+def _future_requires_resolution(instrument: Instrument) -> bool:
+    return (
+        str(instrument.asset_class).lower() == "future"
+        and instrument.expiry is None
+    )
 
 
 def _normalize_dispatch_mode(mode: str) -> str:

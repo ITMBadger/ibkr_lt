@@ -12,6 +12,7 @@ import pytest
 
 from core import DataFeed, Engine, SimulatedClock, WallClock
 from core.audit import AuditLogger, DecisionTrace, record_decision
+from core.adapters.ibkr.contracts import IBKRInstrumentResolver
 from core.adapters.ibkr.data import IBKRDataProvider
 from core.adapters.paper.broker import PaperBroker
 from core.adapters.paper.data import ReplayDataProvider
@@ -21,6 +22,7 @@ from core.interfaces.strategy import (
     POSITION_MODE_MULTI,
     PositionPolicy,
     ProtectiveStopSpec,
+    ProtectiveStopUpdate,
     StrategyKernel,
     StrategySpec,
 )
@@ -32,12 +34,28 @@ from core.startup import (
     StartupPositionGateController,
     build_startup_gate_status,
     validate_startup_allocations,
+    validate_startup_mapping_submission,
 )
 from core.types import Bar, Fill, Instrument, MarketContext, OrderRequest, OrderStatus, Position, Signal
 
 QQQ = Instrument(asset_class="equity", symbol="QQQ")
 SPY = Instrument(asset_class="equity", symbol="SPY")
 MNQ = Instrument(asset_class="future", symbol="MNQ", multiplier=2.0)
+MNQ_CME = Instrument(
+    asset_class="future",
+    symbol="MNQ",
+    exchange="CME",
+    currency="USD",
+    multiplier=2.0,
+)
+MNQ_202606 = Instrument(
+    asset_class="future",
+    symbol="MNQ",
+    exchange="CME",
+    currency="USD",
+    expiry=date(2026, 6, 1),
+    multiplier=2.0,
+)
 
 
 def _bars(instrument: Instrument, n: int = 3) -> list[Bar]:
@@ -110,6 +128,42 @@ class _OneShotStrategy(StrategyKernel):
         return None
 
 
+class _UnresolvedFutureStrategy(StrategyKernel):
+    SPEC = StrategySpec(
+        id="_phase6_unresolved_future",
+        primary_instrument=QQQ,
+        execution_instrument=MNQ_CME,
+        reference_instruments=(MNQ_CME,),
+        timeframes=("1m",),
+    )
+
+    def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
+        if not state.get("fired"):
+            state["fired"] = True
+            return Signal(instrument=MNQ_CME, side="long")
+        return None
+
+
+class _FakeInstrumentResolver:
+    def __init__(self, resolved: Instrument) -> None:
+        self.resolved = resolved
+        self.calls: list[Instrument] = []
+
+    async def resolve(self, instrument: Instrument) -> Instrument:
+        self.calls.append(instrument)
+        if (
+            instrument.asset_class == self.resolved.asset_class
+            and instrument.symbol == self.resolved.symbol
+            and instrument.expiry is None
+        ):
+            return self.resolved
+        return instrument
+
+
+class _IBKRNamedPaperBroker(PaperBroker):
+    name = "ibkr"
+
+
 class _ExitStrategy(StrategyKernel):
     SPEC = StrategySpec(
         id="_phase6_exit",
@@ -179,6 +233,55 @@ class _AdoptableQqqStrategy(StrategyKernel):
     def on_adopt_position(self, position, adoption, state):
         state["adopted_entry_ts"] = adoption.entry_ts
         return position
+
+
+class _AdoptableStopStrategy(StrategyKernel):
+    SPEC = StrategySpec(
+        id="_adoptable_stop",
+        primary_instrument=QQQ,
+        execution_instrument=QQQ,
+        timeframes=("1m",),
+        protective_stop=ProtectiveStopSpec(pct=0.01, reference="fill_price", tif="GTC"),
+        position_policy=PositionPolicy(supports_position_adoption=True),
+    )
+
+    def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
+        return None
+
+    def on_adopt_position(self, position, adoption, state):
+        return Position(
+            position.instrument,
+            position.quantity,
+            position.avg_cost,
+            trade_id=adoption.trade_id or "adopted_lot",
+        )
+
+    def on_protective_stop_update(
+        self,
+        ctx: MarketContext,
+        position: Position,
+        state: dict,
+    ) -> ProtectiveStopUpdate | None:
+        return ProtectiveStopUpdate(stop_price=95.0, reason="startup_seed")
+
+
+class _AdoptableStopMissingUpdateStrategy(_AdoptableStopStrategy):
+    SPEC = StrategySpec(
+        id="_adoptable_stop_missing_update",
+        primary_instrument=QQQ,
+        execution_instrument=QQQ,
+        timeframes=("1m",),
+        protective_stop=ProtectiveStopSpec(pct=0.01, reference="fill_price", tif="GTC"),
+        position_policy=PositionPolicy(supports_position_adoption=True),
+    )
+
+    def on_protective_stop_update(
+        self,
+        ctx: MarketContext,
+        position: Position,
+        state: dict,
+    ) -> ProtectiveStopUpdate | None:
+        return None
 
 
 class _StaticHistorical:
@@ -391,6 +494,90 @@ def test_ibkr_bars_uses_live_subscription_lookup(monkeypatch):
     asyncio.run(run())
 
 
+def test_ibkr_instrument_resolver_resolves_front_month_future(monkeypatch):
+    from core.adapters.ibkr import contracts as contracts_module
+
+    class _FakeContract:
+        pass
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.contract_details_queue: asyncio.Queue[dict] = asyncio.Queue()
+            self.hist_queue: asyncio.Queue[dict] = asyncio.Queue()
+            self._next_id = 1
+
+        def get_next_order_id(self) -> int:
+            req_id = self._next_id
+            self._next_id += 1
+            return req_id
+
+        def reqContractDetails(self, req_id, contract) -> None:
+            for item in [
+                {
+                    "con_id": 1001,
+                    "exchange": "CME",
+                    "currency": "USD",
+                    "last_trade_date": "20990618",
+                    "multiplier": "2",
+                    "local_symbol": "MNQM9",
+                },
+                {
+                    "con_id": 1002,
+                    "exchange": "CME",
+                    "currency": "USD",
+                    "last_trade_date": "20990917",
+                    "multiplier": "2",
+                    "local_symbol": "MNQU9",
+                },
+            ]:
+                self.contract_details_queue.put_nowait({"req_id": req_id, **item})
+            self.contract_details_queue.put_nowait({"req_id": req_id, "done": True})
+
+        def reqHistoricalData(
+            self,
+            req_id,
+            contract,
+            end_str,
+            duration_str,
+            bar_size,
+            what_to_show,
+            use_rth,
+            format_date,
+            keep_up_to_date,
+            chart_options,
+        ) -> None:
+            volume = 1000 if contract.conId == 1001 else 500
+            self.hist_queue.put_nowait({"req_id": req_id, "volume": volume})
+            self.hist_queue.put_nowait({"req_id": req_id, "done": True})
+
+    monkeypatch.setattr(contracts_module, "_IBAPI_AVAILABLE", True)
+    monkeypatch.setattr(contracts_module, "_IBContract", _FakeContract)
+
+    async def run():
+        resolver = IBKRInstrumentResolver(_FakeClient())
+        return await resolver.resolve(MNQ_CME)
+
+    resolved = asyncio.run(run())
+
+    assert resolved.asset_class == "future"
+    assert resolved.symbol == "MNQ"
+    assert resolved.exchange == "CME"
+    assert resolved.currency == "USD"
+    assert resolved.expiry == date(2099, 6, 18)
+    assert resolved.multiplier == 2.0
+
+
+def test_ibkr_instrument_resolver_leaves_explicit_expiry_unchanged():
+    class _UnusedClient:
+        pass
+
+    async def run():
+        resolver = IBKRInstrumentResolver(_UnusedClient())
+        return await resolver.resolve(MNQ_202606)
+
+    assert asyncio.run(run()) == MNQ_202606
+
+
 def test_simulated_engine_subscribes_execution_instrument_for_paper_fills():
     provider = _RecordingReplay([*_bars(QQQ, 1), *_bars(MNQ, 1)])
     broker = PaperBroker()
@@ -425,6 +612,49 @@ def test_non_simulated_engine_does_not_subscribe_execution_instrument_as_data():
     engine.run_live()
     assert QQQ in provider.subscriptions
     assert MNQ not in provider.subscriptions
+
+
+def test_engine_resolves_future_before_data_and_order_setup():
+    provider = _RecordingReplay([*_bars(QQQ, 2), *_bars(MNQ_202606, 2)])
+    broker = _CountingBroker()
+    strategy = _UnresolvedFutureStrategy()
+    resolver = _FakeInstrumentResolver(MNQ_202606)
+    engine = Engine(
+        broker=broker,
+        streaming=provider,
+        historical=None,
+        clock=WallClock(),
+        strategies=[(strategy, {})],
+        risk=RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        thread_pool_workers=1,
+        lookback_days=10,
+        instrument_resolver=resolver,
+    )
+
+    engine.run_live()
+
+    assert strategy.SPEC.execution_instrument == MNQ_202606
+    assert strategy.SPEC.reference_instruments == (MNQ_202606,)
+    assert MNQ_202606 in provider.subscriptions
+    assert broker.submitted_orders
+    assert broker.submitted_orders[0].instrument == MNQ_202606
+
+
+def test_ibkr_runtime_rejects_unresolved_future_without_resolver():
+    provider = _RecordingReplay([*_bars(QQQ, 1), *_bars(MNQ_CME, 1)])
+    engine = Engine(
+        broker=_IBKRNamedPaperBroker(),
+        streaming=provider,
+        historical=None,
+        clock=WallClock(),
+        strategies=[(_UnresolvedFutureStrategy(), {})],
+        risk=RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        thread_pool_workers=1,
+        lookback_days=10,
+    )
+
+    with pytest.raises(RuntimeError, match="instrument resolver"):
+        engine.run_live()
 
 
 def test_engine_on_exit_submits_market_close():
@@ -512,15 +742,46 @@ def test_startup_gate_uses_operator_quantity():
     )
 
     position_id = status["positions"][0]["position_id"]
-    result = validate_startup_allocations(status, [
-        {
-            "position_id": position_id,
-            "strategy_id": "_adoptable_qqq",
-            "quantity": 3,
-        }
-    ])
+    result = validate_startup_mapping_submission(
+        status,
+        [
+            {
+                "position_id": position_id,
+                "strategy_id": "_adoptable_qqq",
+                "quantity": 3,
+            }
+        ],
+        ack_unmanaged_remainders=[
+            {
+                "position_id": position_id,
+                "quantity": 2,
+                "reason": "operator_acknowledged_unmanaged_remainder",
+            }
+        ],
+    )
 
-    assert result[0]["quantity"] == 3.0
+    assert result.allocations[0]["quantity"] == 3.0
+    assert result.unmanaged_remainder_acknowledgements[0]["quantity"] == 2.0
+
+
+def test_startup_gate_rejects_partial_mapping_without_remainder_ack():
+    status = build_startup_gate_status(
+        [Position(QQQ, quantity=5, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
+    )
+
+    with pytest.raises(ValueError, match="acknowledgement required"):
+        validate_startup_allocations(
+            status,
+            [
+                {
+                    "position_id": status["positions"][0]["position_id"],
+                    "strategy_id": "_adoptable_qqq",
+                    "quantity": 3,
+                }
+            ],
+        )
 
 
 def test_startup_gate_rejects_insufficient_broker_quantity():
@@ -597,6 +858,46 @@ def test_startup_gate_blocks_derivative_contract_mismatch():
     assert status["positions"][0]["reason"] == "instrument_contract_not_exactly_declared"
 
 
+def test_startup_gate_matches_future_contract_month():
+    strategy_instrument = Instrument(
+        asset_class="future",
+        symbol="MNQ",
+        exchange="CME",
+        currency="USD",
+        expiry=date(2026, 6, 1),
+        multiplier=2.0,
+    )
+    broker_instrument = Instrument(
+        asset_class="future",
+        symbol="MNQ",
+        exchange="CME",
+        currency="USD",
+        expiry=date(2026, 6, 19),
+        multiplier=2.0,
+    )
+
+    class _AdoptableFutureStrategy(StrategyKernel):
+        SPEC = StrategySpec(
+            id="_adoptable_future_same_month",
+            primary_instrument=QQQ,
+            execution_instrument=strategy_instrument,
+            timeframes=("1m",),
+            position_policy=PositionPolicy(supports_position_adoption=True),
+        )
+
+        def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
+            return None
+
+    status = build_startup_gate_status(
+        [Position(broker_instrument, quantity=1, avg_cost=18000.0)],
+        [(_AdoptableFutureStrategy(), {})],
+        default_risk=RiskPolicy(),
+    )
+
+    assert status["phase"] == "awaiting_mapping"
+    assert status["positions"][0]["candidates"][0]["strategy_id"] == "_adoptable_future_same_month"
+
+
 def test_startup_gate_uses_configured_adopted_position_mapping():
     status = build_startup_gate_status(
         [Position(QQQ, quantity=1, avg_cost=100.0)],
@@ -618,6 +919,26 @@ def test_startup_gate_uses_configured_adopted_position_mapping():
     assert status["allocations"][0]["source"] == "config"
 
 
+def test_startup_gate_does_not_auto_clear_partial_configured_mapping():
+    status = build_startup_gate_status(
+        [Position(QQQ, quantity=5, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
+        configured_allocations=[
+            {
+                "symbol": "QQQ",
+                "asset_class": "equity",
+                "strategy_id": "_adoptable_qqq",
+                "quantity": 3,
+                "source": "config",
+            }
+        ],
+    )
+
+    assert status["phase"] == "awaiting_mapping"
+    assert status["allocations"][0]["quantity"] == 3.0
+
+
 def test_startup_gate_fails_fast_without_mapping_interface():
     async def run():
         gate = StartupPositionGateController(
@@ -637,6 +958,76 @@ def test_startup_gate_fails_fast_without_mapping_interface():
             )
 
     asyncio.run(run())
+
+
+def test_live_startup_seeds_protective_stop_for_adopted_position():
+    historical = _StaticHistorical(_bars(QQQ, 3))
+    live = _StaticLive([])
+    broker = _CountingBroker()
+    broker._positions[QQQ] = 2.0
+    strategy = _AdoptableStopStrategy()
+    engine = Engine(
+        broker=broker,
+        data_feed=DataFeed(historical, live),
+        clock=WallClock(),
+        strategies=[(strategy, {})],
+        risk=RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        thread_pool_workers=1,
+        lookback_days=10,
+        startup_position_gate_enabled=True,
+        startup_position_allocations=[
+            {
+                "symbol": "QQQ",
+                "asset_class": "equity",
+                "strategy_id": "_adoptable_stop",
+                "quantity": 2,
+                "entry_ts": "2026-05-01T13:30:00+00:00",
+            }
+        ],
+    )
+
+    engine.run_live()
+
+    stop_orders = [
+        order for order in broker.submitted_orders
+        if order.order_type == "stop"
+    ]
+    assert len(stop_orders) == 1
+    stop = stop_orders[0]
+    assert stop.instrument == QQQ
+    assert stop.side == "short"
+    assert stop.quantity == 2
+    assert stop.stop_price == 95.0
+    assert stop.tif == "GTC"
+
+
+def test_live_startup_aborts_when_adopted_stop_update_is_missing():
+    historical = _StaticHistorical(_bars(QQQ, 3))
+    live = _StaticLive([])
+    broker = _CountingBroker()
+    broker._positions[QQQ] = 1.0
+    engine = Engine(
+        broker=broker,
+        data_feed=DataFeed(historical, live),
+        clock=WallClock(),
+        strategies=[(_AdoptableStopMissingUpdateStrategy(), {})],
+        risk=RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        thread_pool_workers=1,
+        lookback_days=10,
+        startup_position_gate_enabled=True,
+        startup_position_allocations=[
+            {
+                "symbol": "QQQ",
+                "asset_class": "equity",
+                "strategy_id": "_adoptable_stop_missing_update",
+                "quantity": 1,
+                "entry_ts": "2026-05-01T13:30:00+00:00",
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="missing protective stop update"):
+        engine.run_live()
 
 
 def test_position_ownership_ledger_recovers_fill_allocation(tmp_path):

@@ -6,7 +6,8 @@ This file captures durable engineering rules for future code changes.
 
 Design and update the code in a modular way. Prefer small, focused modules with clear ownership boundaries so future upgrades, broker/provider changes, strategy changes, and maintenance stay practical.
 
-- Keep framework behavior in `core/`, API behavior in `api/`, operator tools in `tools/`, and strategy logic in one strategy file per strategy.
+- Keep framework behavior in `core/`, API behavior in `api/`, public dashboard loading in `dashboard/`, operator tools in `tools/`, and strategy logic in one strategy file per strategy.
+- Keep operator-facing read/control access behind `core/operator/OperatorService`; API routes and dashboard plugins should use that facade instead of reaching into broker adapters, `OrderManager`, or strategy internals.
 - Prefer existing interfaces and adapters over direct cross-module calls.
 - Keep strategy code pure inside `generate()` and `on_exit()`: no broker calls, no file or network I/O, and no framework state mutation beyond the provided `state` dict.
 - Add shared behavior to framework modules only when it is genuinely reusable and does not expose proprietary strategy logic.
@@ -30,8 +31,7 @@ All strategy implementations are highly sensitive and proprietary unless explici
 - Public strategy source allowed in git: `strategies/stoch_3m_cross_long.py`.
 - Public copy-only strategy scaffold allowed in git: `strategies/_sample_strategy.py`.
 - Public package marker allowed in git: `strategies/__init__.py`.
-- Public protected package marker allowed in git: `protected_strategies/__init__.py`.
-- All other strategy source files, compiled artifacts, configs, docs, tests, formulas, thresholds, identifiers, logs, and derivative materials must remain hidden from git and public documentation.
+- All `protected_strategies*` source files, package markers, compiled artifacts, configs, docs, tests, formulas, thresholds, identifiers, logs, and derivative materials must remain hidden from git and public documentation unless a future release explicitly whitelists a safe compiled artifact.
 - Do not move proprietary strategy details into public docs, tests, config examples, comments, or shared framework modules.
 - When adding a new public/demo strategy, add an explicit `.gitignore` exception for that file only.
 - Customer/protected runtimes should load private modules through `strategy_packages: [protected_strategies]` in a private config and use `logging.profile: customer` with aliases when logs or API output may be shared.
@@ -41,11 +41,13 @@ All strategy implementations are highly sensitive and proprietary unless explici
 
 New strategies should follow the existing `strategies/stoch_3m_cross_long.py` shape unless there is a specific reason to deviate.
 
-- Put one strategy class per strategy file under `strategies/`; use module-level `Instrument` and timezone constants for shared objects.
+- Put one strategy class per strategy file under the correct configured package: public/demo modules under `strategies/`, private/customer modules under `protected_strategies/`.
 - Decorate the class with `@register_strategy`, subclass `StrategyKernel`, and define a class-level `SPEC = StrategySpec(...)`.
 - Start from `strategies/_sample_strategy.py` when creating a new strategy, then rename the file, class, and `StrategySpec.id`.
 - Treat `StrategySpec.id` as the stable runtime identity used by config, logs, API metadata, and adopted-position ownership. Do not rely on the filename as the strategy id.
 - Keep `SPEC` minimal: declare only instruments, required timeframes, warmup bars, position policy, and broker-side protective stops the engine must know before runtime.
+- Strategies may declare unresolved futures by omitting `Instrument.expiry`; live contract resolution belongs to the engine plus broker adapter through `InstrumentResolver`, not strategy code.
+- If a strategy returns a `Signal` with the same underlying as its resolved execution instrument, framework order routing may normalize the signal to the resolved contract. Strategies should still prefer `self.SPEC.execution_instrument` when constructing execution signals.
 - Declare `StrategySpec.position_policy` explicitly. Use `single_position` for one open strategy position per execution instrument; use `multi_position` only when the strategy creates independent logical lots and can manage per-lot state, preferably with deterministic `Signal.trade_id` values.
 - Declare the entry-frequency rule in `position_policy`: `one_per_day`, `one_per_session`, or `unlimited`. Do not duplicate date-throttle checks inside each strategy unless a private rule is stricter than the framework policy.
 - Leave `supports_position_adoption=False` unless the strategy can safely seed all state needed to manage a broker position that existed before startup.
@@ -58,3 +60,12 @@ New strategies should follow the existing `strategies/stoch_3m_cross_long.py` sh
 - Use deterministic pandas/numpy operations on `ctx.bars` or `ctx.features`; guard against insufficient bars before reading latest/prior rows.
 - Use `DecisionTrace` with a local `finish()` helper when decision logging is needed, and record the trace with `record_decision(state, trace)` before every return path.
 - Keep decision traces owner/dev oriented. Include only the bars, metrics, tables, indicators, and conditions needed to debug the strategy, because these logs can reveal behavior if shared.
+
+## Dashboard Privacy
+
+The dashboard is proprietary operator UI unless explicitly made public.
+
+- Public dashboard code in git is limited to the generic loader/contract under `dashboard/`.
+- `protected_dashboard*` source files, compiled artifacts, configs, logs, screenshots, customer UI text that reveals strategy behavior, and derivative materials must remain hidden from git.
+- The protected dashboard must mount through the public loader and use `OperatorService` for runtime state, positions, events, and startup mapping.
+- Dashboard code must not call broker adapters directly, submit trades, cancel orders, import private strategy internals, or expose decision traces/thresholds in customer builds.

@@ -44,12 +44,18 @@ class _SnapshotEngine:
             "unmanaged": [],
         }
 
-    def submit_startup_mappings(self, allocations: list[dict]) -> dict:
+    def submit_startup_mappings(
+        self,
+        allocations: list[dict],
+        *,
+        ack_unmanaged_remainders: list[dict] | None = None,
+    ) -> dict:
         if not allocations:
             raise ValueError("at least one allocation is required")
         return {
             **self.startup_gate_status(),
             "allocations": allocations,
+            "unmanaged_remainder_acknowledgements": list(ack_unmanaged_remainders or []),
         }
 
     def request_startup_gate_refresh(self) -> dict:
@@ -253,12 +259,20 @@ async def test_startup_gate_endpoints_require_auth_and_use_engine():
                         "quantity": 1,
                         "entry_ts": "2026-05-25T10:18:00-04:00",
                     }
-                ]
+                ],
+                "ack_unmanaged_remainders": [
+                    {
+                        "position_id": "position:equity:QQQ:long",
+                        "quantity": 1,
+                        "reason": "operator_acknowledged_unmanaged_remainder",
+                    }
+                ],
             },
             headers=headers,
         )
         assert mapped.status_code == 200
         assert mapped.json()["allocations"][0]["strategy_id"] == "example_live_strategy"
+        assert mapped.json()["unmanaged_remainder_acknowledgements"][0]["quantity"] == 1
 
         refresh = await client.post("/api/v1/startup/refresh", headers=headers)
         assert refresh.status_code == 200
