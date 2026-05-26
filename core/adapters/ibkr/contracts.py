@@ -47,7 +47,9 @@ def instrument_to_contract(instrument: Instrument) -> "_IBContract":
     elif ac == "future":
         c.secType = "FUT"
         c.exchange = instrument.exchange or "CME"
-        c.multiplier = str(int(instrument.multiplier)) if instrument.multiplier else ""
+        multiplier = _future_multiplier_field(instrument.multiplier)
+        if multiplier:
+            c.multiplier = multiplier
         if instrument.expiry:
             c.lastTradeDateOrContractMonth = instrument.expiry.strftime("%Y%m")
     elif ac == "option":
@@ -96,8 +98,9 @@ async def resolve_front_month_future(
     c.secType = "FUT"
     c.exchange = instrument.exchange or "CME"
     c.currency = instrument.currency or "USD"
-    if instrument.multiplier:
-        c.multiplier = str(int(instrument.multiplier))
+    multiplier = _future_multiplier_field(instrument.multiplier)
+    if multiplier:
+        c.multiplier = multiplier
 
     req_id = client.get_next_order_id()
     client.reqContractDetails(req_id, c)
@@ -186,7 +189,25 @@ async def resolve_front_month_future(
         asset_class=instrument.asset_class,
         symbol=instrument.symbol,
         exchange=best.get("exchange") or instrument.exchange,
-        currency=instrument.currency,
+        currency=best.get("currency") or instrument.currency,
         expiry=expiry,
-        multiplier=instrument.multiplier,
+        multiplier=_parse_multiplier(best.get("multiplier"), instrument.multiplier),
     )
+
+
+def _future_multiplier_field(multiplier: float) -> str:
+    if not multiplier or float(multiplier) == 1.0:
+        return ""
+    if float(multiplier).is_integer():
+        return str(int(multiplier))
+    return str(multiplier)
+
+
+def _parse_multiplier(value, fallback: float) -> float:
+    if value is None or value == "":
+        return fallback
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback

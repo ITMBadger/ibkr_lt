@@ -208,9 +208,28 @@ async def detect_paper_account(broker: IBKRBroker, expected: str = "") -> str:
 async def actual_position_qty(broker: IBKRBroker, instrument: Instrument) -> float:
     positions = await broker.get_positions()
     for position in positions:
-        if position.instrument == instrument:
+        if paper_instruments_match(position.instrument, instrument):
             return position.quantity
     return 0.0
+
+
+def paper_instruments_match(left: Instrument, right: Instrument) -> bool:
+    if left == right:
+        return True
+    if left.asset_class != right.asset_class or left.symbol != right.symbol:
+        return False
+    if left.asset_class != "future":
+        return False
+    if left.currency and right.currency and left.currency != right.currency:
+        return False
+    if left.expiry and right.expiry:
+        left_month = (left.expiry.year, left.expiry.month)
+        right_month = (right.expiry.year, right.expiry.month)
+        if left_month != right_month:
+            return False
+    if left.multiplier != 1.0 and right.multiplier != 1.0:
+        return left.multiplier == right.multiplier
+    return True
 
 
 async def cancel_quietly(broker: IBKRBroker, order_id: str | None) -> None:
