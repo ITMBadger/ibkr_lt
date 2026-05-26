@@ -194,6 +194,9 @@ Hermes agent/operator.
 - API routes must not call broker adapters, `OrderManager`, or strategies directly.
 - No manual trade or order-cancel endpoints are active.
 - Startup mutation is limited to `/api/v1/startup/mappings` and `/api/v1/startup/refresh`.
+- Strategy-action mutation is limited to approving or rejecting already-pending
+  strategy-generated approvals. Approval endpoints must not create manual orders
+  or change the strategy intent.
 
 ### Optional Protected Dashboard
 

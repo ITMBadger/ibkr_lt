@@ -16,7 +16,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, Mapping
 
-from ..types import Instrument, MarketContext, Position, PositionAdoption, Signal
+from ..types import (
+    Instrument,
+    MarketContext,
+    OptionDataRequest,
+    Position,
+    PositionAdoption,
+    Signal,
+    StrategyIntent,
+)
 
 POSITION_MODE_SINGLE = "single_position"
 POSITION_MODE_MULTI = "multi_position"
@@ -125,6 +133,31 @@ class StrategyKernel:
         raise NotImplementedError(
             f"{type(self).__name__} must implement generate()"
         )
+
+    def option_data_requests(
+        self,
+        ctx: MarketContext,
+        state: dict,
+    ) -> tuple[OptionDataRequest, ...]:
+        """Optional. Request option data for the framework to refresh.
+
+        This method must stay pure: return desired chain/quote refreshes only.
+        The engine and adapters own any broker/API calls.
+        """
+        return ()
+
+    def generate_intents(
+        self,
+        ctx: MarketContext,
+        state: dict,
+    ) -> tuple[StrategyIntent, ...]:
+        """Optional. Return explicit strategy trade intents.
+
+        Existing strategies should keep using generate() and Signal. This hook is
+        for strategies that need exact contract/quantity intent while preserving
+        centralized order conversion and submission in OrderManager.
+        """
+        return ()
 
     def on_exit(
         self,

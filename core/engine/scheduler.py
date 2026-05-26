@@ -26,11 +26,16 @@ log = logging.getLogger(__name__)
 class Scheduler:
     """Maintains the strategy registry and builds MarketContext on bar-close."""
 
-    def __init__(self, features: FeatureRegistry | None = None) -> None:
+    def __init__(
+        self,
+        features: FeatureRegistry | None = None,
+        options=None,
+    ) -> None:
         self._by_primary: dict[Instrument, list[tuple[StrategyKernel, dict]]] = {}
         # All instruments that need strategy MarketContext data.
         self._all_instruments: set[Instrument] = set()
         self._features = features
+        self._options = options
 
     def register(
         self,
@@ -139,6 +144,7 @@ class Scheduler:
             bars=bars_map,
             indicators=indicators,
             features=feature_view,
+            options=self._options,
         )
 
 

@@ -86,6 +86,8 @@ def instrument_to_contract(instrument: Instrument) -> "_IBContract":
             c.strike = instrument.strike
         if instrument.right:
             c.right = instrument.right
+        if instrument.multiplier and instrument.multiplier != 1.0:
+            c.multiplier = _format_multiplier(instrument.multiplier)
     elif ac == "fx":
         c.secType = "CASH"
         c.exchange = "IDEALPRO"
@@ -223,6 +225,10 @@ async def resolve_front_month_future(
 def _future_multiplier_field(multiplier: float) -> str:
     if not multiplier or float(multiplier) == 1.0:
         return ""
+    return _format_multiplier(multiplier)
+
+
+def _format_multiplier(multiplier: float) -> str:
     if float(multiplier).is_integer():
         return str(int(multiplier))
     return str(multiplier)

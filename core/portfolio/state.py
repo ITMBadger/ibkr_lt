@@ -148,6 +148,24 @@ class PortfolioState:
                 return []
             return [pos]
 
+    def get_all_strategy_positions(self, strategy_id: str) -> list[Position]:
+        with self._lock:
+            lots = [
+                pos
+                for (sid, _, _), pos in self._strategy_position_lots.items()
+                if sid == strategy_id and not pos.is_flat
+            ]
+            aggregate_only = [
+                pos
+                for (sid, inst), pos in self._strategy_positions.items()
+                if (
+                    sid == strategy_id
+                    and not pos.is_flat
+                    and not any(lot.instrument == inst for lot in lots)
+                )
+            ]
+            return [*lots, *aggregate_only]
+
     def strategy_positions(self) -> list[tuple[str, Position]]:
         with self._lock:
             return [

@@ -8,6 +8,7 @@ Design and update the code in a modular way. Prefer small, focused modules with 
 
 - Keep framework behavior in `core/`, API behavior in `api/`, public dashboard loading in `dashboard/`, operator tools in `tools/`, and strategy logic in one strategy file per strategy.
 - Keep operator-facing read/control access behind `core/operator/OperatorService`; API routes and dashboard plugins should use that facade instead of reaching into broker adapters, `OrderManager`, or strategy internals.
+- Operator approval endpoints may only approve or reject pending strategy-generated intents. They must not create manual trade intents, edit strategy parameters, or cancel broker orders directly.
 - Prefer existing interfaces and adapters over direct cross-module calls.
 - Keep strategy code pure inside `generate()` and `on_exit()`: no broker calls, no file or network I/O, and no framework state mutation beyond the provided `state` dict.
 - Add shared behavior to framework modules only when it is genuinely reusable and does not expose proprietary strategy logic.

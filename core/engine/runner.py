@@ -28,6 +28,8 @@ from ..audit.serialize import to_jsonable
 from ..data.bar_builder import BarBuilder
 from ..data.feed import DataFeed
 from ..data.manager import DataManager
+from ..data.options import OptionDataCache
+from ..orders.approvals import ApprovalStore
 from ..orders.order_manager import OrderManager
 from ..orders.strategy_modes import strategy_mode_map
 from ..privacy import is_customer_profile, redact_payload, safe_strategy_id
@@ -49,7 +51,7 @@ from ..interfaces.strategy import (
     StrategyKernel,
 )
 from ..risk.policy import RiskPolicy
-from ..types import Bar, Fill, Instrument, MarketContext, Position, Signal
+from ..types import Bar, Fill, Instrument, MarketContext, OptionDataRequest, Position, Signal
 from .clock import Clock, SimulatedClock, WallClock
 from .scheduler import Scheduler
 
@@ -57,6 +59,7 @@ if TYPE_CHECKING:
     from ..interfaces.broker import BrokerAdapter
     from ..interfaces.data import HistoricalDataProvider, StreamingDataProvider
     from ..interfaces.instruments import InstrumentResolver
+    from ..interfaces.options import OptionDataProvider
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +107,7 @@ class Engine:
         progress_interval_seconds: float = 30.0,
         startup_position_gate_enabled: bool = False,
         instrument_resolver: "InstrumentResolver | None" = None,
+        option_data_provider: "OptionDataProvider | None" = None,
     ) -> None:
         self._broker = broker
         if data_feed is not None:
@@ -115,6 +119,9 @@ class Engine:
         self._clock = clock or WallClock()
         self._strategies = strategies or []
         self._instrument_resolver = instrument_resolver
+        self._option_data_provider = option_data_provider
+        self._option_cache = OptionDataCache()
+        self._approval_store = ApprovalStore()
         strategy_ids = [kernel.SPEC.id for kernel, _ in self._strategies]
         self._strategy_modes = strategy_mode_map(strategy_modes, strategy_ids)
         self._dispatch_mode = _normalize_dispatch_mode(dispatch_mode)
@@ -152,6 +159,8 @@ class Engine:
         self._bar_count = 0
         self._managers: dict[Instrument, DataManager] = {}
         self._portfolio: PortfolioState | None = None
+        self._order_manager: OrderManager | None = None
+        self._runtime_loop: asyncio.AbstractEventLoop | None = None
         self._recent_events: list[dict[str, Any]] = []
         self._startup_position_gate_enabled = bool(startup_position_gate_enabled)
         self._startup_gate = StartupPositionGateController(
@@ -238,6 +247,7 @@ class Engine:
                     },
                 },
                 "startup_gate": startup_gate_status,
+                "approvals": to_jsonable(self._approval_store.list()),
                 "recent_events": list(self._recent_events),
             }
 
@@ -317,6 +327,7 @@ class Engine:
         )
         self._progress.start()
         loop = asyncio.get_running_loop()
+        self._runtime_loop = loop
         is_simulated = isinstance(self._clock, SimulatedClock)
 
         # Connect before instrument resolution so adapter-backed resolvers can
@@ -326,6 +337,8 @@ class Engine:
         self._set_runtime_state(broker_connected=True)
         await self._data_feed.connect()
         self._set_runtime_state(data_connected=True)
+        if self._option_data_provider is not None:
+            await self._option_data_provider.connect()
         self._progress.add_timing("setup_connect", time.perf_counter() - setup_t0)
 
         await self._resolve_runtime_instruments(
@@ -447,7 +460,9 @@ class Engine:
             sizing_equity_provider=sizing_account.equity,
             fill_listener=sizing_account.apply_fill,
             strategy_execution_instruments=strategy_execution_instruments,
+            approval_store=self._approval_store,
         )
+        self._order_manager = order_manager
 
         # Backfill historical data. Split feeds may load offline history first
         # and supplement the gap with broker historical bars before live starts.
@@ -522,7 +537,7 @@ class Engine:
             self._progress.add_timing("setup_subscribe", time.perf_counter() - subscribe_t0)
 
         # Register strategies in scheduler
-        scheduler = Scheduler(features)
+        scheduler = Scheduler(features, options=self._option_cache)
         for kernel, state in strategy_entries:
             scheduler.register(kernel, state)
         last_evaluation_bars: dict[str, datetime] = {}
@@ -544,6 +559,7 @@ class Engine:
             state: dict,
             position: Position,
         ) -> None:
+            ctx = self._context_with_positions(ctx, kernel, portfolio)
             self._progress.count("exit_evals")
             strategy_t0 = time.perf_counter()
             if is_simulated:
@@ -615,7 +631,36 @@ class Engine:
             )
             self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
 
+        async def refresh_option_data(
+            kernel: StrategyKernel,
+            ctx,
+            state: dict,
+        ) -> None:
+            if self._option_data_provider is None:
+                return
+            seen: set[tuple] = set()
+            for _ in range(2):
+                if is_simulated:
+                    requests = kernel.option_data_requests(ctx, state)
+                else:
+                    requests = await loop.run_in_executor(
+                        pool,
+                        kernel.option_data_requests,
+                        ctx,
+                        state,
+                    )
+                fresh = [
+                    request for request in requests or ()
+                    if _option_request_key(request) not in seen
+                ]
+                if not fresh:
+                    break
+                for request in fresh:
+                    seen.add(_option_request_key(request))
+                    await self._refresh_option_data_request(request)
+
         async def evaluate_entry(kernel: StrategyKernel, ctx, state: dict) -> None:
+            ctx = self._context_with_positions(ctx, kernel, portfolio)
             if self._dispatch_mode == _DISPATCH_MODE_PARALLEL:
                 signals = self._precomputed_signals_at(kernel.SPEC.id, ctx.timestamp)
                 if not signals:
@@ -651,6 +696,7 @@ class Engine:
                 return
 
             self._progress.count("entry_evals")
+            await refresh_option_data(kernel, ctx, state)
             strategy_t0 = time.perf_counter()
             if is_simulated:
                 signal = kernel.generate(ctx, state)
@@ -663,20 +709,40 @@ class Engine:
             audit_t0 = time.perf_counter()
             self._write_decision_trace(state)
             self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
-            if signal is None:
+            if is_simulated:
+                intents = kernel.generate_intents(ctx, state)
+            else:
+                intents = await loop.run_in_executor(
+                    pool,
+                    kernel.generate_intents,
+                    ctx,
+                    state,
+                )
+            if signal is None and not intents:
                 return
 
             self._mark_entry_frequency(kernel, state, ctx.timestamp)
-            self._progress.count("entry_signals")
             order_t0 = time.perf_counter()
-            self._write_signal_event(
-                kernel.SPEC.id,
-                "entry",
-                ctx.timestamp,
-                signal=signal,
-                trade_id=signal.trade_id,
-            )
-            await order_manager.submit(signal, kernel.SPEC.id)
+            if signal is not None:
+                self._progress.count("entry_signals")
+                self._write_signal_event(
+                    kernel.SPEC.id,
+                    "entry",
+                    ctx.timestamp,
+                    signal=signal,
+                    trade_id=signal.trade_id,
+                )
+                await order_manager.submit(signal, kernel.SPEC.id)
+            for intent in intents or ():
+                self._progress.count("entry_signals")
+                self._write_signal_event(
+                    kernel.SPEC.id,
+                    "entry_intent",
+                    ctx.timestamp,
+                    intent=intent,
+                    trade_id=intent.trade_id,
+                )
+                await order_manager.submit_intent(intent, kernel.SPEC.id)
             if is_simulated:
                 await order_manager.drain_ready_orders()
                 await order_manager.drain_ready_order_updates()
@@ -858,7 +924,11 @@ class Engine:
                 drain_fills_task.cancel()
             if drain_order_updates_task is not None:
                 drain_order_updates_task.cancel()
+            self._order_manager = None
+            self._runtime_loop = None
             pool.shutdown(wait=False)
+            if self._option_data_provider is not None:
+                await self._option_data_provider.disconnect()
             await self._data_feed.disconnect()
             self._set_runtime_state(data_connected=False)
             await self._broker.disconnect()
@@ -1018,11 +1088,29 @@ class Engine:
                     f"trade_id={position.trade_id}"
                 )
             self._write_startup_order_event(
-                "startup_protective_stop_seeded",
-                strategy_id=strategy_id,
-                position=position,
-                stop_update=stop_update,
-            )
+                    "startup_protective_stop_seeded",
+                    strategy_id=strategy_id,
+                    position=position,
+                    stop_update=stop_update,
+                )
+
+    async def _refresh_option_data_request(self, request: OptionDataRequest) -> None:
+        if self._option_data_provider is None:
+            return
+        if request.request_type == "chain":
+            snapshot = await self._option_data_provider.option_chain(request.underlying)
+            self._option_cache.update_chain(snapshot)
+            return
+        if request.request_type == "quote" and request.instrument is not None:
+            quote = await self._option_data_provider.option_quote(request.instrument)
+            self._option_cache.update_quote(quote)
+            return
+        self._record_event(
+            "data",
+            "option_data_request_dropped",
+            request=request,
+            reason="invalid_request",
+        )
 
     def _startup_context(
         self,
@@ -1068,10 +1156,25 @@ class Engine:
             bars=bars,
             indicators=indicators,
             features=feature_view,
+            options=self._option_cache,
         )
 
     def _has_precomputed_signal_at(self, strategy_id: str, timestamp: datetime) -> bool:
         return bool(self._precomputed_signals_at(strategy_id, timestamp))
+
+    def _context_with_positions(
+        self,
+        ctx: MarketContext,
+        kernel: StrategyKernel,
+        portfolio: PortfolioState,
+    ) -> MarketContext:
+        return replace(
+            ctx,
+            positions={
+                "strategy": portfolio.get_all_strategy_positions(kernel.SPEC.id),
+                "broker": portfolio.positions(),
+            },
+        )
 
     def _precomputed_signals_at(
         self,
@@ -1099,6 +1202,67 @@ class Engine:
 
     def request_startup_gate_refresh(self) -> dict[str, Any]:
         return self._startup_gate.request_refresh()
+
+    def pending_approvals(self) -> list[dict[str, Any]]:
+        return to_jsonable(self._approval_store.list())
+
+    def approve_pending_action(
+        self,
+        approval_id: str,
+        *,
+        operator_note: str | None = None,
+    ) -> dict[str, Any]:
+        approval = self._approval_store.approve(
+            approval_id,
+            operator_note=operator_note,
+        )
+        self._submit_approved_action(approval.approval_id)
+        self._record_event(
+            "operator",
+            "approval_marked_approved",
+            approval_id=approval.approval_id,
+            strategy_id=approval.strategy_id,
+        )
+        return to_jsonable(approval)
+
+    def reject_pending_action(
+        self,
+        approval_id: str,
+        *,
+        operator_note: str | None = None,
+    ) -> dict[str, Any]:
+        approval = self._approval_store.reject(
+            approval_id,
+            operator_note=operator_note,
+        )
+        self._record_event(
+            "operator",
+            "approval_marked_rejected",
+            approval_id=approval.approval_id,
+            strategy_id=approval.strategy_id,
+        )
+        return to_jsonable(approval)
+
+    def _submit_approved_action(self, approval_id: str) -> None:
+        approval = self._approval_store.get(approval_id)
+        if approval is None:
+            return
+        order_manager = self._order_manager
+        loop = self._runtime_loop
+        if order_manager is None or loop is None or not loop.is_running():
+            self._record_event(
+                "operator",
+                "approval_submission_deferred",
+                approval_id=approval_id,
+                strategy_id=approval.strategy_id,
+                reason="engine_not_running",
+            )
+            return
+
+        async def submit() -> None:
+            await order_manager.submit_intent(approval.intent, approval.strategy_id)
+
+        loop.call_soon_threadsafe(lambda: loop.create_task(submit()))
 
     def _has_entry_capacity(self, kernel: StrategyKernel, open_positions: int) -> bool:
         limit = kernel.SPEC.position_policy.max_concurrent_positions
@@ -1476,6 +1640,28 @@ def _signed_fill_quantity(fill: Fill) -> float:
     if fill.side.upper() in {"BOT", "BUY", "B", "LONG"}:
         return float(fill.quantity)
     return -float(fill.quantity)
+
+
+def _option_request_key(request: OptionDataRequest) -> tuple:
+    option = request.instrument
+    option_key = None
+    if option is not None:
+        option_key = (
+            option.asset_class,
+            option.symbol,
+            option.expiry,
+            option.strike,
+            option.right,
+            option.multiplier,
+        )
+    return (
+        request.request_type,
+        request.underlying.asset_class,
+        request.underlying.symbol,
+        request.underlying.exchange,
+        request.underlying.currency,
+        option_key,
+    )
 
 
 def _future_requires_resolution(instrument: Instrument) -> bool:

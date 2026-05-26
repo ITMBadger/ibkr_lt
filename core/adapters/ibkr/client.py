@@ -68,6 +68,8 @@ class IBKRClient(EWrapper, EClient):  # type: ignore[misc]
         self.position_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.account_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.contract_details_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.market_data_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.option_params_queue: asyncio.Queue[dict] = asyncio.Queue()
 
         # Map reqId → asyncio.Event for blocking requests
         self._req_events: dict[int, threading.Event] = {}
@@ -320,6 +322,84 @@ class IBKRClient(EWrapper, EClient):  # type: ignore[misc]
         self._push(self.contract_details_queue, {"req_id": reqId, "done": True})
 
     # ------------------------------------------------------------------
+    # EWrapper: option chains and market data snapshots
+    # ------------------------------------------------------------------
+
+    def securityDefinitionOptionParameter(
+        self,
+        reqId: int,
+        exchange: str,
+        underlyingConId: int,
+        tradingClass: str,
+        multiplier: str,
+        expirations,
+        strikes,
+    ) -> None:
+        self._push(self.option_params_queue, {
+            "req_id": reqId,
+            "exchange": exchange,
+            "underlying_con_id": underlyingConId,
+            "trading_class": tradingClass,
+            "multiplier": multiplier,
+            "expirations": tuple(expirations or ()),
+            "strikes": tuple(strikes or ()),
+            "done": False,
+        })
+
+    def securityDefinitionOptionParameterEnd(self, reqId: int) -> None:
+        self._push(self.option_params_queue, {"req_id": reqId, "done": True})
+
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib) -> None:
+        self._push(self.market_data_queue, {
+            "req_id": reqId,
+            "kind": "price",
+            "tick_type": tickType,
+            "price": float(price),
+        })
+
+    def tickSize(self, reqId: int, tickType: int, size: float) -> None:
+        self._push(self.market_data_queue, {
+            "req_id": reqId,
+            "kind": "size",
+            "tick_type": tickType,
+            "size": float(size),
+        })
+
+    def tickOptionComputation(self, reqId: int, tickType: int, *args: Any) -> None:
+        values = list(args)
+        if len(values) >= 9:
+            # Newer ibapi includes tickAttrib before impliedVol.
+            values = values[-9:]
+        if len(values) < 8:
+            return
+        implied_vol = _optional_float(values[0])
+        delta = _optional_float(values[1])
+        opt_price = _optional_float(values[2])
+        gamma = _optional_float(values[5]) if len(values) > 5 else None
+        vega = _optional_float(values[6]) if len(values) > 6 else None
+        theta = _optional_float(values[7]) if len(values) > 7 else None
+        und_price = _optional_float(values[8]) if len(values) > 8 else None
+        self._push(self.market_data_queue, {
+            "req_id": reqId,
+            "kind": "option_computation",
+            "tick_type": tickType,
+            "implied_vol": implied_vol,
+            "delta": delta,
+            "option_price": opt_price,
+            "gamma": gamma,
+            "vega": vega,
+            "theta": theta,
+            "underlying_price": und_price,
+        })
+
+    def tickSnapshotEnd(self, reqId: int) -> None:
+        self._push(self.market_data_queue, {
+            "req_id": reqId,
+            "kind": "snapshot_end",
+            "done": True,
+        })
+
+    # ------------------------------------------------------------------
     # Internal bridge helper
     # ------------------------------------------------------------------
 
@@ -329,3 +409,13 @@ class IBKRClient(EWrapper, EClient):  # type: ignore[misc]
             log.warning("Dropping IBKR callback before loop is bound: %s", item)
             return
         self._loop.call_soon_threadsafe(queue.put_nowait, item)
+
+
+def _optional_float(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= -1e300:
+        return None
+    return parsed

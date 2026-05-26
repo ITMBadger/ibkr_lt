@@ -69,6 +69,8 @@ class MarketContext:
     bars: Mapping[Instrument, Mapping[str, pd.DataFrame]]
     indicators: Mapping[str, Any]  # pd.Series or pd.DataFrame depending on indicator
     features: Any | None = None  # FeatureRegistry-style accessor for shared indicators
+    options: Any | None = None  # cached option-chain/quote accessor, no direct I/O
+    positions: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,84 @@ class Signal:
     side: Literal["long", "short", "flat"]
     trade_id: str | None = None  # optional logical lot id for multi-position use
     protective_stop_pct: float | None = None  # optional per-entry broker stop distance
+
+
+@dataclass(frozen=True)
+class OptionDataRequest:
+    """Strategy request for framework-owned option data refresh."""
+
+    request_type: Literal["chain", "quote"]
+    underlying: Instrument
+    instrument: Instrument | None = None
+
+
+@dataclass(frozen=True)
+class OptionChainSnapshot:
+    """Cached option-chain metadata for one underlying."""
+
+    underlying: Instrument
+    expirations: tuple[date, ...] = ()
+    strikes: tuple[float, ...] = ()
+    trading_classes: tuple[str, ...] = ()
+    multiplier: float = 100.0
+    timestamp: datetime | None = None
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class OptionQuote:
+    """Point-in-time option quote/greek snapshot."""
+
+    instrument: Instrument
+    bid: float | None = None
+    ask: float | None = None
+    bid_size: float | None = None
+    ask_size: float | None = None
+    model_delta: float | None = None
+    model_price: float | None = None
+    underlying_price: float | None = None
+    timestamp: datetime | None = None
+    source: str = ""
+
+    @property
+    def mid(self) -> float | None:
+        if self.bid is None or self.ask is None:
+            return None
+        if self.bid <= 0 or self.ask <= 0 or self.ask < self.bid:
+            return None
+        return (self.bid + self.ask) / 2.0
+
+
+@dataclass(frozen=True)
+class StrategyIntent:
+    """Trade intent emitted by a strategy before framework order conversion."""
+
+    instrument: Instrument
+    side: Literal["long", "short"]
+    quantity: float
+    pricing: Literal["market", "limit", "midpoint"] = "market"
+    limit_price: float | None = None
+    tif: Literal["DAY", "GTC"] = "DAY"
+    role: str = "entry"
+    trade_id: str | None = None
+    idempotency_key: str | None = None
+    approval_required: bool = False
+    approval_reason: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PendingApproval:
+    """Operator approval state for a strategy-generated intent."""
+
+    approval_id: str
+    strategy_id: str
+    intent: StrategyIntent
+    status: Literal["pending", "approved", "rejected", "submitted"]
+    created_at: datetime
+    updated_at: datetime
+    reason: str | None = None
+    operator_note: str | None = None
 
 
 @dataclass(frozen=True)

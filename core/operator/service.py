@@ -50,5 +50,34 @@ class OperatorService:
     def request_startup_gate_refresh(self) -> dict[str, Any]:
         return dict(self.engine.request_startup_gate_refresh())
 
+    def pending_approvals(self) -> list[dict[str, Any]]:
+        return list(self.engine.pending_approvals())
+
+    def approve_pending_action(
+        self,
+        approval_id: str,
+        *,
+        operator_note: str | None = None,
+    ) -> dict[str, Any]:
+        return dict(
+            self.engine.approve_pending_action(
+                approval_id,
+                operator_note=operator_note,
+            )
+        )
+
+    def reject_pending_action(
+        self,
+        approval_id: str,
+        *,
+        operator_note: str | None = None,
+    ) -> dict[str, Any]:
+        return dict(
+            self.engine.reject_pending_action(
+                approval_id,
+                operator_note=operator_note,
+            )
+        )
+
     def set_metadata(self, **fields: Any) -> None:
         self.metadata.update(fields)

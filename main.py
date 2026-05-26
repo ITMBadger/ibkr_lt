@@ -16,6 +16,7 @@ from core.adapters.ibkr.broker import IBKRBroker
 from core.adapters.ibkr.client import IBKRClient
 from core.adapters.ibkr.contracts import IBKRInstrumentResolver
 from core.adapters.ibkr.data import IBKRDataProvider
+from core.adapters.ibkr.options import IBKROptionDataProvider
 from core.adapters.polygon.data import PolygonDataProvider
 from core.adapters.csv.data import CSVDataProvider
 from core.audit import AuditLogger, configure_runtime_logging
@@ -108,6 +109,7 @@ def main() -> None:
     broker, shared = _build_broker(config)
     data_feed = _build_data_feed(config, shared)
     instrument_resolver = _build_instrument_resolver(config, shared)
+    option_data_provider = _build_option_data_provider(config, shared)
 
     print(f"Execution: {broker.name}")
     print(f"IBKR environment: {config.get('mode', '')}")
@@ -149,6 +151,7 @@ def main() -> None:
         strategy_aliases=strategy_aliases,
         startup_position_gate_enabled=str(config.get("mode", "")).lower() == "live",
         instrument_resolver=instrument_resolver,
+        option_data_provider=option_data_provider,
     )
     api_metadata = _api_metadata(
         config,
@@ -347,6 +350,25 @@ def _build_instrument_resolver(config: dict[str, Any], shared: dict[str, Any]):
         client,
         min_days_to_expiry=int(cfg.get("min_days_to_expiry", 7)),
         lookahead_contracts=int(cfg.get("lookahead_contracts", 2)),
+    )
+
+
+def _build_option_data_provider(config: dict[str, Any], shared: dict[str, Any]):
+    execution = dict(config.get("execution") or {})
+    if execution.get("provider", "ibkr") != "ibkr":
+        return None
+    client = shared.get("ibkr_client")
+    if client is None:
+        return None
+    cfg = dict(config.get("option_data") or {})
+    if cfg.get("enabled", True) is False:
+        return None
+    return IBKROptionDataProvider(
+        client,
+        host=str(execution.get("host", "127.0.0.1")),
+        port=int(execution.get("port", 7497)),
+        client_id=int(execution.get("client_id", 1)),
+        timeout_seconds=float(cfg.get("timeout_seconds", 15.0)),
     )
 
 

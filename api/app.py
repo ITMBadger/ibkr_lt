@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from core.operator import OperatorService
 
 from .errors import install_error_handlers
-from .routes import events, health, meta, positions, runtime, startup
+from .routes import approvals, events, health, meta, positions, runtime, startup
 from .stream import runtime_events_websocket
 
 
@@ -42,6 +42,7 @@ def create_control_api_app(
         app.include_router(positions.router, prefix="/api/v1")
         app.include_router(events.router, prefix="/api/v1")
         app.include_router(startup.router, prefix="/api/v1")
+        app.include_router(approvals.router, prefix="/api/v1")
         app.websocket("/ws/events")(runtime_events_websocket)
     return app
 

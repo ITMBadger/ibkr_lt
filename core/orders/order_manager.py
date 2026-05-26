@@ -15,11 +15,12 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable
 
 from .strategy_modes import STRATEGY_MODE_DRY_RUN, strategy_mode_map
+from .approvals import ApprovalStore
 from ..privacy import safe_strategy_id
 from ..portfolio.state import PortfolioState
 from ..risk.policy import RiskPolicy
 from ..interfaces.strategy import POSITION_MODE_MULTI, PositionPolicy, ProtectiveStopSpec
-from ..types import Fill, Instrument, OrderRequest, OrderStatus, Position, Signal
+from ..types import Fill, Instrument, OrderRequest, OrderStatus, Position, Signal, StrategyIntent
 from ..audit import AuditLogger
 
 if TYPE_CHECKING:
@@ -58,6 +59,7 @@ class OrderManager:
         sizing_equity_provider: Callable[[], float | None] | None = None,
         fill_listener: Callable[[Fill], None] | None = None,
         strategy_execution_instruments: Mapping[str, Instrument] | None = None,
+        approval_store: ApprovalStore | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -67,7 +69,7 @@ class OrderManager:
         self._metadata_profile = str(metadata_profile or "owner")
         self._strategy_aliases = dict(strategy_aliases or {})
         self._audit = audit_logger
-        self._queue: asyncio.Queue[tuple[Signal, str]] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[Signal | StrategyIntent, str]] = asyncio.Queue()
         self._signal_log: list[tuple[str, Signal]] = []  # (strategy_id, signal)
         self._order_owner: dict[str, str] = {}  # broker_order_id → strategy_id
         self._order_role: dict[str, str] = {}  # broker_order_id → entry/close/protective_stop
@@ -79,6 +81,7 @@ class OrderManager:
         self._sizing_equity_provider = sizing_equity_provider
         self._fill_listener = fill_listener
         self._strategy_execution_instruments = dict(strategy_execution_instruments or {})
+        self._approval_store = approval_store
         self._dry_run_counter = itertools.count(1)
         self._trade_counter = itertools.count(1)
         self._order_trade_id: dict[str, str | None] = {}
@@ -98,6 +101,10 @@ class OrderManager:
     async def submit(self, signal: Signal, strategy_id: str) -> None:
         """Enqueue a signal for the order drain loop to process."""
         await self._queue.put((signal, strategy_id))
+
+    async def submit_intent(self, intent: StrategyIntent, strategy_id: str) -> None:
+        """Enqueue an explicit strategy intent for centralized order conversion."""
+        await self._queue.put((intent, strategy_id))
 
     async def submit_close(
         self,
@@ -382,18 +389,18 @@ class OrderManager:
     async def drain_orders(self) -> None:
         """Continuously dequeue signals and submit orders to the broker."""
         while True:
-            signal, strategy_id = await self._queue.get()
+            item, strategy_id = await self._queue.get()
             try:
-                await self._process_signal(signal, strategy_id)
+                await self._process_queue_item(item, strategy_id)
             except Exception as e:
                 log.exception("OrderManager: error processing signal from %s: %s", strategy_id, e)
 
     async def drain_ready_orders(self) -> None:
         """Drain currently queued orders without waiting for more."""
         while not self._queue.empty():
-            signal, strategy_id = self._queue.get_nowait()
+            item, strategy_id = self._queue.get_nowait()
             try:
-                await self._process_signal(signal, strategy_id)
+                await self._process_queue_item(item, strategy_id)
             except Exception as e:
                 log.exception("OrderManager: error processing signal from %s: %s", strategy_id, e)
 
@@ -438,6 +445,16 @@ class OrderManager:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    async def _process_queue_item(
+        self,
+        item: Signal | StrategyIntent,
+        strategy_id: str,
+    ) -> None:
+        if isinstance(item, StrategyIntent):
+            await self._process_intent(item, strategy_id)
+            return
+        await self._process_signal(item, strategy_id)
 
     async def _process_signal(self, signal: Signal, strategy_id: str) -> None:
         if signal.side == "flat":
@@ -563,6 +580,156 @@ class OrderManager:
             "Submitted %s %s %.0f → order_id=%s status=%s",
             signal.side, signal.instrument.symbol, qty,
             status.broker_order_id, status.status,
+        )
+
+    async def _process_intent(self, intent: StrategyIntent, strategy_id: str) -> None:
+        if intent.quantity <= 0:
+            self._write_order_event(
+                "intent_dropped",
+                strategy_id=strategy_id,
+                reason="quantity_not_positive",
+                intent=intent,
+            )
+            return
+        if intent.side == "short" and not self._broker.capabilities.supports_short:
+            self._write_order_event(
+                "intent_dropped",
+                strategy_id=strategy_id,
+                reason="short_not_supported",
+                intent=intent,
+                broker=self._broker.name,
+            )
+            return
+
+        approval_id = None
+        if intent.approval_required:
+            if self._approval_store is None:
+                self._write_order_event(
+                    "intent_dropped",
+                    strategy_id=strategy_id,
+                    reason="approval_store_missing",
+                    intent=intent,
+                )
+                return
+            approval = self._approval_store.request(strategy_id, intent)
+            approval_id = approval.approval_id
+            if approval.status == "pending":
+                self._write_order_event(
+                    "intent_pending_approval",
+                    strategy_id=strategy_id,
+                    approval=approval,
+                )
+                return
+            if approval.status == "rejected":
+                self._write_order_event(
+                    "intent_rejected",
+                    strategy_id=strategy_id,
+                    approval=approval,
+                )
+                return
+            if approval.status == "submitted":
+                self._write_order_event(
+                    "intent_dropped",
+                    strategy_id=strategy_id,
+                    reason="approval_already_submitted",
+                    approval=approval,
+                )
+                return
+
+        qty = float(intent.quantity)
+        risk = self._risk_for_strategy(strategy_id)
+        if risk.max_order_quantity is not None and qty > float(risk.max_order_quantity):
+            self._write_order_event(
+                "intent_dropped",
+                strategy_id=strategy_id,
+                reason="max_order_quantity_exceeded",
+                intent=intent,
+                max_order_quantity=risk.max_order_quantity,
+            )
+            return
+        rules = self._broker.capabilities.quantity_rules.get(intent.instrument.asset_class)
+        if rules:
+            qty = rules.round(qty)
+        if qty <= 0:
+            self._write_order_event(
+                "intent_dropped",
+                strategy_id=strategy_id,
+                reason="rounded_quantity_zero",
+                intent=intent,
+            )
+            return
+
+        order_type = "market"
+        limit_price = intent.limit_price
+        if intent.pricing in {"limit", "midpoint"}:
+            order_type = "limit"
+            if limit_price is None:
+                limit_price = _midpoint_from_metadata(intent)
+            if limit_price is None or limit_price <= 0:
+                self._write_order_event(
+                    "intent_dropped",
+                    strategy_id=strategy_id,
+                    reason="missing_limit_price",
+                    intent=intent,
+                )
+                return
+            limit_price = _round_limit_price(intent.instrument, limit_price)
+
+        strategy_ref = self._safe_strategy_id(strategy_id)
+        key = intent.idempotency_key or (
+            f"{strategy_ref}-{intent.instrument.symbol}-{intent.role}-{intent.side}"
+        )
+        if intent.trade_id:
+            key = f"{key}-{intent.trade_id}"
+        order = OrderRequest(
+            instrument=intent.instrument,
+            side=intent.side,
+            quantity=qty,
+            order_type=order_type,  # type: ignore[arg-type]
+            limit_price=limit_price,
+            strategy_id=strategy_id,
+            idempotency_key=key,
+            tif=intent.tif,
+        )
+        if not self._validate_order(order, is_entry=intent.role == "entry"):
+            self._write_order_event(
+                "intent_dropped",
+                strategy_id=strategy_id,
+                reason="validation_failed",
+                intent=intent,
+                order=order,
+            )
+            return
+
+        self._write_order_event(
+            "intent_order_intent",
+            strategy_id=strategy_id,
+            intent=intent,
+            order=order,
+            approval_id=approval_id,
+        )
+        if self._is_dry_run_strategy(strategy_id):
+            self._write_dry_run_order_event(
+                "intent_order_dry_run",
+                strategy_id=strategy_id,
+                order=order,
+                intent=intent,
+                approval_id=approval_id,
+            )
+            return
+        status = await self._broker.submit_order(order)
+        self._order_owner[status.broker_order_id] = strategy_id
+        self._order_role[status.broker_order_id] = intent.role
+        self._order_trade_id[status.broker_order_id] = intent.trade_id
+        if approval_id is not None and self._approval_store is not None:
+            self._approval_store.mark_submitted(approval_id)
+        self._write_order_event(
+            "intent_order_submitted",
+            strategy_id=strategy_id,
+            intent=intent,
+            order=order,
+            status=status,
+            approval_id=approval_id,
         )
 
     async def _handle_fill(self, fill: Fill) -> None:
@@ -1017,6 +1184,25 @@ def _round_stop_price(instrument, price: float) -> float:
     if instrument.asset_class in {"equity", "option"}:
         return round(price, 2)
     return round(price, 4)
+
+
+def _round_limit_price(instrument, price: float) -> float:
+    if instrument.asset_class in {"equity", "option"}:
+        return round(float(price), 2)
+    return round(float(price), 4)
+
+
+def _midpoint_from_metadata(intent: StrategyIntent) -> float | None:
+    bid = intent.metadata.get("bid")
+    ask = intent.metadata.get("ask")
+    try:
+        bid_f = float(bid)
+        ask_f = float(ask)
+    except (TypeError, ValueError):
+        return None
+    if bid_f <= 0 or ask_f <= 0 or ask_f < bid_f:
+        return None
+    return (bid_f + ask_f) / 2.0
 
 
 def _same_underlying(left: Instrument, right: Instrument) -> bool:

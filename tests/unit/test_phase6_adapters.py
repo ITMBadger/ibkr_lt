@@ -27,6 +27,7 @@ from core.interfaces.strategy import (
     StrategySpec,
 )
 from core.orders.order_manager import OrderManager
+from core.orders.approvals import ApprovalStore
 from core.portfolio.state import PortfolioState
 from core.risk.policy import RiskPolicy
 from core.startup import (
@@ -36,7 +37,7 @@ from core.startup import (
     validate_startup_allocations,
     validate_startup_mapping_submission,
 )
-from core.types import Bar, Fill, Instrument, MarketContext, OrderRequest, OrderStatus, Position, Signal
+from core.types import Bar, Fill, Instrument, MarketContext, OrderRequest, OrderStatus, Position, Signal, StrategyIntent
 
 QQQ = Instrument(asset_class="equity", symbol="QQQ")
 SPY = Instrument(asset_class="equity", symbol="SPY")
@@ -55,6 +56,16 @@ MNQ_202606 = Instrument(
     currency="USD",
     expiry=date(2026, 6, 1),
     multiplier=2.0,
+)
+GENERIC_OPTION = Instrument(
+    asset_class="option",
+    symbol="XYZ",
+    exchange="SMART",
+    currency="USD",
+    expiry=date(2026, 6, 19),
+    strike=100.0,
+    right="P",
+    multiplier=100.0,
 )
 
 
@@ -1485,6 +1496,79 @@ def test_order_manager_drops_duplicate_pending_close(tmp_path):
     assert "close_already_pending" in text
 
 
+def test_order_manager_submits_explicit_option_intent_as_midpoint_limit():
+    async def run():
+        broker = _CountingBroker()
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        )
+        await om.submit_intent(
+            StrategyIntent(
+                instrument=GENERIC_OPTION,
+                side="short",
+                quantity=1,
+                pricing="midpoint",
+                tif="DAY",
+                role="open_short_option",
+                trade_id="generic_lot",
+                idempotency_key="generic-option-open",
+                metadata={"bid": 1.1, "ask": 1.2},
+            ),
+            "_generic_option_strategy",
+        )
+        await om.drain_ready_orders()
+
+        assert broker.submit_calls == 1
+        order = broker.submitted_orders[0]
+        assert order.instrument == GENERIC_OPTION
+        assert order.side == "short"
+        assert order.order_type == "limit"
+        assert order.quantity == 1
+        assert order.limit_price == 1.15
+        assert order.tif == "DAY"
+
+    asyncio.run(run())
+
+
+def test_order_manager_requires_operator_approval_before_submitting_intent():
+    async def run():
+        broker = _CountingBroker()
+        approvals = ApprovalStore()
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=10),
+            approval_store=approvals,
+        )
+        intent = StrategyIntent(
+            instrument=QQQ,
+            side="long",
+            quantity=10,
+            pricing="market",
+            role="base_share_buy",
+            idempotency_key="generic-share-buy",
+            approval_required=True,
+            approval_reason="strategy_requested_share_buy",
+        )
+
+        await om.submit_intent(intent, "_generic_option_strategy")
+        await om.drain_ready_orders()
+        assert broker.submit_calls == 0
+        pending = approvals.list()
+        assert len(pending) == 1
+        assert pending[0].status == "pending"
+
+        approvals.approve(pending[0].approval_id)
+        await om.submit_intent(intent, "_generic_option_strategy")
+        await om.drain_ready_orders()
+        assert broker.submit_calls == 1
+        assert approvals.get(pending[0].approval_id).status == "submitted"
+
+    asyncio.run(run())
+
+
 def test_order_manager_drops_duplicate_close_while_submit_in_flight():
     class _SlowSubmitBroker(_CountingBroker):
         def __init__(self) -> None:
@@ -1934,6 +2018,91 @@ def test_ibkr_broker_honors_order_tif(monkeypatch):
         assert modified_order.tif == "GTC"
 
     import asyncio
+    asyncio.run(run())
+
+
+def test_ibkr_option_contract_includes_expiry_strike_right_and_multiplier(monkeypatch):
+    from core.adapters.ibkr import contracts as contract_module
+
+    class _FakeContract:
+        pass
+
+    monkeypatch.setattr(contract_module, "_IBAPI_AVAILABLE", True)
+    monkeypatch.setattr(contract_module, "_IBContract", _FakeContract)
+
+    contract = contract_module.instrument_to_contract(GENERIC_OPTION)
+
+    assert contract.secType == "OPT"
+    assert contract.symbol == "XYZ"
+    assert contract.exchange == "SMART"
+    assert contract.currency == "USD"
+    assert contract.lastTradeDateOrContractMonth == "20260619"
+    assert contract.strike == 100.0
+    assert contract.right == "P"
+    assert contract.multiplier == "100"
+
+
+def test_ibkr_option_provider_parses_snapshot_quote(monkeypatch):
+    from core.adapters.ibkr import options as options_module
+    from core.adapters.ibkr.options import IBKROptionDataProvider
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.market_data_queue = asyncio.Queue()
+            self.cancelled = []
+
+        def is_ready(self) -> bool:
+            return True
+
+        def get_next_order_id(self) -> int:
+            return 77
+
+        def reqMktData(self, req_id, contract, generic_ticks, snapshot, regulatory, options):
+            assert req_id == 77
+            assert generic_ticks == "106"
+            self.market_data_queue.put_nowait({
+                "req_id": req_id,
+                "kind": "price",
+                "tick_type": 1,
+                "price": 1.0,
+            })
+            self.market_data_queue.put_nowait({
+                "req_id": req_id,
+                "kind": "price",
+                "tick_type": 2,
+                "price": 1.2,
+            })
+            self.market_data_queue.put_nowait({
+                "req_id": req_id,
+                "kind": "option_computation",
+                "tick_type": 13,
+                "delta": -0.33,
+                "option_price": 1.1,
+                "underlying_price": 100.0,
+            })
+            self.market_data_queue.put_nowait({
+                "req_id": req_id,
+                "kind": "snapshot_end",
+                "done": True,
+            })
+
+        def cancelMktData(self, req_id) -> None:
+            self.cancelled.append(req_id)
+
+    monkeypatch.setattr(options_module, "instrument_to_contract", lambda instrument: object())
+
+    async def run():
+        client = _FakeClient()
+        provider = IBKROptionDataProvider(client, timeout_seconds=1)
+        quote = await provider.option_quote(GENERIC_OPTION)
+        assert quote.bid == 1.0
+        assert quote.ask == 1.2
+        assert quote.mid == 1.1
+        assert quote.model_delta == -0.33
+        assert quote.model_price == 1.1
+        assert quote.underlying_price == 100.0
+        assert client.cancelled == [77]
+
     asyncio.run(run())
 
 

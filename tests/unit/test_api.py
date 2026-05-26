@@ -27,6 +27,13 @@ class _SnapshotEngine:
                 "net_liquidation": 100_000.0,
             },
             "strategies": [{"id": "example_strategy"}],
+            "approvals": [
+                {
+                    "approval_id": "example:buy-base",
+                    "strategy_id": "example_strategy",
+                    "status": "pending",
+                }
+            ],
             "recent_events": [
                 {"timestamp": "2026-05-19T00:00:00+00:00", "source": "test", "message": "ready"}
             ],
@@ -64,6 +71,27 @@ class _SnapshotEngine:
             "message": "Startup position refresh requested.",
         }
 
+    def pending_approvals(self) -> list[dict]:
+        return list(self.snapshot.get("approvals", []))
+
+    def approve_pending_action(self, approval_id: str, *, operator_note: str | None = None) -> dict:
+        if approval_id != "example:buy-base":
+            raise ValueError("unknown approval_id")
+        return {
+            "approval_id": approval_id,
+            "status": "approved",
+            "operator_note": operator_note,
+        }
+
+    def reject_pending_action(self, approval_id: str, *, operator_note: str | None = None) -> dict:
+        if approval_id != "example:buy-base":
+            raise ValueError("unknown approval_id")
+        return {
+            "approval_id": approval_id,
+            "status": "rejected",
+            "operator_note": operator_note,
+        }
+
 
 def test_operator_service_delegates_runtime_and_startup_controls():
     engine = _SnapshotEngine()
@@ -74,6 +102,9 @@ def test_operator_service_delegates_runtime_and_startup_controls():
     assert operator.events(limit=1)[0]["message"] == "ready"
     assert operator.startup_gate_status()["phase"] == "awaiting_mapping"
     assert operator.request_startup_gate_refresh()["message"] == "Startup position refresh requested."
+    assert operator.pending_approvals()[0]["approval_id"] == "example:buy-base"
+    assert operator.approve_pending_action("example:buy-base")["status"] == "approved"
+    assert operator.reject_pending_action("example:buy-base")["status"] == "rejected"
     mapped = operator.submit_startup_mappings([
         {
             "position_id": "position:equity:QQQ:long",
@@ -277,6 +308,34 @@ async def test_startup_gate_endpoints_require_auth_and_use_engine():
         refresh = await client.post("/api/v1/startup/refresh", headers=headers)
         assert refresh.status_code == 200
         assert refresh.json()["message"] == "Startup position refresh requested."
+
+
+@pytest.mark.anyio
+async def test_approval_endpoints_require_auth_and_use_engine():
+    app = create_control_api_app(_SnapshotEngine(), api_token="secret")
+    async for client in _client(app):
+        assert (await client.get("/api/v1/approvals")).status_code == 401
+
+        headers = {"Authorization": "Bearer secret"}
+        pending = await client.get("/api/v1/approvals", headers=headers)
+        assert pending.status_code == 200
+        assert pending.json()[0]["approval_id"] == "example:buy-base"
+
+        approved = await client.post(
+            "/api/v1/approvals/example:buy-base/approve",
+            json={"note": "ok"},
+            headers=headers,
+        )
+        assert approved.status_code == 200
+        assert approved.json()["status"] == "approved"
+
+        rejected = await client.post(
+            "/api/v1/approvals/example:buy-base/reject",
+            json={"note": "no"},
+            headers=headers,
+        )
+        assert rejected.status_code == 200
+        assert rejected.json()["status"] == "rejected"
 
 
 def test_local_control_hosts_can_run_without_token(monkeypatch):

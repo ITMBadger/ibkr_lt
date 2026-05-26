@@ -10,6 +10,11 @@ from .types import (
     Timeframe,
     MarketContext,
     Signal,
+    StrategyIntent,
+    OptionDataRequest,
+    OptionChainSnapshot,
+    OptionQuote,
+    PendingApproval,
     OrderRequest,
     OrderStatus,
     Fill,
@@ -33,6 +38,7 @@ from .interfaces.strategy import (
     StrategySpec,
 )
 from .interfaces.instruments import InstrumentResolver
+from .interfaces.options import OptionDataProvider
 from .engine.loader import register_strategy, load_strategies
 from .engine.runner import Engine
 from .engine.clock import WallClock, SimulatedClock
@@ -46,6 +52,11 @@ __all__ = [
     "Timeframe",
     "MarketContext",
     "Signal",
+    "StrategyIntent",
+    "OptionDataRequest",
+    "OptionChainSnapshot",
+    "OptionQuote",
+    "PendingApproval",
     "OrderRequest",
     "OrderStatus",
     "Fill",
@@ -66,6 +77,7 @@ __all__ = [
     "StrategyKernel",
     "StrategySpec",
     "InstrumentResolver",
+    "OptionDataProvider",
     "register_strategy",
     "load_strategies",
     "Engine",
