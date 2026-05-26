@@ -63,14 +63,21 @@ class _CountingBroker(PaperBroker):
     def __init__(self) -> None:
         super().__init__()
         self.submit_calls = 0
+        self.modify_calls = 0
         self.cancel_calls = 0
         self.submitted_orders: list[OrderRequest] = []
+        self.modified_orders: list[tuple[str, OrderRequest]] = []
         self.cancelled_order_ids: list[str] = []
 
     async def submit_order(self, order: OrderRequest):
         self.submit_calls += 1
         self.submitted_orders.append(order)
         return await super().submit_order(order)
+
+    async def modify_order(self, broker_order_id: str, order: OrderRequest):
+        self.modify_calls += 1
+        self.modified_orders.append((broker_order_id, order))
+        return await super().modify_order(broker_order_id, order)
 
     async def cancel_order(self, broker_order_id: str) -> None:
         self.cancel_calls += 1
@@ -1247,7 +1254,11 @@ def test_order_manager_submits_fill_price_protective_stop():
             portfolio,
             RiskPolicy(position_size_shares=1, max_order_quantity=2),
             protective_stops={
-                "_phase6": ProtectiveStopSpec(pct=0.015, reference="fill_price"),
+                "_phase6": ProtectiveStopSpec(
+                    pct=0.015,
+                    reference="fill_price",
+                    tif="GTC",
+                ),
             },
         )
         await om._process_signal(Signal(QQQ, "long"), "_phase6")
@@ -1263,6 +1274,7 @@ def test_order_manager_submits_fill_price_protective_stop():
         assert stop.order_type == "stop"
         assert stop.quantity == 1
         assert stop.stop_price == 98.5
+        assert stop.tif == "GTC"
 
         await broker.on_bar(Bar(
             instrument=QQQ,
@@ -1283,6 +1295,125 @@ def test_order_manager_submits_fill_price_protective_stop():
         except asyncio.CancelledError:
             pass
         assert portfolio.get_strategy_position("_phase6", QQQ) is None
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_order_manager_signal_protective_stop_pct_overrides_spec_pct():
+    async def run():
+        broker = _CountingBroker()
+        om = OrderManager(
+            broker,
+            PortfolioState(),
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+            protective_stops={
+                "_phase6": ProtectiveStopSpec(
+                    pct=0.015,
+                    reference="fill_price",
+                    tif="GTC",
+                ),
+            },
+        )
+
+        await om._process_signal(
+            Signal(QQQ, "long", protective_stop_pct=0.02),
+            "_phase6",
+        )
+        await broker.on_bar(_bars(QQQ, 1)[0])
+        await om.drain_ready_fills()
+
+        assert len(broker.submitted_orders) == 2
+        stop = broker.submitted_orders[1]
+        assert stop.order_type == "stop"
+        assert stop.stop_price == 98.0
+        assert stop.tif == "GTC"
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_order_manager_tightens_existing_protective_stop_with_modify_order():
+    async def run():
+        broker = _CountingBroker()
+        portfolio = PortfolioState()
+        om = OrderManager(
+            broker,
+            portfolio,
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+            protective_stops={
+                "_phase6": ProtectiveStopSpec(
+                    pct=0.015,
+                    reference="fill_price",
+                    tif="GTC",
+                ),
+            },
+        )
+
+        await om._process_signal(Signal(QQQ, "long", trade_id="lot_a"), "_phase6")
+        await broker.on_bar(_bars(QQQ, 1)[0])
+        await om.drain_ready_fills()
+
+        positions = portfolio.get_strategy_positions("_phase6", QQQ)
+        position = next((pos for pos in positions if pos.trade_id == "lot_a"), None)
+        assert position is not None
+        original_stop_order_id = broker.submitted_orders[1].idempotency_key
+
+        await om.ensure_protective_stop(
+            "_phase6",
+            position,
+            99.25,
+            "atr_trailing_stop",
+        )
+
+        assert broker.submit_calls == 2
+        assert broker.modify_calls == 1
+        assert len(broker.modified_orders) == 1
+        modified_order_id, modified_order = broker.modified_orders[0]
+        assert modified_order_id == original_stop_order_id
+        assert modified_order.order_type == "stop"
+        assert modified_order.side == "short"
+        assert modified_order.quantity == 1
+        assert modified_order.stop_price == 99.25
+        assert modified_order.tif == "GTC"
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_order_manager_does_not_loosen_existing_long_protective_stop():
+    async def run():
+        broker = _CountingBroker()
+        portfolio = PortfolioState()
+        om = OrderManager(
+            broker,
+            portfolio,
+            RiskPolicy(position_size_shares=1, max_order_quantity=2),
+            protective_stops={
+                "_phase6": ProtectiveStopSpec(
+                    pct=0.015,
+                    reference="fill_price",
+                    tif="GTC",
+                ),
+            },
+        )
+
+        await om._process_signal(Signal(QQQ, "long", trade_id="lot_a"), "_phase6")
+        await broker.on_bar(_bars(QQQ, 1)[0])
+        await om.drain_ready_fills()
+
+        positions = portfolio.get_strategy_positions("_phase6", QQQ)
+        position = next((pos for pos in positions if pos.trade_id == "lot_a"), None)
+        assert position is not None
+
+        await om.ensure_protective_stop(
+            "_phase6",
+            position,
+            98.0,
+            "atr_trailing_stop",
+        )
+
+        assert broker.modify_calls == 0
 
     import asyncio
     asyncio.run(run())
@@ -1337,6 +1468,82 @@ def test_order_manager_cancels_protective_stop_when_strategy_close_submits(tmp_p
     asyncio.run(run())
     text = (tmp_path / "orders.jsonl").read_text(encoding="utf-8")
     assert "protective_stop_cancel_requested" in text
+
+
+def test_ibkr_broker_honors_order_tif(monkeypatch):
+    from core.adapters.ibkr import broker as ibkr_broker_module
+    from core.adapters.ibkr.broker import IBKRBroker
+
+    class _FakeIBOrder:
+        pass
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.placed_orders = []
+
+        def is_ready(self) -> bool:
+            return True
+
+        def get_next_order_id(self) -> int:
+            return 42
+
+        def placeOrder(self, order_id, contract, order) -> None:
+            self.placed_orders.append((order_id, contract, order))
+
+    monkeypatch.setattr(ibkr_broker_module, "_IBAPI_AVAILABLE", True)
+    monkeypatch.setattr(ibkr_broker_module, "IBOrder", _FakeIBOrder)
+    monkeypatch.setattr(
+        ibkr_broker_module,
+        "instrument_to_contract",
+        lambda instrument: object(),
+    )
+
+    async def run():
+        client = _FakeClient()
+        broker = IBKRBroker(client)
+        status = await broker.submit_order(OrderRequest(
+            instrument=QQQ,
+            side="short",
+            quantity=2,
+            order_type="stop",
+            stop_price=98.5,
+            strategy_id="_phase6",
+            idempotency_key="gtc-stop",
+            tif="GTC",
+        ))
+
+        assert status.broker_order_id == "42"
+        assert len(client.placed_orders) == 1
+        _, _, order = client.placed_orders[0]
+        assert order.action == "SELL"
+        assert order.orderType == "STP"
+        assert order.totalQuantity == 2
+        assert order.auxPrice == 98.5
+        assert order.tif == "GTC"
+
+        modify_status = await broker.modify_order("42", OrderRequest(
+            instrument=QQQ,
+            side="short",
+            quantity=2,
+            order_type="stop",
+            stop_price=99.25,
+            strategy_id="_phase6",
+            idempotency_key="gtc-stop",
+            tif="GTC",
+        ))
+
+        assert modify_status.broker_order_id == "42"
+        assert len(client.placed_orders) == 2
+        modified_order_id, _, modified_order = client.placed_orders[1]
+        assert modified_order_id == 42
+        assert modified_order.action == "SELL"
+        assert modified_order.orderType == "STP"
+        assert modified_order.totalQuantity == 2
+        assert modified_order.auxPrice == 99.25
+        assert modified_order.tif == "GTC"
+
+    import asyncio
+    asyncio.run(run())
 
 
 def test_order_manager_drains_order_updates(tmp_path):

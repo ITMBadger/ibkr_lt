@@ -28,6 +28,7 @@ from .interfaces.strategy import (
     POSITION_MODE_SINGLE,
     PositionPolicy,
     ProtectiveStopSpec,
+    ProtectiveStopUpdate,
     StrategyKernel,
     StrategySpec,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "POSITION_MODE_SINGLE",
     "PositionPolicy",
     "ProtectiveStopSpec",
+    "ProtectiveStopUpdate",
     "StrategyKernel",
     "StrategySpec",
     "register_strategy",

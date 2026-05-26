@@ -100,6 +100,25 @@ class PaperBroker:
         await self._order_update_queue.put(status)
         return status
 
+    async def modify_order(self, broker_order_id: str, order: OrderRequest) -> OrderStatus:
+        """Replace a pending order in place, preserving the broker id."""
+        for index, pending in enumerate(self._pending):
+            if pending.broker_id != broker_order_id:
+                continue
+            self._pending[index] = _PendingOrder(
+                order=order,
+                broker_id=broker_order_id,
+                submitted_after=pending.submitted_after,
+            )
+            status = OrderStatus(
+                broker_order_id=broker_order_id,
+                status="pending",
+                filled_qty=0.0,
+            )
+            await self._order_update_queue.put(status)
+            return status
+        raise ValueError(f"Cannot modify unknown pending paper order: {broker_order_id}")
+
     async def cancel_order(self, broker_order_id: str) -> None:
         self._pending = [
             pending for pending in self._pending

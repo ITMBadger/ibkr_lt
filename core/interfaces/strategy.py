@@ -35,6 +35,15 @@ class ProtectiveStopSpec:
 
     pct: float
     reference: str = "fill_price"
+    tif: Literal["DAY", "GTC"] = "DAY"
+
+
+@dataclass(frozen=True)
+class ProtectiveStopUpdate:
+    """Requested broker-side protective stop price for an open position."""
+
+    stop_price: float
+    reason: str = "protective_stop_update"
 
 
 @dataclass(frozen=True)
@@ -128,6 +137,15 @@ class StrategyKernel:
         Return an exit reason string to close the position, or None to hold.
         Default: always hold (return None).
         """
+        return None
+
+    def on_protective_stop_update(
+        self,
+        ctx: MarketContext,
+        position: Position,
+        state: dict,
+    ) -> ProtectiveStopUpdate | None:
+        """Optional. Return a broker-side stop update for an open position."""
         return None
 
     def on_start(self, state: dict) -> None:

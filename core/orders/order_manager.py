@@ -11,6 +11,7 @@ import asyncio
 import itertools
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from .strategy_modes import STRATEGY_MODE_DRY_RUN, strategy_mode_map
@@ -29,6 +30,12 @@ log = logging.getLogger(__name__)
 
 _BUY_FILL_SIDES = {"BOT", "BUY", "B", "LONG"}
 _UNACCEPTED_ORDER_STATUSES = {"cancelled", "rejected"}
+
+
+@dataclass(frozen=True)
+class _ProtectiveStopRecord:
+    order_id: str
+    order: OrderRequest
 
 
 class OrderManager:
@@ -73,6 +80,7 @@ class OrderManager:
         self._dry_run_counter = itertools.count(1)
         self._trade_counter = itertools.count(1)
         self._order_trade_id: dict[str, str | None] = {}
+        self._order_protective_stop_pct: dict[str, float | None] = {}
         self._pending_closes: dict[tuple[str, Instrument, str | None], str] = {}
         self._close_keys_by_order_id: dict[str, tuple[str, Instrument, str | None]] = {}
         self._protective_stop_orders: dict[
@@ -83,6 +91,7 @@ class OrderManager:
             str,
             tuple[str, Instrument, str | None],
         ] = {}
+        self._protective_stop_requests: dict[str, OrderRequest] = {}
 
     async def submit(self, signal: Signal, strategy_id: str) -> None:
         """Enqueue a signal for the order drain loop to process."""
@@ -207,6 +216,160 @@ class OrderManager:
             reason,
             status.broker_order_id,
             status.status,
+        )
+
+    async def ensure_protective_stop(
+        self,
+        strategy_id: str,
+        position: Position,
+        stop_price: float,
+        reason: str,
+    ) -> None:
+        """Submit or tighten the broker-side protective stop for an open lot."""
+        spec = self._protective_stops.get(strategy_id)
+        if spec is None:
+            return
+        if self._is_dry_run_strategy(strategy_id):
+            self._write_order_event(
+                "protective_stop_update_dropped",
+                strategy_id=strategy_id,
+                reason="strategy_dry_run",
+                position=position,
+                requested_stop_price=stop_price,
+            )
+            return
+        if position.quantity == 0 or stop_price <= 0:
+            self._write_order_event(
+                "protective_stop_update_dropped",
+                strategy_id=strategy_id,
+                reason="invalid_stop_inputs",
+                position=position,
+                requested_stop_price=stop_price,
+            )
+            return
+
+        position_key = self._position_key(
+            strategy_id,
+            position.instrument,
+            position.trade_id,
+        )
+        stop_side = "short" if position.quantity > 0 else "long"
+        rounded_stop = _round_stop_price(position.instrument, float(stop_price))
+        current_record = self._active_protective_stop_record(position_key)
+        if current_record is not None:
+            current_stop = current_record.order.stop_price
+            if current_stop is not None and not _protective_stop_improves(
+                stop_side,
+                rounded_stop,
+                float(current_stop),
+            ):
+                self._write_order_event(
+                    "protective_stop_update_skipped",
+                    strategy_id=strategy_id,
+                    reason="stop_not_improved",
+                    update_reason=reason,
+                    current_stop_price=current_stop,
+                    requested_stop_price=rounded_stop,
+                    position=position,
+                )
+                return
+            order = OrderRequest(
+                instrument=position.instrument,
+                side=stop_side,
+                quantity=abs(position.quantity),
+                order_type="stop",
+                stop_price=rounded_stop,
+                strategy_id=strategy_id,
+                idempotency_key=current_record.order.idempotency_key,
+                tif=current_record.order.tif,
+            )
+            if not self._validate_order(order, is_entry=False):
+                self._write_order_event(
+                    "protective_stop_update_dropped",
+                    strategy_id=strategy_id,
+                    reason="validation_failed",
+                    order=order,
+                    position=position,
+                )
+                return
+            self._write_order_event(
+                "protective_stop_update_intent",
+                strategy_id=strategy_id,
+                reason=reason,
+                order=order,
+                previous_order=current_record.order,
+                position=position,
+            )
+            status = await self._broker.modify_order(current_record.order_id, order)
+            if status.status in _UNACCEPTED_ORDER_STATUSES:
+                self._clear_protective_stop(current_record.order_id)
+            else:
+                self._protective_stop_requests[current_record.order_id] = order
+            self._write_order_event(
+                "protective_stop_update_submitted",
+                strategy_id=strategy_id,
+                reason=reason,
+                order=order,
+                status=status,
+                position=position,
+            )
+            log.info(
+                "Updated protective stop for %s: %s %s %.0f stop=%.4f order_id=%s status=%s",
+                strategy_id,
+                stop_side,
+                position.instrument.symbol,
+                abs(position.quantity),
+                rounded_stop,
+                current_record.order_id,
+                status.status,
+            )
+            return
+
+        strategy_ref = self._safe_strategy_id(strategy_id)
+        stop_key = f"{strategy_ref}-{position.instrument.symbol}-protective-stop-update"
+        if position.trade_id:
+            stop_key = f"{stop_key}-{position.trade_id}"
+        order = OrderRequest(
+            instrument=position.instrument,
+            side=stop_side,
+            quantity=abs(position.quantity),
+            order_type="stop",
+            stop_price=rounded_stop,
+            strategy_id=strategy_id,
+            idempotency_key=stop_key,
+            tif=spec.tif,
+        )
+        if not self._validate_order(order, is_entry=False):
+            self._write_order_event(
+                "protective_stop_update_dropped",
+                strategy_id=strategy_id,
+                reason="validation_failed",
+                order=order,
+                position=position,
+            )
+            return
+        self._write_order_event(
+            "protective_stop_update_intent",
+            strategy_id=strategy_id,
+            reason=reason,
+            order=order,
+            position=position,
+        )
+        status = await self._broker.submit_order(order)
+        self._track_protective_stop_order(
+            status,
+            strategy_id=strategy_id,
+            position_key=position_key,
+            trade_id=position.trade_id,
+            order=order,
+        )
+        self._write_order_event(
+            "protective_stop_update_submitted",
+            strategy_id=strategy_id,
+            reason=reason,
+            order=order,
+            status=status,
+            position=position,
         )
 
     # ------------------------------------------------------------------
@@ -383,6 +546,7 @@ class OrderManager:
         self._order_owner[status.broker_order_id] = strategy_id
         self._order_role[status.broker_order_id] = "entry"
         self._order_trade_id[status.broker_order_id] = trade_id
+        self._order_protective_stop_pct[status.broker_order_id] = signal.protective_stop_pct
         self._write_order_event(
             "order_submitted",
             strategy_id=strategy_id,
@@ -488,12 +652,16 @@ class OrderManager:
                 spec.reference,
             )
             return
-        if spec.pct <= 0 or fill.quantity <= 0 or fill.price <= 0:
+        pct = self._order_protective_stop_pct.get(fill.broker_order_id)
+        if pct is None:
+            pct = spec.pct
+        if pct <= 0 or fill.quantity <= 0 or fill.price <= 0:
             self._write_order_event(
                 "protective_stop_dropped",
                 strategy_id=strategy_id,
                 reason="invalid_stop_inputs",
                 spec=spec,
+                pct=pct,
                 fill=fill,
             )
             return
@@ -502,9 +670,9 @@ class OrderManager:
         trade_id = self._order_trade_id.get(fill.broker_order_id)
         stop_side = "short" if is_buy_fill else "long"
         if is_buy_fill:
-            raw_stop_price = fill.price * (1.0 - spec.pct)
+            raw_stop_price = fill.price * (1.0 - pct)
         else:
-            raw_stop_price = fill.price * (1.0 + spec.pct)
+            raw_stop_price = fill.price * (1.0 + pct)
         stop_price = _round_stop_price(fill.instrument, raw_stop_price)
         strategy_ref = self._safe_strategy_id(strategy_id)
         stop_key = (
@@ -521,6 +689,7 @@ class OrderManager:
             stop_price=stop_price,
             strategy_id=strategy_id,
             idempotency_key=stop_key,
+            tif=spec.tif,
         )
         if not self._validate_order(order, is_entry=False):
             self._write_order_event(
@@ -537,25 +706,24 @@ class OrderManager:
             strategy_id=strategy_id,
             fill=fill,
             order=order,
-            pct=spec.pct,
+            pct=pct,
             reference=spec.reference,
         )
         status = await self._broker.submit_order(order)
-        self._order_owner[status.broker_order_id] = strategy_id
-        self._order_role[status.broker_order_id] = "protective_stop"
-        self._order_trade_id[status.broker_order_id] = trade_id
-        if status.status not in _UNACCEPTED_ORDER_STATUSES and status.status != "filled":
-            position_key = self._position_key(strategy_id, fill.instrument, trade_id)
-            self._protective_stop_orders.setdefault(position_key, set()).add(
-                status.broker_order_id
-            )
-            self._protective_stop_keys_by_order_id[status.broker_order_id] = position_key
+        self._track_protective_stop_order(
+            status,
+            strategy_id=strategy_id,
+            position_key=self._position_key(strategy_id, fill.instrument, trade_id),
+            trade_id=trade_id,
+            order=order,
+        )
         self._write_order_event(
             "protective_stop_submitted",
             strategy_id=strategy_id,
             fill=fill,
             order=order,
             status=status,
+            pct=pct,
         )
         log.info(
             "Submitted protective stop for %s: %s %s %.0f stop=%.4f → order_id=%s status=%s",
@@ -633,6 +801,36 @@ class OrderManager:
         trade_id: str | None,
     ) -> tuple[str, Instrument, str | None]:
         return (strategy_id, instrument, trade_id)
+
+    def _track_protective_stop_order(
+        self,
+        status: OrderStatus,
+        *,
+        strategy_id: str,
+        position_key: tuple[str, Instrument, str | None],
+        trade_id: str | None,
+        order: OrderRequest,
+    ) -> None:
+        self._order_owner[status.broker_order_id] = strategy_id
+        self._order_role[status.broker_order_id] = "protective_stop"
+        self._order_trade_id[status.broker_order_id] = trade_id
+        if status.status not in _UNACCEPTED_ORDER_STATUSES and status.status != "filled":
+            self._protective_stop_orders.setdefault(position_key, set()).add(
+                status.broker_order_id
+            )
+            self._protective_stop_keys_by_order_id[status.broker_order_id] = position_key
+            self._protective_stop_requests[status.broker_order_id] = order
+
+    def _active_protective_stop_record(
+        self,
+        position_key: tuple[str, Instrument, str | None],
+    ) -> _ProtectiveStopRecord | None:
+        stop_order_ids = sorted(self._protective_stop_orders.get(position_key, set()))
+        for stop_order_id in stop_order_ids:
+            order = self._protective_stop_requests.get(stop_order_id)
+            if order is not None:
+                return _ProtectiveStopRecord(stop_order_id, order)
+        return None
 
     async def _cancel_protective_stops_for_position(
         self,
@@ -732,6 +930,7 @@ class OrderManager:
             self._pending_closes.pop(position_key, None)
 
     def _clear_protective_stop(self, broker_order_id: str) -> None:
+        self._protective_stop_requests.pop(broker_order_id, None)
         position_key = self._protective_stop_keys_by_order_id.pop(
             broker_order_id,
             None,
@@ -805,3 +1004,9 @@ def _round_stop_price(instrument, price: float) -> float:
     if instrument.asset_class in {"equity", "option"}:
         return round(price, 2)
     return round(price, 4)
+
+
+def _protective_stop_improves(side: str, requested_stop: float, current_stop: float) -> bool:
+    if side == "short":
+        return requested_stop > current_stop
+    return requested_stop < current_stop

@@ -78,6 +78,7 @@ class Signal:
     instrument: Instrument  # execution instrument
     side: Literal["long", "short", "flat"]
     trade_id: str | None = None  # optional logical lot id for multi-position use
+    protective_stop_pct: float | None = None  # optional per-entry broker stop distance
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ class OrderRequest:
     stop_price: float | None = None
     strategy_id: str = ""
     idempotency_key: str = ""
+    tif: Literal["DAY", "GTC"] = "DAY"
 
 
 @dataclass(frozen=True)

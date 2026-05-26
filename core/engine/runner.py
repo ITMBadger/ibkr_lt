@@ -529,6 +529,43 @@ class Engine:
             self._write_decision_trace(state)
             self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
             if not reason:
+                strategy_t0 = time.perf_counter()
+                if is_simulated:
+                    stop_update = kernel.on_protective_stop_update(ctx, position, state)
+                else:
+                    stop_update = await loop.run_in_executor(
+                        pool, kernel.on_protective_stop_update, ctx, position, state
+                    )
+                elapsed = time.perf_counter() - strategy_t0
+                self._progress.add_strategy_timing(kernel.SPEC.id, "protective_stop", elapsed)
+                audit_t0 = time.perf_counter()
+                self._write_decision_trace(state)
+                self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
+                if stop_update is None:
+                    return
+
+                self._progress.count("protective_stop_updates")
+                order_t0 = time.perf_counter()
+                self._write_signal_event(
+                    kernel.SPEC.id,
+                    "protective_stop_update",
+                    ctx.timestamp,
+                    stop_update=stop_update,
+                    instrument=position.instrument,
+                    side=position.side,
+                    trade_id=position.trade_id,
+                )
+                await order_manager.ensure_protective_stop(
+                    kernel.SPEC.id,
+                    position,
+                    stop_update.stop_price,
+                    stop_update.reason,
+                )
+                if is_simulated:
+                    await order_manager.drain_ready_order_updates()
+                else:
+                    await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+                self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
                 return
 
             self._progress.count("exit_signals")

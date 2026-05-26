@@ -163,6 +163,46 @@ class IBKRBroker:
         if not _IBAPI_AVAILABLE:
             raise ImportError("ibapi required")
         contract = instrument_to_contract(order.instrument)
+        ib_order = self._build_ib_order(order)
+
+        order_id = self._client.get_next_order_id()
+        self._client.placeOrder(order_id, contract, ib_order)
+        log.info(
+            "Placed order %d: %s %s %.0f @ %s",
+            order_id, ib_order.action, order.instrument.symbol,
+            order.quantity, order.order_type,
+        )
+        return OrderStatus(
+            broker_order_id=str(order_id),
+            status="pending",
+            filled_qty=0.0,
+        )
+
+    async def modify_order(self, broker_order_id: str, order: OrderRequest) -> OrderStatus:
+        if not _IBAPI_AVAILABLE:
+            raise ImportError("ibapi required")
+        order_id = int(broker_order_id)
+        contract = instrument_to_contract(order.instrument)
+        ib_order = self._build_ib_order(order)
+        self._client.placeOrder(order_id, contract, ib_order)
+        log.info(
+            "Modified order %d: %s %s %.0f @ %s",
+            order_id, ib_order.action, order.instrument.symbol,
+            order.quantity, order.order_type,
+        )
+        return OrderStatus(
+            broker_order_id=str(order_id),
+            status="pending",
+            filled_qty=0.0,
+        )
+
+    async def cancel_order(self, broker_order_id: str) -> None:
+        try:
+            self._client.cancelOrder(int(broker_order_id), "")
+        except Exception as e:
+            log.warning("cancel_order failed: %s", e)
+
+    def _build_ib_order(self, order: OrderRequest):
         ib_order = IBOrder()
         ib_order.action = "BUY" if order.side == "long" else "SELL"
         ib_order.totalQuantity = order.quantity
@@ -179,27 +219,9 @@ class IBKRBroker:
             ib_order.eTradeOnly = False
         if hasattr(ib_order, "firmQuoteOnly"):
             ib_order.firmQuoteOnly = False
-        ib_order.tif = "DAY"
+        ib_order.tif = str(order.tif or "DAY").upper()
         ib_order.transmit = True
-
-        order_id = self._client.get_next_order_id()
-        self._client.placeOrder(order_id, contract, ib_order)
-        log.info(
-            "Placed order %d: %s %s %.0f @ %s",
-            order_id, ib_order.action, order.instrument.symbol,
-            order.quantity, order.order_type,
-        )
-        return OrderStatus(
-            broker_order_id=str(order_id),
-            status="pending",
-            filled_qty=0.0,
-        )
-
-    async def cancel_order(self, broker_order_id: str) -> None:
-        try:
-            self._client.cancelOrder(int(broker_order_id), "")
-        except Exception as e:
-            log.warning("cancel_order failed: %s", e)
+        return ib_order
 
     # ------------------------------------------------------------------
     # Streaming updates
