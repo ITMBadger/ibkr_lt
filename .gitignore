@@ -54,13 +54,12 @@ fills*.jsonl
 *order*
 *fill*
 
-# Config privacy. Only the root shared config is public. Root config variants
-# such as config.live.yaml, config.vwap.local.yaml, and config.private.yml are
-# always local/private.
+# Config privacy. The root runtime config is local/private. The example config
+# is the public shared starting point.
 *.yaml
 *.yml
 /config.*
-!/config.yaml
+!/config.example.yaml
 !configs/
 !configs/customer.template.yaml
 configs/local/
@@ -77,6 +76,9 @@ strategies/**
 # Protected strategy/dashboard packages and any artifacts/logs/configs named
 # after them are private. Do not whitelist package markers here; tracked files
 # under these paths must be removed from Git tracking separately.
+protected_*/
+protected_*/**
+*protected_*
 *protected_strategies*
 protected_strategies/
 protected_strategies/**
