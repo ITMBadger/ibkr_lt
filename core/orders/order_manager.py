@@ -12,6 +12,7 @@ import itertools
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
 
 from .strategy_modes import STRATEGY_MODE_DRY_RUN, strategy_mode_map
@@ -20,7 +21,16 @@ from ..privacy import safe_strategy_id
 from ..portfolio.state import PortfolioState
 from ..risk.policy import RiskPolicy
 from ..interfaces.strategy import POSITION_MODE_MULTI, PositionPolicy, ProtectiveStopSpec
-from ..types import Fill, Instrument, OrderRequest, OrderStatus, Position, Signal, StrategyIntent
+from ..types import (
+    AccountSnapshot,
+    Fill,
+    Instrument,
+    OrderRequest,
+    OrderStatus,
+    Position,
+    Signal,
+    StrategyIntent,
+)
 from ..audit import AuditLogger
 
 if TYPE_CHECKING:
@@ -60,6 +70,8 @@ class OrderManager:
         fill_listener: Callable[[Fill], None] | None = None,
         strategy_execution_instruments: Mapping[str, Instrument] | None = None,
         approval_store: ApprovalStore | None = None,
+        entry_block_provider: Callable[[str, Instrument], str | None] | None = None,
+        account_snapshot_provider: Callable[[], AccountSnapshot | None] | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -82,8 +94,12 @@ class OrderManager:
         self._fill_listener = fill_listener
         self._strategy_execution_instruments = dict(strategy_execution_instruments or {})
         self._approval_store = approval_store
+        self._entry_block_provider = entry_block_provider
+        self._account_snapshot_provider = account_snapshot_provider
         self._dry_run_counter = itertools.count(1)
         self._trade_counter = itertools.count(1)
+        self._daily_start_equity_key: str | None = None
+        self._daily_start_equity: float | None = None
         self._order_trade_id: dict[str, str | None] = {}
         self._order_protective_stop_pct: dict[str, float | None] = {}
         self._pending_closes: dict[tuple[str, Instrument, str | None], str] = {}
@@ -187,18 +203,35 @@ class OrderManager:
                 reason,
             )
             return
-        submitting_order_id = f"submitting:{close_key}"
+        reserved_order_id = await self._reserve_broker_order_id()
+        if reserved_order_id is not None:
+            order = replace(order, client_order_id=reserved_order_id)
+        submitting_order_id = reserved_order_id or f"submitting:{close_key}"
         self._pending_closes[position_key] = submitting_order_id
+        if reserved_order_id is not None:
+            self._register_order(
+                reserved_order_id,
+                strategy_id=strategy_id,
+                role="close",
+                trade_id=position.trade_id,
+            )
         try:
             status = await self._broker.submit_order(order)
         except Exception:
             self._clear_pending_close_reservation(position_key, submitting_order_id)
+            if reserved_order_id is not None:
+                self._clear_order_tracking(reserved_order_id)
             raise
-        self._order_owner[status.broker_order_id] = strategy_id
-        self._order_role[status.broker_order_id] = "close"
-        self._order_trade_id[status.broker_order_id] = position.trade_id
+        self._complete_order_registration(
+            submitting_order_id if reserved_order_id is not None else None,
+            status,
+            strategy_id=strategy_id,
+            role="close",
+            trade_id=position.trade_id,
+        )
         if status.status in _UNACCEPTED_ORDER_STATUSES:
             self._clear_pending_close_reservation(position_key, submitting_order_id)
+            self._clear_order_tracking(status.broker_order_id)
         else:
             self._pending_closes[position_key] = status.broker_order_id
             self._close_keys_by_order_id[status.broker_order_id] = position_key
@@ -291,6 +324,7 @@ class OrderManager:
                 strategy_id=strategy_id,
                 idempotency_key=current_record.order.idempotency_key,
                 tif=current_record.order.tif,
+                outside_rth=current_record.order.outside_rth,
             )
             if not self._validate_order(order, is_entry=False):
                 self._write_order_event(
@@ -347,6 +381,7 @@ class OrderManager:
             strategy_id=strategy_id,
             idempotency_key=stop_key,
             tif=spec.tif,
+            outside_rth=False if spec.rth_only else None,
         )
         if not self._validate_order(order, is_entry=False):
             self._write_order_event(
@@ -364,7 +399,28 @@ class OrderManager:
             order=order,
             position=position,
         )
-        status = await self._broker.submit_order(order)
+        reserved_order_id = await self._reserve_broker_order_id()
+        if reserved_order_id is not None:
+            order = replace(order, client_order_id=reserved_order_id)
+            self._register_order(
+                reserved_order_id,
+                strategy_id=strategy_id,
+                role="protective_stop",
+                trade_id=position.trade_id,
+            )
+        try:
+            status = await self._broker.submit_order(order)
+        except Exception:
+            if reserved_order_id is not None:
+                self._clear_order_tracking(reserved_order_id)
+            raise
+        self._complete_order_registration(
+            reserved_order_id,
+            status,
+            strategy_id=strategy_id,
+            role="protective_stop",
+            trade_id=position.trade_id,
+        )
         self._track_protective_stop_order(
             status,
             strategy_id=strategy_id,
@@ -372,6 +428,8 @@ class OrderManager:
             trade_id=position.trade_id,
             order=order,
         )
+        if status.status in _UNACCEPTED_ORDER_STATUSES:
+            self._clear_order_tracking(status.broker_order_id)
         self._write_order_event(
             "protective_stop_update_submitted",
             strategy_id=strategy_id,
@@ -481,6 +539,16 @@ class OrderManager:
             return
 
         signal = self._normalize_signal_instrument(signal, strategy_id)
+        block_reason = self._entry_block_reason(strategy_id, signal.instrument)
+        if block_reason is not None:
+            self._write_order_event(
+                "signal_dropped",
+                strategy_id=strategy_id,
+                reason="runtime_entry_blocked",
+                block_reason=block_reason,
+                signal=signal,
+            )
+            return
 
         # Size the order
         trade_id = self._resolve_trade_id(signal, strategy_id)
@@ -508,6 +576,16 @@ class OrderManager:
 
         ac = signal.instrument.asset_class
         rules = self._broker.capabilities.quantity_rules.get(ac)
+        if rules is not None and 0 < float(qty_float) < float(rules.min_quantity):
+            self._write_order_event(
+                "signal_dropped",
+                strategy_id=strategy_id,
+                reason="quantity_below_broker_minimum",
+                signal=signal,
+                raw_quantity=qty_float,
+                min_quantity=rules.min_quantity,
+            )
+            return
         qty = rules.round(float(qty_float)) if rules else float(qty_float)
         if qty <= 0:
             self._write_order_event(
@@ -540,6 +618,12 @@ class OrderManager:
                 order=order,
             )
             return
+        if not self._risk_guard_allows_order(
+            order,
+            strategy_id=strategy_id,
+            is_entry=True,
+        ):
+            return
 
         self._signal_log.append((strategy_id, signal))
         self._write_order_event(
@@ -564,11 +648,32 @@ class OrderManager:
                 qty,
             )
             return
-        status = await self._broker.submit_order(order)
-        self._order_owner[status.broker_order_id] = strategy_id
-        self._order_role[status.broker_order_id] = "entry"
-        self._order_trade_id[status.broker_order_id] = trade_id
-        self._order_protective_stop_pct[status.broker_order_id] = signal.protective_stop_pct
+        reserved_order_id = await self._reserve_broker_order_id()
+        if reserved_order_id is not None:
+            order = replace(order, client_order_id=reserved_order_id)
+            self._register_order(
+                reserved_order_id,
+                strategy_id=strategy_id,
+                role="entry",
+                trade_id=trade_id,
+                protective_stop_pct=signal.protective_stop_pct,
+            )
+        try:
+            status = await self._broker.submit_order(order)
+        except Exception:
+            if reserved_order_id is not None:
+                self._clear_order_tracking(reserved_order_id)
+            raise
+        self._complete_order_registration(
+            reserved_order_id,
+            status,
+            strategy_id=strategy_id,
+            role="entry",
+            trade_id=trade_id,
+            protective_stop_pct=signal.protective_stop_pct,
+        )
+        if status.status in _UNACCEPTED_ORDER_STATUSES:
+            self._clear_order_tracking(status.broker_order_id)
         self._write_order_event(
             "order_submitted",
             strategy_id=strategy_id,
@@ -637,6 +742,20 @@ class OrderManager:
                 return
 
         qty = float(intent.quantity)
+        block_reason = (
+            self._entry_block_reason(strategy_id, intent.instrument)
+            if intent.role == "entry"
+            else None
+        )
+        if block_reason is not None:
+            self._write_order_event(
+                "intent_dropped",
+                strategy_id=strategy_id,
+                reason="runtime_entry_blocked",
+                block_reason=block_reason,
+                intent=intent,
+            )
+            return
         risk = self._risk_for_strategy(strategy_id)
         if risk.max_order_quantity is not None and qty > float(risk.max_order_quantity):
             self._write_order_event(
@@ -648,6 +767,16 @@ class OrderManager:
             )
             return
         rules = self._broker.capabilities.quantity_rules.get(intent.instrument.asset_class)
+        if rules is not None and 0 < qty < float(rules.min_quantity):
+            self._write_order_event(
+                "intent_dropped",
+                strategy_id=strategy_id,
+                reason="quantity_below_broker_minimum",
+                intent=intent,
+                raw_quantity=qty,
+                min_quantity=rules.min_quantity,
+            )
+            return
         if rules:
             qty = rules.round(qty)
         if qty <= 0:
@@ -700,6 +829,12 @@ class OrderManager:
                 order=order,
             )
             return
+        if not self._risk_guard_allows_order(
+            order,
+            strategy_id=strategy_id,
+            is_entry=intent.role == "entry",
+        ):
+            return
 
         self._write_order_event(
             "intent_order_intent",
@@ -717,10 +852,30 @@ class OrderManager:
                 approval_id=approval_id,
             )
             return
-        status = await self._broker.submit_order(order)
-        self._order_owner[status.broker_order_id] = strategy_id
-        self._order_role[status.broker_order_id] = intent.role
-        self._order_trade_id[status.broker_order_id] = intent.trade_id
+        reserved_order_id = await self._reserve_broker_order_id()
+        if reserved_order_id is not None:
+            order = replace(order, client_order_id=reserved_order_id)
+            self._register_order(
+                reserved_order_id,
+                strategy_id=strategy_id,
+                role=intent.role,
+                trade_id=intent.trade_id,
+            )
+        try:
+            status = await self._broker.submit_order(order)
+        except Exception:
+            if reserved_order_id is not None:
+                self._clear_order_tracking(reserved_order_id)
+            raise
+        self._complete_order_registration(
+            reserved_order_id,
+            status,
+            strategy_id=strategy_id,
+            role=intent.role,
+            trade_id=intent.trade_id,
+        )
+        if status.status in _UNACCEPTED_ORDER_STATUSES:
+            self._clear_order_tracking(status.broker_order_id)
         if approval_id is not None and self._approval_store is not None:
             self._approval_store.mark_submitted(approval_id)
         self._write_order_event(
@@ -797,6 +952,7 @@ class OrderManager:
                 self._clear_pending_close(status.broker_order_id)
             elif role == "protective_stop":
                 self._clear_protective_stop(status.broker_order_id)
+            self._clear_order_tracking(status.broker_order_id)
 
     async def _submit_protective_stop(self, fill: Fill, strategy_id: str) -> None:
         spec = self._protective_stops.get(strategy_id)
@@ -862,6 +1018,7 @@ class OrderManager:
             strategy_id=strategy_id,
             idempotency_key=stop_key,
             tif=spec.tif,
+            outside_rth=False if spec.rth_only else None,
         )
         if not self._validate_order(order, is_entry=False):
             self._write_order_event(
@@ -881,7 +1038,28 @@ class OrderManager:
             pct=pct,
             reference=spec.reference,
         )
-        status = await self._broker.submit_order(order)
+        reserved_order_id = await self._reserve_broker_order_id()
+        if reserved_order_id is not None:
+            order = replace(order, client_order_id=reserved_order_id)
+            self._register_order(
+                reserved_order_id,
+                strategy_id=strategy_id,
+                role="protective_stop",
+                trade_id=trade_id,
+            )
+        try:
+            status = await self._broker.submit_order(order)
+        except Exception:
+            if reserved_order_id is not None:
+                self._clear_order_tracking(reserved_order_id)
+            raise
+        self._complete_order_registration(
+            reserved_order_id,
+            status,
+            strategy_id=strategy_id,
+            role="protective_stop",
+            trade_id=trade_id,
+        )
         self._track_protective_stop_order(
             status,
             strategy_id=strategy_id,
@@ -889,6 +1067,8 @@ class OrderManager:
             trade_id=trade_id,
             order=order,
         )
+        if status.status in _UNACCEPTED_ORDER_STATUSES:
+            self._clear_order_tracking(status.broker_order_id)
         self._write_order_event(
             "protective_stop_submitted",
             strategy_id=strategy_id,
@@ -992,6 +1172,112 @@ class OrderManager:
             )
             self._protective_stop_keys_by_order_id[status.broker_order_id] = position_key
             self._protective_stop_requests[status.broker_order_id] = order
+
+    async def cancel_session_protective_stops(self, *, reason: str) -> None:
+        """Cancel strategy stops that are declared regular-session-only."""
+        stop_order_ids = sorted(self._protective_stop_keys_by_order_id)
+        for stop_order_id in stop_order_ids:
+            strategy_id = self._order_owner.get(stop_order_id)
+            if strategy_id is None:
+                continue
+            spec = self._protective_stops.get(strategy_id)
+            if spec is None or not spec.cancel_after_session:
+                continue
+            try:
+                await self._broker.cancel_order(stop_order_id)
+            except Exception as exc:
+                self._write_order_event(
+                    "protective_stop_session_cancel_failed",
+                    strategy_id=strategy_id,
+                    reason=reason,
+                    protective_stop_broker_order_id=stop_order_id,
+                    error=str(exc),
+                )
+                log.warning(
+                    "Failed to cancel session-only protective stop %s for %s: %s",
+                    stop_order_id,
+                    strategy_id,
+                    exc,
+                )
+                continue
+            self._clear_protective_stop(stop_order_id)
+            self._write_order_event(
+                "protective_stop_session_cancel_requested",
+                strategy_id=strategy_id,
+                reason=reason,
+                protective_stop_broker_order_id=stop_order_id,
+            )
+
+    def tracked_open_order_ids(self) -> set[str]:
+        return (
+            set(self._order_owner)
+            | set(self._pending_closes.values())
+            | set(self._protective_stop_keys_by_order_id)
+        )
+
+    async def _reserve_broker_order_id(self) -> str | None:
+        reserve = getattr(self._broker, "reserve_order_id", None)
+        if not callable(reserve):
+            return None
+        reserved = await reserve()
+        return str(reserved)
+
+    def _register_order(
+        self,
+        broker_order_id: str,
+        *,
+        strategy_id: str,
+        role: str,
+        trade_id: str | None,
+        protective_stop_pct: float | None = None,
+    ) -> None:
+        self._order_owner[broker_order_id] = strategy_id
+        self._order_role[broker_order_id] = role
+        self._order_trade_id[broker_order_id] = trade_id
+        if protective_stop_pct is not None or role == "entry":
+            self._order_protective_stop_pct[broker_order_id] = protective_stop_pct
+
+    def _complete_order_registration(
+        self,
+        reserved_order_id: str | None,
+        status: OrderStatus,
+        *,
+        strategy_id: str,
+        role: str,
+        trade_id: str | None,
+        protective_stop_pct: float | None = None,
+    ) -> None:
+        if reserved_order_id is not None and reserved_order_id != status.broker_order_id:
+            self._move_order_tracking(reserved_order_id, status.broker_order_id)
+        if reserved_order_id is None or status.broker_order_id not in self._order_owner:
+            self._register_order(
+                status.broker_order_id,
+                strategy_id=strategy_id,
+                role=role,
+                trade_id=trade_id,
+                protective_stop_pct=protective_stop_pct,
+            )
+
+    def _move_order_tracking(self, old_order_id: str, new_order_id: str) -> None:
+        if old_order_id == new_order_id:
+            return
+        owner = self._order_owner.pop(old_order_id, None)
+        role = self._order_role.pop(old_order_id, None)
+        trade_id = self._order_trade_id.pop(old_order_id, None)
+        stop_pct = self._order_protective_stop_pct.pop(old_order_id, None)
+        if owner is not None:
+            self._order_owner[new_order_id] = owner
+        if role is not None:
+            self._order_role[new_order_id] = role
+        self._order_trade_id[new_order_id] = trade_id
+        if stop_pct is not None or role == "entry":
+            self._order_protective_stop_pct[new_order_id] = stop_pct
+
+    def _clear_order_tracking(self, broker_order_id: str) -> None:
+        self._order_owner.pop(broker_order_id, None)
+        self._order_role.pop(broker_order_id, None)
+        self._order_trade_id.pop(broker_order_id, None)
+        self._order_protective_stop_pct.pop(broker_order_id, None)
 
     def _active_protective_stop_record(
         self,
@@ -1125,6 +1411,142 @@ class OrderManager:
         if self._sizing_equity_provider is None:
             return None
         return self._sizing_equity_provider()
+
+    def _entry_block_reason(
+        self,
+        strategy_id: str,
+        instrument: Instrument,
+    ) -> str | None:
+        if self._entry_block_provider is None:
+            return None
+        return self._entry_block_provider(strategy_id, instrument)
+
+    def _risk_guard_allows_order(
+        self,
+        order: OrderRequest,
+        *,
+        strategy_id: str,
+        is_entry: bool,
+    ) -> bool:
+        if not is_entry:
+            return True
+        risk = self._risk_for_strategy(strategy_id)
+        needs_notional = (
+            risk.max_order_notional is not None
+            or risk.buying_power_buffer_pct is not None
+        )
+        needs_drawdown = risk.max_intraday_drawdown_pct is not None
+        if not needs_notional and not needs_drawdown:
+            return True
+
+        account = self._account_snapshot_provider() if self._account_snapshot_provider else None
+        if needs_drawdown and not self._drawdown_guard_allows_entry(
+            account,
+            risk=risk,
+            strategy_id=strategy_id,
+            order=order,
+        ):
+            return False
+
+        if not needs_notional:
+            return True
+
+        notional = self._order_notional(order)
+        if notional is None:
+            self._write_order_event(
+                "order_dropped",
+                strategy_id=strategy_id,
+                reason="risk_reference_price_missing",
+                order=order,
+            )
+            return False
+        if risk.max_order_notional is not None and notional > float(risk.max_order_notional):
+            self._write_order_event(
+                "order_dropped",
+                strategy_id=strategy_id,
+                reason="max_order_notional_exceeded",
+                order=order,
+                notional=notional,
+                max_order_notional=risk.max_order_notional,
+            )
+            return False
+        if risk.buying_power_buffer_pct is None:
+            return True
+        if account is None:
+            self._write_order_event(
+                "order_dropped",
+                strategy_id=strategy_id,
+                reason="account_snapshot_missing",
+                order=order,
+                notional=notional,
+            )
+            return False
+        buying_power = max(float(account.available_funds), float(account.buying_power))
+        buffer_pct = max(0.0, float(risk.buying_power_buffer_pct))
+        usable_buying_power = buying_power * max(0.0, 1.0 - buffer_pct)
+        if notional > usable_buying_power:
+            self._write_order_event(
+                "order_dropped",
+                strategy_id=strategy_id,
+                reason="buying_power_guard_failed",
+                order=order,
+                notional=notional,
+                buying_power=buying_power,
+                usable_buying_power=usable_buying_power,
+                buying_power_buffer_pct=buffer_pct,
+            )
+            return False
+        return True
+
+    def _drawdown_guard_allows_entry(
+        self,
+        account: AccountSnapshot | None,
+        *,
+        risk: RiskPolicy,
+        strategy_id: str,
+        order: OrderRequest,
+    ) -> bool:
+        if risk.max_intraday_drawdown_pct is None:
+            return True
+        if account is None:
+            self._write_order_event(
+                "order_dropped",
+                strategy_id=strategy_id,
+                reason="account_snapshot_missing",
+                order=order,
+            )
+            return False
+        today_key = datetime.now(tz=timezone.utc).date().isoformat()
+        equity = float(account.net_liquidation)
+        if self._daily_start_equity_key != today_key or self._daily_start_equity is None:
+            self._daily_start_equity_key = today_key
+            self._daily_start_equity = equity
+        if self._daily_start_equity <= 0:
+            return True
+        drawdown_pct = max(0.0, (self._daily_start_equity - equity) / self._daily_start_equity)
+        max_drawdown = max(0.0, float(risk.max_intraday_drawdown_pct))
+        if drawdown_pct < max_drawdown:
+            return True
+        self._write_order_event(
+            "order_dropped",
+            strategy_id=strategy_id,
+            reason="intraday_drawdown_guard_failed",
+            order=order,
+            daily_start_equity=self._daily_start_equity,
+            current_equity=equity,
+            drawdown_pct=drawdown_pct,
+            max_intraday_drawdown_pct=max_drawdown,
+        )
+        return False
+
+    def _order_notional(self, order: OrderRequest) -> float | None:
+        reference_price = order.limit_price or order.stop_price
+        if reference_price is None and self._sizing_price_provider is not None:
+            reference_price = self._sizing_price_provider(order.instrument)
+        if reference_price is None or reference_price <= 0:
+            return None
+        multiplier = float(order.instrument.multiplier or 1.0)
+        return abs(float(order.quantity)) * float(reference_price) * multiplier
 
     def _normalize_signal_instrument(self, signal: Signal, strategy_id: str) -> Signal:
         execution = self._strategy_execution_instruments.get(strategy_id)

@@ -20,7 +20,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -117,6 +117,8 @@ class Engine:
         startup_position_gate_enabled: bool = False,
         instrument_resolver: "InstrumentResolver | None" = None,
         option_data_provider: "OptionDataProvider | None" = None,
+        live_health: Mapping[str, Any] | None = None,
+        runtime_reconciliation: Mapping[str, Any] | None = None,
     ) -> None:
         self._broker = broker
         if data_feed is not None:
@@ -166,6 +168,7 @@ class Engine:
         self._stopped_at: datetime | None = None
         self._last_error: str | None = None
         self._last_bar: dict[str, Any] | None = None
+        self._last_bar_received_at: datetime | None = None
         self._bar_count = 0
         self._managers: dict[Instrument, DataManager] = {}
         self._strategy_market_cache: dict[
@@ -177,6 +180,23 @@ class Engine:
         self._order_manager: OrderManager | None = None
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
         self._recent_events: list[dict[str, Any]] = []
+        self._entry_block_reason: str | None = None
+        self._runtime_health: dict[str, Any] = {
+            "entry_blocked": False,
+            "block_reason": None,
+            "last_check": None,
+            "last_bar_received_at": None,
+        }
+        self._reconciliation_state: dict[str, Any] = {
+            "enabled": False,
+            "last_check": None,
+            "status": "not_started",
+            "block_reason": None,
+        }
+        self._live_health_config = dict(live_health or {})
+        self._runtime_reconciliation_config = dict(runtime_reconciliation or {})
+        self._latest_account_snapshot = None
+        self._last_session_stop_cancel_date = None
         self._startup_position_gate_enabled = bool(startup_position_gate_enabled)
         self._startup_gate = StartupPositionGateController(
             enabled=self._startup_position_gate_enabled,
@@ -229,6 +249,8 @@ class Engine:
                     "data_connected": self._data_connected,
                     "connected": self._broker_connected and self._data_connected,
                 },
+                "runtime_health": dict(self._runtime_health),
+                "reconciliation": dict(self._reconciliation_state),
                 "broker": {
                     "name": getattr(self._broker, "name", self._broker.__class__.__name__),
                     "capabilities": to_jsonable(getattr(self._broker, "capabilities", None)),
@@ -401,445 +423,522 @@ class Engine:
         self._runtime_loop = loop
         is_simulated = isinstance(self._clock, SimulatedClock)
 
-        # Connect before instrument resolution so adapter-backed resolvers can
-        # query broker contract details without strategies importing adapters.
-        setup_t0 = time.perf_counter()
-        await self._broker.connect()
-        self._set_runtime_state(broker_connected=True)
-        await self._data_feed.connect()
-        self._set_runtime_state(data_connected=True)
-        if self._option_data_provider is not None:
-            await self._option_data_provider.connect()
-        self._progress.add_timing("setup_connect", time.perf_counter() - setup_t0)
-
-        await self._resolve_runtime_instruments(
-            require_resolved_futures=(
-                not is_simulated
-                and str(getattr(self._broker, "name", "")).lower() == "ibkr"
-            )
-        )
-
-        # Build DataManagers for strategy data. Simulated paper replay also
-        # needs execution-instrument bars so PaperBroker can resolve fills.
-        strategy_data_instruments: set[Instrument] = set()
-        execution_instruments: set[Instrument] = set()
-        for kernel, _ in self._strategies:
-            strategy_data_instruments.add(kernel.SPEC.primary_instrument)
-            strategy_data_instruments.update(kernel.SPEC.reference_instruments)
-            execution_instruments.add(kernel.SPEC.execution_instrument)
-        all_instruments = set(strategy_data_instruments)
-        if is_simulated and hasattr(self._broker, "on_bar"):
-            all_instruments.update(execution_instruments)
-
-        managers: dict[Instrument, DataManager] = {
-            instr: DataManager(instr, self._lookback_days, self._session_tz)
-            for instr in all_instruments
-        }
-        self._set_managers(managers)
-        features = FeatureRegistry(managers)
-        bar_builders: dict[Instrument, BarBuilder] = {}
-        strategy_entries: list[tuple[StrategyKernel, dict]] = []
-        for kernel, initial_state in self._strategies:
-            state: dict = dict(initial_state)
-            kernel.on_start(state)
-            if self._strategy_state_store is not None:
-                state.update(self._strategy_state_store.load_state(kernel.SPEC.id))
-            strategy_entries.append((kernel, state))
-
-        self._progress.info(
-            "Engine setup starting strategies=%s dispatch_mode=%s progress_total_bars=%s",
-            [kernel.SPEC.id for kernel, _ in self._strategies],
-            self._dispatch_mode,
-            self._progress.total_bars,
-        )
-
-        # Portfolio state and order manager
-        portfolio = PortfolioState()
-        self._set_portfolio(portfolio)
-        account_snapshot = await self._broker.get_account()
-        portfolio.update_account(account_snapshot)
-        sizing_account = _MarkToMarketSizingState(account_snapshot.net_liquidation)
-        adopted = await self._broker.get_positions()
-        if self._startup_position_gate_enabled:
-            portfolio.adopt_positions(adopted)
-            if adopted:
-                gate_result = await self._startup_gate.run(
-                    adopted,
-                    strategy_entries,
-                    refresh_positions=self._broker.get_positions,
-                    on_awaiting_mapping=lambda: self._set_runtime_state(
-                        phase=_PHASE_AWAITING_STARTUP_MAPPING,
-                    ),
-                    on_released=lambda: self._set_runtime_state(phase="starting"),
-                )
-                apply_startup_position_allocations(
-                    gate_result.allocations,
-                    gate_result.positions,
-                    strategy_entries,
-                    portfolio,
-                    unmanaged_remainder_acknowledgements=(
-                        gate_result.unmanaged_remainder_acknowledgements
-                    ),
-                    ownership_ledger=self._ownership_ledger,
-                    write_event=self._write_startup_order_event,
-                )
-            else:
-                self._startup_gate.mark_clear(
-                    "No broker positions found; startup can continue.",
-                )
-        elif adopted:
-            strategy_map = resolve_adopted_position_map(
-                adopted,
-                strategy_entries,
-                self._adopted_position_map,
-            )
-            portfolio.adopt_positions(adopted, strategy_map)
-            for position in adopted:
-                sid = strategy_map.get(position.instrument)
-                owner = sid if sid else "unmapped"
-                log.warning(
-                    "Adopted broker position: %s %.4f avg_cost=%.4f owner=%s",
-                    position.instrument.symbol,
-                    position.quantity,
-                    position.avg_cost,
-                    owner,
-                )
-        self._persist_strategy_states(strategy_entries, portfolio)
-        protective_stops = {
-            kernel.SPEC.id: kernel.SPEC.protective_stop
-            for kernel, _ in self._strategies
-            if kernel.SPEC.protective_stop is not None
-        }
-        position_policies = {
-            kernel.SPEC.id: kernel.SPEC.position_policy
-            for kernel, _ in self._strategies
-        }
-        strategy_execution_instruments = {
-            kernel.SPEC.id: kernel.SPEC.execution_instrument
-            for kernel, _ in self._strategies
-        }
-
-        def on_fill_applied(fill: Fill) -> None:
-            sizing_account.apply_fill(fill)
-            self._persist_strategy_states(strategy_entries, portfolio)
-
-        order_manager = OrderManager(
-            self._broker,
-            portfolio,
-            self._risk,
-            self._audit,
-            protective_stops=protective_stops,
-            strategy_modes=self._strategy_modes,
-            position_policies=position_policies,
-            strategy_risk=self._strategy_risk,
-            ownership_ledger=self._ownership_ledger,
-            metadata_profile=self._metadata_profile,
-            strategy_aliases=self._strategy_aliases,
-            sizing_price_provider=sizing_account.latest_price,
-            sizing_equity_provider=sizing_account.equity,
-            fill_listener=on_fill_applied,
-            strategy_execution_instruments=strategy_execution_instruments,
-            approval_store=self._approval_store,
-        )
-        self._order_manager = order_manager
-
-        # Backfill historical data. Split feeds may load offline history first
-        # and supplement the gap with broker historical bars before live starts.
-        end = self._clock.now()
-        if isinstance(self._clock, SimulatedClock) and end.year == 1:
-            end = datetime.now(tz=timezone.utc)
-        start = end - timedelta(days=self._lookback_days)
-        for instr, dm in managers.items():
-            try:
-                fetch_t0 = time.perf_counter()
-                self._progress.info(
-                    "Backfill fetch starting instrument=%s lookback_days=%d start=%s end=%s",
-                    instr.symbol,
-                    self._lookback_days,
-                    start.isoformat(),
-                    end.isoformat(),
-                )
-                bars = await self._data_feed.fetch(instr, TF_1M, start, end)
-                self._progress.add_timing("setup_backfill_fetch", time.perf_counter() - fetch_t0)
-                merge_t0 = time.perf_counter()
-                dm.merge_backfill(bars)
-                self._progress.add_timing("setup_backfill_merge", time.perf_counter() - merge_t0)
-                log.info("Backfilled %d bars for %s", len(bars), instr.symbol)
-                self._record_event(
-                    "data",
-                    "backfill_complete",
-                    instrument=instr.symbol,
-                    bars=len(bars),
-                )
-            except Exception as e:
-                log.warning("Backfill failed for %s: %s", instr.symbol, e)
-                self._record_event(
-                    "data",
-                    "backfill_failed",
-                    instrument=instr.symbol,
-                    error=str(e),
-                )
-
-        preload_t0 = time.perf_counter()
-        features.preload_from_managers()
-        self._progress.add_timing("setup_feature_preload_managers", time.perf_counter() - preload_t0)
-        if self._feature_preload_bars:
-            preload_t0 = time.perf_counter()
-            features.preload_bars(self._feature_preload_bars)
-            self._progress.add_timing("setup_feature_preload_replay", time.perf_counter() - preload_t0)
-            self._progress.info(
-                "Feature replay preload complete bars=%d",
-                len(self._feature_preload_bars),
-            )
-        features_are_replay_preloaded = is_simulated and bool(self._feature_preload_bars)
-
-        await self._seed_startup_protective_stops(
-            strategy_entries,
-            portfolio,
-            managers,
-            features,
-            order_manager,
-        )
-
-        # Subscribe streaming
-        for instr in all_instruments:
-            subscribe_t0 = time.perf_counter()
-            native_tfs = self._data_feed.capabilities.native_timeframes
-            if native_tfs and TF_5S in native_tfs:
-                # IBKR: subscribe at 5s, build 1m
-                await self._data_feed.subscribe(instr, TF_5S)
-                bar_builders[instr] = BarBuilder(instr, TF_5S, TF_1M)
-            else:
-                # Replay / moomoo: subscribe at 1m directly
-                await self._data_feed.subscribe(instr, TF_1M)
-            self._record_event("data", "subscribed", instrument=instr.symbol)
-            self._progress.add_timing("setup_subscribe", time.perf_counter() - subscribe_t0)
-
-        # Register strategies in scheduler
-        scheduler = Scheduler(features, options=self._option_cache)
-        for kernel, state in strategy_entries:
-            scheduler.register(kernel, state)
-        last_evaluation_bars: dict[str, datetime] = {}
-
-        # Start background tasks
-        pool = ThreadPoolExecutor(max_workers=self._pool_workers)
-        inline_order_drain = _supports_inline_order_drain(self._broker)
-        inline_strategy_calls = is_simulated or inline_order_drain
+        pool = None
         drain_orders_task = None
         drain_fills_task = None
         drain_order_updates_task = None
-        if not is_simulated and not inline_order_drain:
-            drain_orders_task = loop.create_task(order_manager.drain_orders())
-            drain_fills_task = loop.create_task(order_manager.drain_fills())
-            drain_order_updates_task = loop.create_task(order_manager.drain_order_updates())
-        self._set_runtime_state(phase="running")
+        health_task = None
+        reconciliation_task = None
+        try:
+            # Connect before instrument resolution so adapter-backed resolvers can
+            # query broker contract details without strategies importing adapters.
+            setup_t0 = time.perf_counter()
+            await self._broker.connect()
+            self._set_runtime_state(broker_connected=True)
+            await self._data_feed.connect()
+            self._set_runtime_state(data_connected=True)
+            if self._option_data_provider is not None:
+                await self._option_data_provider.connect()
+            self._progress.add_timing("setup_connect", time.perf_counter() - setup_t0)
 
-        async def evaluate_exit(
-            kernel: StrategyKernel,
-            ctx,
-            state: dict,
-            position: Position,
-        ) -> None:
-            ctx = self._context_with_positions(ctx, kernel, portfolio)
-            self._progress.count("exit_evals")
-            strategy_t0 = time.perf_counter()
-            if inline_strategy_calls:
-                reason = kernel.on_exit(ctx, position, state)
-            else:
-                reason = await loop.run_in_executor(
-                    pool, kernel.on_exit, ctx, position, state
+            await self._resolve_runtime_instruments(
+                require_resolved_futures=(
+                    not is_simulated
+                    and str(getattr(self._broker, "name", "")).lower() == "ibkr"
                 )
-            elapsed = time.perf_counter() - strategy_t0
-            self._progress.add_strategy_timing(kernel.SPEC.id, "exit", elapsed)
-            audit_t0 = time.perf_counter()
-            self._write_decision_trace(state)
-            self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
+            )
+
+            # Build DataManagers for strategy data. Simulated paper replay also
+            # needs execution-instrument bars so PaperBroker can resolve fills.
+            strategy_data_instruments: set[Instrument] = set()
+            execution_instruments: set[Instrument] = set()
+            for kernel, _ in self._strategies:
+                strategy_data_instruments.add(kernel.SPEC.primary_instrument)
+                strategy_data_instruments.update(kernel.SPEC.reference_instruments)
+                execution_instruments.add(kernel.SPEC.execution_instrument)
+            all_instruments = set(strategy_data_instruments)
+            if is_simulated and hasattr(self._broker, "on_bar"):
+                all_instruments.update(execution_instruments)
+
+            managers: dict[Instrument, DataManager] = {
+                instr: DataManager(instr, self._lookback_days, self._session_tz)
+                for instr in all_instruments
+            }
+            self._set_managers(managers)
+            features = FeatureRegistry(managers)
+            bar_builders: dict[Instrument, BarBuilder] = {}
+            strategy_entries: list[tuple[StrategyKernel, dict]] = []
+            for kernel, initial_state in self._strategies:
+                state: dict = dict(initial_state)
+                kernel.on_start(state)
+                if self._strategy_state_store is not None:
+                    state.update(self._strategy_state_store.load_state(kernel.SPEC.id))
+                strategy_entries.append((kernel, state))
+
+            self._progress.info(
+                "Engine setup starting strategies=%s dispatch_mode=%s progress_total_bars=%s",
+                [kernel.SPEC.id for kernel, _ in self._strategies],
+                self._dispatch_mode,
+                self._progress.total_bars,
+            )
+
+            # Portfolio state and order manager
+            portfolio = PortfolioState()
+            self._set_portfolio(portfolio)
+            account_snapshot = await self._broker.get_account()
+            self._set_latest_account_snapshot(account_snapshot)
+            portfolio.update_account(account_snapshot)
+            sizing_account = _MarkToMarketSizingState(account_snapshot.net_liquidation)
+            adopted = await self._broker.get_positions()
+            if self._startup_position_gate_enabled:
+                portfolio.adopt_positions(adopted)
+                if adopted:
+                    gate_result = await self._startup_gate.run(
+                        adopted,
+                        strategy_entries,
+                        refresh_positions=self._broker.get_positions,
+                        on_awaiting_mapping=lambda: self._set_runtime_state(
+                            phase=_PHASE_AWAITING_STARTUP_MAPPING,
+                        ),
+                        on_released=lambda: self._set_runtime_state(phase="starting"),
+                    )
+                    apply_startup_position_allocations(
+                        gate_result.allocations,
+                        gate_result.positions,
+                        strategy_entries,
+                        portfolio,
+                        unmanaged_remainder_acknowledgements=(
+                            gate_result.unmanaged_remainder_acknowledgements
+                        ),
+                        ownership_ledger=self._ownership_ledger,
+                        write_event=self._write_startup_order_event,
+                    )
+                else:
+                    self._startup_gate.mark_clear(
+                        "No broker positions found; startup can continue.",
+                    )
+            elif adopted:
+                strategy_map = resolve_adopted_position_map(
+                    adopted,
+                    strategy_entries,
+                    self._adopted_position_map,
+                )
+                portfolio.adopt_positions(adopted, strategy_map)
+                for position in adopted:
+                    sid = strategy_map.get(position.instrument)
+                    owner = sid if sid else "unmapped"
+                    log.warning(
+                        "Adopted broker position: %s %.4f avg_cost=%.4f owner=%s",
+                        position.instrument.symbol,
+                        position.quantity,
+                        position.avg_cost,
+                        owner,
+                    )
             self._persist_strategy_states(strategy_entries, portfolio)
-            if not reason:
+            protective_stops = {
+                kernel.SPEC.id: kernel.SPEC.protective_stop
+                for kernel, _ in self._strategies
+                if kernel.SPEC.protective_stop is not None
+            }
+            position_policies = {
+                kernel.SPEC.id: kernel.SPEC.position_policy
+                for kernel, _ in self._strategies
+            }
+            strategy_execution_instruments = {
+                kernel.SPEC.id: kernel.SPEC.execution_instrument
+                for kernel, _ in self._strategies
+            }
+
+            def on_fill_applied(fill: Fill) -> None:
+                sizing_account.apply_fill(fill)
+                self._persist_strategy_states(strategy_entries, portfolio)
+
+            order_manager = OrderManager(
+                self._broker,
+                portfolio,
+                self._risk,
+                self._audit,
+                protective_stops=protective_stops,
+                strategy_modes=self._strategy_modes,
+                position_policies=position_policies,
+                strategy_risk=self._strategy_risk,
+                ownership_ledger=self._ownership_ledger,
+                metadata_profile=self._metadata_profile,
+                strategy_aliases=self._strategy_aliases,
+                sizing_price_provider=sizing_account.latest_price,
+                sizing_equity_provider=sizing_account.equity,
+                fill_listener=on_fill_applied,
+                strategy_execution_instruments=strategy_execution_instruments,
+                approval_store=self._approval_store,
+                entry_block_provider=self._order_entry_block_reason,
+                account_snapshot_provider=self._latest_account_for_risk,
+            )
+            self._order_manager = order_manager
+
+            if not is_simulated:
+                await self._startup_open_order_gate(all_instruments)
+
+            # Backfill historical data. Split feeds may load offline history first
+            # and supplement the gap with broker historical bars before live starts.
+            end = self._clock.now()
+            if isinstance(self._clock, SimulatedClock) and end.year == 1:
+                end = datetime.now(tz=timezone.utc)
+            start = end - timedelta(days=self._lookback_days)
+            for instr, dm in managers.items():
+                try:
+                    fetch_t0 = time.perf_counter()
+                    self._progress.info(
+                        "Backfill fetch starting instrument=%s lookback_days=%d start=%s end=%s",
+                        instr.symbol,
+                        self._lookback_days,
+                        start.isoformat(),
+                        end.isoformat(),
+                    )
+                    bars = await self._data_feed.fetch(instr, TF_1M, start, end)
+                    self._progress.add_timing("setup_backfill_fetch", time.perf_counter() - fetch_t0)
+                    merge_t0 = time.perf_counter()
+                    dm.merge_backfill(bars)
+                    self._progress.add_timing("setup_backfill_merge", time.perf_counter() - merge_t0)
+                    log.info("Backfilled %d bars for %s", len(bars), instr.symbol)
+                    self._record_event(
+                        "data",
+                        "backfill_complete",
+                        instrument=instr.symbol,
+                        bars=len(bars),
+                    )
+                except Exception as e:
+                    log.warning("Backfill failed for %s: %s", instr.symbol, e)
+                    self._record_event(
+                        "data",
+                        "backfill_failed",
+                        instrument=instr.symbol,
+                        error=str(e),
+                    )
+
+            preload_t0 = time.perf_counter()
+            features.preload_from_managers()
+            self._progress.add_timing("setup_feature_preload_managers", time.perf_counter() - preload_t0)
+            if self._feature_preload_bars:
+                preload_t0 = time.perf_counter()
+                features.preload_bars(self._feature_preload_bars)
+                self._progress.add_timing("setup_feature_preload_replay", time.perf_counter() - preload_t0)
+                self._progress.info(
+                    "Feature replay preload complete bars=%d",
+                    len(self._feature_preload_bars),
+                )
+            features_are_replay_preloaded = is_simulated and bool(self._feature_preload_bars)
+
+            await self._seed_startup_protective_stops(
+                strategy_entries,
+                portfolio,
+                managers,
+                features,
+                order_manager,
+            )
+
+            # Subscribe streaming
+            for instr in all_instruments:
+                subscribe_t0 = time.perf_counter()
+                native_tfs = self._data_feed.capabilities.native_timeframes
+                if native_tfs and TF_5S in native_tfs:
+                    # IBKR: subscribe at 5s, build 1m
+                    await self._data_feed.subscribe(instr, TF_5S)
+                    bar_builders[instr] = BarBuilder(instr, TF_5S, TF_1M)
+                else:
+                    # Replay / moomoo: subscribe at 1m directly
+                    await self._data_feed.subscribe(instr, TF_1M)
+                self._record_event("data", "subscribed", instrument=instr.symbol)
+                self._progress.add_timing("setup_subscribe", time.perf_counter() - subscribe_t0)
+
+            # Register strategies in scheduler
+            scheduler = Scheduler(features, options=self._option_cache)
+            for kernel, state in strategy_entries:
+                scheduler.register(kernel, state)
+            last_evaluation_bars: dict[str, datetime] = {}
+
+            # Start background tasks
+            pool = ThreadPoolExecutor(max_workers=self._pool_workers)
+            inline_order_drain = _supports_inline_order_drain(self._broker)
+            inline_strategy_calls = is_simulated or inline_order_drain
+            drain_orders_task = None
+            drain_fills_task = None
+            drain_order_updates_task = None
+            health_task = None
+            reconciliation_task = None
+            if not is_simulated and not inline_order_drain:
+                drain_orders_task = loop.create_task(order_manager.drain_orders())
+                drain_fills_task = loop.create_task(order_manager.drain_fills())
+                drain_order_updates_task = loop.create_task(order_manager.drain_order_updates())
+            if not is_simulated:
+                health_task = loop.create_task(self._live_health_monitor(all_instruments))
+                reconciliation_task = loop.create_task(
+                    self._runtime_reconciliation_loop(
+                        portfolio,
+                        order_manager,
+                        all_instruments,
+                    )
+                )
+            self._set_runtime_state(phase="running")
+
+            async def evaluate_exit(
+                kernel: StrategyKernel,
+                ctx,
+                state: dict,
+                position: Position,
+            ) -> None:
+                ctx = self._context_with_positions(ctx, kernel, portfolio)
+                self._progress.count("exit_evals")
                 strategy_t0 = time.perf_counter()
                 if inline_strategy_calls:
-                    stop_update = kernel.on_protective_stop_update(ctx, position, state)
+                    reason = kernel.on_exit(ctx, position, state)
                 else:
-                    stop_update = await loop.run_in_executor(
-                        pool, kernel.on_protective_stop_update, ctx, position, state
+                    reason = await loop.run_in_executor(
+                        pool, kernel.on_exit, ctx, position, state
                     )
                 elapsed = time.perf_counter() - strategy_t0
-                self._progress.add_strategy_timing(kernel.SPEC.id, "protective_stop", elapsed)
+                self._progress.add_strategy_timing(kernel.SPEC.id, "exit", elapsed)
                 audit_t0 = time.perf_counter()
                 self._write_decision_trace(state)
                 self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
                 self._persist_strategy_states(strategy_entries, portfolio)
-                if stop_update is None:
+                if not reason:
+                    strategy_t0 = time.perf_counter()
+                    if inline_strategy_calls:
+                        stop_update = kernel.on_protective_stop_update(ctx, position, state)
+                    else:
+                        stop_update = await loop.run_in_executor(
+                            pool, kernel.on_protective_stop_update, ctx, position, state
+                        )
+                    elapsed = time.perf_counter() - strategy_t0
+                    self._progress.add_strategy_timing(kernel.SPEC.id, "protective_stop", elapsed)
+                    audit_t0 = time.perf_counter()
+                    self._write_decision_trace(state)
+                    self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
+                    self._persist_strategy_states(strategy_entries, portfolio)
+                    if stop_update is None:
+                        return
+
+                    self._progress.count("protective_stop_updates")
+                    order_t0 = time.perf_counter()
+                    self._write_signal_event(
+                        kernel.SPEC.id,
+                        "protective_stop_update",
+                        ctx.timestamp,
+                        stop_update=stop_update,
+                        instrument=position.instrument,
+                        side=position.side,
+                        trade_id=position.trade_id,
+                    )
+                    await order_manager.ensure_protective_stop(
+                        kernel.SPEC.id,
+                        position,
+                        stop_update.stop_price,
+                        stop_update.reason,
+                    )
+                    if is_simulated or inline_order_drain:
+                        await order_manager.drain_ready_order_updates()
+                    else:
+                        await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+                    self._persist_strategy_states(strategy_entries, portfolio)
+                    self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
                     return
 
-                self._progress.count("protective_stop_updates")
+                self._progress.count("exit_signals")
                 order_t0 = time.perf_counter()
                 self._write_signal_event(
                     kernel.SPEC.id,
-                    "protective_stop_update",
+                    "exit",
                     ctx.timestamp,
-                    stop_update=stop_update,
+                    reason=reason,
                     instrument=position.instrument,
                     side=position.side,
                     trade_id=position.trade_id,
                 )
-                await order_manager.ensure_protective_stop(
+                await order_manager.submit_close(
                     kernel.SPEC.id,
                     position,
-                    stop_update.stop_price,
-                    stop_update.reason,
+                    reason,
                 )
-                if is_simulated or inline_order_drain:
-                    await order_manager.drain_ready_order_updates()
-                else:
-                    await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
                 self._persist_strategy_states(strategy_entries, portfolio)
                 self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
-                return
 
-            self._progress.count("exit_signals")
-            order_t0 = time.perf_counter()
-            self._write_signal_event(
-                kernel.SPEC.id,
-                "exit",
-                ctx.timestamp,
-                reason=reason,
-                instrument=position.instrument,
-                side=position.side,
-                trade_id=position.trade_id,
-            )
-            await order_manager.submit_close(
-                kernel.SPEC.id,
-                position,
-                reason,
-            )
-            self._persist_strategy_states(strategy_entries, portfolio)
-            self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
+            async def refresh_option_data(
+                kernel: StrategyKernel,
+                ctx,
+                state: dict,
+            ) -> None:
+                if self._option_data_provider is None:
+                    return
+                seen: set[tuple] = set()
+                for _ in range(2):
+                    if inline_strategy_calls:
+                        requests = kernel.option_data_requests(ctx, state)
+                    else:
+                        requests = await loop.run_in_executor(
+                            pool,
+                            kernel.option_data_requests,
+                            ctx,
+                            state,
+                        )
+                    fresh = [
+                        request for request in requests or ()
+                        if _option_request_key(request) not in seen
+                    ]
+                    if not fresh:
+                        break
+                    for request in fresh:
+                        seen.add(_option_request_key(request))
+                        await self._refresh_option_data_request(request)
 
-        async def refresh_option_data(
-            kernel: StrategyKernel,
-            ctx,
-            state: dict,
-        ) -> None:
-            if self._option_data_provider is None:
-                return
-            seen: set[tuple] = set()
-            for _ in range(2):
+            async def evaluate_entry(kernel: StrategyKernel, ctx, state: dict) -> None:
+                ctx = self._context_with_positions(ctx, kernel, portfolio)
+                block_reason = self._order_entry_block_reason(
+                    kernel.SPEC.id,
+                    kernel.SPEC.execution_instrument,
+                )
+                if block_reason is not None:
+                    self._progress.count("entry_blocked")
+                    self._write_signal_event(
+                        kernel.SPEC.id,
+                        "entry_blocked",
+                        ctx.timestamp,
+                        reason=block_reason,
+                        instrument=kernel.SPEC.execution_instrument,
+                    )
+                    return
+                if self._dispatch_mode == _DISPATCH_MODE_PARALLEL:
+                    signals = self._precomputed_signals_at(kernel.SPEC.id, ctx.timestamp)
+                    if not signals:
+                        self._progress.count("parallel_entry_misses")
+                        return
+                    for signal in signals:
+                        if not self._entry_frequency_allows(kernel, state, ctx.timestamp):
+                            self._progress.count("entry_frequency_skips")
+                            continue
+                        self._progress.count("entry_evals")
+                        self._mark_entry_frequency(kernel, state, ctx.timestamp)
+                        self._progress.count("entry_signals")
+                        order_t0 = time.perf_counter()
+                        self._write_signal_event(
+                            kernel.SPEC.id,
+                            "entry",
+                            ctx.timestamp,
+                            signal=signal,
+                            trade_id=signal.trade_id,
+                            source="precomputed",
+                        )
+                        await order_manager.submit(signal, kernel.SPEC.id)
+                        if is_simulated or inline_order_drain:
+                            await order_manager.drain_ready_orders()
+                            await order_manager.drain_ready_order_updates()
+                        else:
+                            await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+                        self._persist_strategy_states(strategy_entries, portfolio)
+                        self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
+                    return
+
+                if not self._entry_frequency_allows(kernel, state, ctx.timestamp):
+                    self._progress.count("entry_frequency_skips")
+                    return
+
+                self._progress.count("entry_evals")
+                await refresh_option_data(kernel, ctx, state)
+                strategy_t0 = time.perf_counter()
                 if inline_strategy_calls:
-                    requests = kernel.option_data_requests(ctx, state)
+                    signal = kernel.generate(ctx, state)
                 else:
-                    requests = await loop.run_in_executor(
+                    signal = await loop.run_in_executor(
+                        pool, kernel.generate, ctx, state
+                    )
+                elapsed = time.perf_counter() - strategy_t0
+                self._progress.add_strategy_timing(kernel.SPEC.id, "entry", elapsed)
+                audit_t0 = time.perf_counter()
+                self._write_decision_trace(state)
+                self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
+                if inline_strategy_calls:
+                    intents = kernel.generate_intents(ctx, state)
+                else:
+                    intents = await loop.run_in_executor(
                         pool,
-                        kernel.option_data_requests,
+                        kernel.generate_intents,
                         ctx,
                         state,
                     )
-                fresh = [
-                    request for request in requests or ()
-                    if _option_request_key(request) not in seen
-                ]
-                if not fresh:
-                    break
-                for request in fresh:
-                    seen.add(_option_request_key(request))
-                    await self._refresh_option_data_request(request)
-
-        async def evaluate_entry(kernel: StrategyKernel, ctx, state: dict) -> None:
-            ctx = self._context_with_positions(ctx, kernel, portfolio)
-            if self._dispatch_mode == _DISPATCH_MODE_PARALLEL:
-                signals = self._precomputed_signals_at(kernel.SPEC.id, ctx.timestamp)
-                if not signals:
-                    self._progress.count("parallel_entry_misses")
+                audit_t0 = time.perf_counter()
+                self._write_decision_trace(state)
+                self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
+                if signal is None and not intents:
+                    self._persist_strategy_states(strategy_entries, portfolio)
                     return
-                for signal in signals:
-                    if not self._entry_frequency_allows(kernel, state, ctx.timestamp):
-                        self._progress.count("entry_frequency_skips")
-                        continue
-                    self._progress.count("entry_evals")
-                    self._mark_entry_frequency(kernel, state, ctx.timestamp)
+
+                self._mark_entry_frequency(kernel, state, ctx.timestamp)
+                order_t0 = time.perf_counter()
+                if signal is not None:
                     self._progress.count("entry_signals")
-                    order_t0 = time.perf_counter()
                     self._write_signal_event(
                         kernel.SPEC.id,
                         "entry",
                         ctx.timestamp,
                         signal=signal,
                         trade_id=signal.trade_id,
-                        source="precomputed",
                     )
                     await order_manager.submit(signal, kernel.SPEC.id)
-                    if is_simulated or inline_order_drain:
-                        await order_manager.drain_ready_orders()
-                        await order_manager.drain_ready_order_updates()
-                    else:
-                        await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
-                    self._persist_strategy_states(strategy_entries, portfolio)
-                    self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
-                return
-
-            if not self._entry_frequency_allows(kernel, state, ctx.timestamp):
-                self._progress.count("entry_frequency_skips")
-                return
-
-            self._progress.count("entry_evals")
-            await refresh_option_data(kernel, ctx, state)
-            strategy_t0 = time.perf_counter()
-            if inline_strategy_calls:
-                signal = kernel.generate(ctx, state)
-            else:
-                signal = await loop.run_in_executor(
-                    pool, kernel.generate, ctx, state
-                )
-            elapsed = time.perf_counter() - strategy_t0
-            self._progress.add_strategy_timing(kernel.SPEC.id, "entry", elapsed)
-            audit_t0 = time.perf_counter()
-            self._write_decision_trace(state)
-            self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
-            if inline_strategy_calls:
-                intents = kernel.generate_intents(ctx, state)
-            else:
-                intents = await loop.run_in_executor(
-                    pool,
-                    kernel.generate_intents,
-                    ctx,
-                    state,
-                )
-            audit_t0 = time.perf_counter()
-            self._write_decision_trace(state)
-            self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
-            if signal is None and not intents:
+                for intent in intents or ():
+                    self._progress.count("entry_signals")
+                    self._write_signal_event(
+                        kernel.SPEC.id,
+                        "entry_intent",
+                        ctx.timestamp,
+                        intent=intent,
+                        trade_id=intent.trade_id,
+                    )
+                    await order_manager.submit_intent(intent, kernel.SPEC.id)
+                if is_simulated or inline_order_drain:
+                    await order_manager.drain_ready_orders()
+                    await order_manager.drain_ready_order_updates()
+                else:
+                    await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
                 self._persist_strategy_states(strategy_entries, portfolio)
-                return
+                self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
 
-            self._mark_entry_frequency(kernel, state, ctx.timestamp)
-            order_t0 = time.perf_counter()
-            if signal is not None:
-                self._progress.count("entry_signals")
-                self._write_signal_event(
-                    kernel.SPEC.id,
-                    "entry",
-                    ctx.timestamp,
-                    signal=signal,
-                    trade_id=signal.trade_id,
-                )
-                await order_manager.submit(signal, kernel.SPEC.id)
-            for intent in intents or ():
-                self._progress.count("entry_signals")
-                self._write_signal_event(
-                    kernel.SPEC.id,
-                    "entry_intent",
-                    ctx.timestamp,
-                    intent=intent,
-                    trade_id=intent.trade_id,
-                )
-                await order_manager.submit_intent(intent, kernel.SPEC.id)
-            if is_simulated or inline_order_drain:
-                await order_manager.drain_ready_orders()
-                await order_manager.drain_ready_order_updates()
-            else:
-                await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
-            self._persist_strategy_states(strategy_entries, portfolio)
-            self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
+        except Exception as e:
+            log.exception("Engine setup error: %s", e)
+            self._set_runtime_state(phase="error", last_error=str(e))
+            self._record_event("engine", "engine_setup_error", error=str(e))
+            for task in (
+                drain_orders_task,
+                drain_fills_task,
+                drain_order_updates_task,
+                health_task,
+                reconciliation_task,
+            ):
+                if task is not None:
+                    task.cancel()
+            self._order_manager = None
+            self._runtime_loop = None
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
+            if self._option_data_provider is not None:
+                try:
+                    await self._option_data_provider.disconnect()
+                except Exception as disconnect_exc:
+                    log.warning("Option provider cleanup failed: %s", disconnect_exc)
+            try:
+                await self._data_feed.disconnect()
+            except Exception as disconnect_exc:
+                log.warning("Data feed cleanup failed: %s", disconnect_exc)
+            self._set_runtime_state(data_connected=False)
+            try:
+                await self._broker.disconnect()
+            except Exception as disconnect_exc:
+                log.warning("Broker cleanup failed: %s", disconnect_exc)
+            self._progress.finish()
+            self._set_runtime_state(
+                phase="error",
+                broker_connected=False,
+                stopped_at=datetime.now(tz=timezone.utc),
+            )
+            raise
 
         try:
             async for raw_bar in self._data_feed.bars():
@@ -880,6 +979,12 @@ class Engine:
                     else:
                         await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
                     self._progress.add_timing("broker_on_bar", time.perf_counter() - stage_t0)
+
+                if not is_simulated:
+                    await self._maybe_cancel_session_protective_stops(
+                        order_manager,
+                        bar_1m.timestamp,
+                    )
 
                 # Invalidate feature caches for this instrument
                 stage_t0 = time.perf_counter()
@@ -1015,6 +1120,10 @@ class Engine:
                 drain_fills_task.cancel()
             if drain_order_updates_task is not None:
                 drain_order_updates_task.cancel()
+            if health_task is not None:
+                health_task.cancel()
+            if reconciliation_task is not None:
+                reconciliation_task.cancel()
             self._order_manager = None
             self._runtime_loop = None
             pool.shutdown(wait=True, cancel_futures=True)
@@ -1524,6 +1633,213 @@ class Engine:
         if self._audit is not None:
             self._audit.order({"event": event, **fields})
 
+    async def _startup_open_order_gate(
+        self,
+        enabled_instruments: set[Instrument],
+    ) -> None:
+        get_open_orders = getattr(self._broker, "get_open_orders", None)
+        if not callable(get_open_orders):
+            return
+        open_orders = await get_open_orders()
+        relevant = [
+            order for order in open_orders
+            if _matches_any_instrument(order.instrument, enabled_instruments)
+        ]
+        self._set_reconciliation_state(
+            enabled=True,
+            status="startup_checked",
+            last_check=datetime.now(tz=timezone.utc).isoformat(),
+            open_order_count=len(open_orders),
+            relevant_open_order_count=len(relevant),
+        )
+        if not relevant:
+            return
+        reason = "startup_open_orders_require_operator_review"
+        self._set_entry_block(reason)
+        self._record_event(
+            "reconciliation",
+            "startup_open_orders_blocked",
+            reason=reason,
+            open_orders=relevant,
+        )
+        raise RuntimeError(
+            "Open broker orders exist for enabled instruments; resolve them in "
+            "TWS/Gateway before live startup or add an explicit adopt/cancel workflow."
+        )
+
+    async def _live_health_monitor(self, enabled_instruments: set[Instrument]) -> None:
+        interval = float(self._live_health_config.get("check_interval_seconds", 15.0))
+        stale_seconds = float(self._live_health_config.get("stale_bar_seconds", 120.0))
+        reconnect = bool(self._live_health_config.get("reconnect", True))
+        while True:
+            await asyncio.sleep(max(1.0, interval))
+            try:
+                now = datetime.now(tz=timezone.utc)
+                broker_connected = self._broker_is_connected()
+                data_connected = self._data_feed_is_connected()
+                self._set_runtime_state(
+                    broker_connected=broker_connected,
+                    data_connected=data_connected,
+                )
+                stale_bar = False
+                last_received = self._last_bar_received_at
+                if last_received is not None:
+                    stale_bar = (now - last_received).total_seconds() > stale_seconds
+                reason = None
+                if not broker_connected:
+                    reason = "broker_disconnected"
+                elif not data_connected:
+                    reason = "data_disconnected"
+                elif stale_bar:
+                    reason = "stale_market_data"
+
+                self._set_runtime_health(
+                    last_check=now.isoformat(),
+                    broker_connected=broker_connected,
+                    data_connected=data_connected,
+                    stale_bar=stale_bar,
+                    block_reason=reason,
+                )
+                if reason is None:
+                    self._clear_entry_block_if_health_owned()
+                    continue
+                self._set_entry_block(reason)
+                self._record_event("health", reason, stale_seconds=stale_seconds)
+                if reconnect and reason in {"broker_disconnected", "data_disconnected"}:
+                    await self._attempt_reconnect(enabled_instruments, reason)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._set_entry_block("health_monitor_error")
+                self._record_event("health", "health_monitor_error", error=str(exc))
+
+    async def _attempt_reconnect(
+        self,
+        enabled_instruments: set[Instrument],
+        reason: str,
+    ) -> None:
+        try:
+            self._record_event("health", "reconnect_attempt", reason=reason)
+            await self._broker.connect()
+            await self._data_feed.connect()
+            await self._data_feed.resubscribe_all()
+            self._set_runtime_state(
+                broker_connected=self._broker_is_connected(),
+                data_connected=self._data_feed_is_connected(),
+            )
+            self._record_event(
+                "health",
+                "reconnect_complete",
+                instruments=[instrument.symbol for instrument in enabled_instruments],
+            )
+        except Exception as exc:
+            self._record_event("health", "reconnect_failed", error=str(exc))
+
+    async def _runtime_reconciliation_loop(
+        self,
+        portfolio: PortfolioState,
+        order_manager: OrderManager,
+        enabled_instruments: set[Instrument],
+    ) -> None:
+        cfg = self._runtime_reconciliation_config
+        enabled = bool(cfg.get("enabled", True))
+        interval = float(cfg.get("interval_seconds", 60.0))
+        self._set_reconciliation_state(enabled=enabled, status="idle")
+        if not enabled:
+            return
+        while True:
+            await asyncio.sleep(max(5.0, interval))
+            try:
+                await self._run_reconciliation_snapshot(
+                    portfolio,
+                    order_manager,
+                    enabled_instruments,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._set_entry_block("reconciliation_error")
+                self._set_reconciliation_state(
+                    status="error",
+                    block_reason="reconciliation_error",
+                    last_error=str(exc),
+                    last_check=datetime.now(tz=timezone.utc).isoformat(),
+                )
+                self._record_event("reconciliation", "runtime_reconciliation_error", error=str(exc))
+
+    async def _run_reconciliation_snapshot(
+        self,
+        portfolio: PortfolioState,
+        order_manager: OrderManager,
+        enabled_instruments: set[Instrument],
+    ) -> None:
+        now = datetime.now(tz=timezone.utc)
+        account = await self._broker.get_account()
+        self._set_latest_account_snapshot(account)
+        broker_positions = await self._broker.get_positions()
+        get_open_orders = getattr(self._broker, "get_open_orders", None)
+        open_orders = await get_open_orders() if callable(get_open_orders) else []
+        relevant_open_orders = [
+            order for order in open_orders
+            if _matches_any_instrument(order.instrument, enabled_instruments)
+        ]
+        unknown_order_ids = [
+            order.broker_order_id
+            for order in relevant_open_orders
+            if order.broker_order_id not in order_manager.tracked_open_order_ids()
+        ]
+        broker_qty = _position_quantities(broker_positions, enabled_instruments)
+        local_qty = _position_quantities(portfolio.positions(), enabled_instruments)
+        position_drift = broker_qty != local_qty
+        status = "ok"
+        block_reason = None
+        if unknown_order_ids:
+            status = "blocked"
+            block_reason = "unknown_open_orders"
+        elif position_drift:
+            status = "blocked"
+            block_reason = "position_drift"
+        self._set_reconciliation_state(
+            enabled=True,
+            status=status,
+            last_check=now.isoformat(),
+            block_reason=block_reason,
+            unknown_order_ids=unknown_order_ids,
+            broker_positions=broker_qty,
+            local_positions=local_qty,
+        )
+        if block_reason is not None:
+            self._set_entry_block(f"reconciliation_{block_reason}")
+            self._record_event(
+                "reconciliation",
+                "runtime_reconciliation_blocked",
+                reason=block_reason,
+                unknown_order_ids=unknown_order_ids,
+                broker_positions=broker_qty,
+                local_positions=local_qty,
+            )
+        elif self._entry_block_reason and self._entry_block_reason.startswith("reconciliation_"):
+            self._set_entry_block(None)
+
+    async def _maybe_cancel_session_protective_stops(
+        self,
+        order_manager: OrderManager,
+        timestamp: datetime,
+    ) -> None:
+        ts = timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        try:
+            local_ts = ts.astimezone(ZoneInfo(self._session_tz))
+        except Exception:
+            local_ts = ts.astimezone(timezone.utc)
+        if local_ts.time() < dt_time(15, 59):
+            return
+        if self._last_session_stop_cancel_date == local_ts.date():
+            return
+        self._last_session_stop_cancel_date = local_ts.date()
+        await order_manager.cancel_session_protective_stops(reason="rth_session_end")
+
     def _set_managers(self, managers: dict[Instrument, DataManager]) -> None:
         with self._state_lock:
             self._managers = dict(managers)
@@ -1531,6 +1847,59 @@ class Engine:
     def _set_portfolio(self, portfolio: PortfolioState) -> None:
         with self._state_lock:
             self._portfolio = portfolio
+
+    def _set_latest_account_snapshot(self, account) -> None:
+        with self._state_lock:
+            self._latest_account_snapshot = account
+
+    def _latest_account_for_risk(self):
+        with self._state_lock:
+            return self._latest_account_snapshot
+
+    def _broker_is_connected(self) -> bool:
+        connected = getattr(self._broker, "is_connected", None)
+        if callable(connected):
+            return bool(connected())
+        return bool(self._broker_connected)
+
+    def _data_feed_is_connected(self) -> bool:
+        connected = getattr(self._data_feed, "is_connected", None)
+        if callable(connected):
+            return bool(connected())
+        return bool(self._data_connected)
+
+    def _order_entry_block_reason(
+        self,
+        _strategy_id: str,
+        _instrument: Instrument,
+    ) -> str | None:
+        with self._state_lock:
+            return self._entry_block_reason
+
+    def _set_entry_block(self, reason: str | None) -> None:
+        with self._state_lock:
+            previous = self._entry_block_reason
+            self._entry_block_reason = reason
+            self._runtime_health["entry_blocked"] = reason is not None
+            self._runtime_health["block_reason"] = reason
+        if reason and reason != previous:
+            self._record_event("health", "entries_blocked", reason=reason)
+        elif reason is None and previous is not None:
+            self._record_event("health", "entries_unblocked", previous_reason=previous)
+
+    def _clear_entry_block_if_health_owned(self) -> None:
+        with self._state_lock:
+            reason = self._entry_block_reason
+        if reason in {"broker_disconnected", "data_disconnected", "stale_market_data"}:
+            self._set_entry_block(None)
+
+    def _set_runtime_health(self, **fields: Any) -> None:
+        with self._state_lock:
+            self._runtime_health.update(to_jsonable(fields))
+
+    def _set_reconciliation_state(self, **fields: Any) -> None:
+        with self._state_lock:
+            self._reconciliation_state.update(to_jsonable(fields))
 
     def _set_runtime_state(self, **fields: Any) -> None:
         with self._state_lock:
@@ -1550,14 +1919,17 @@ class Engine:
             self._record_event("engine", f"phase_{self._phase}", phase=self._phase)
 
     def _record_bar(self, bar) -> None:
+        received_at = datetime.now(tz=timezone.utc)
         with self._state_lock:
             self._bar_count += 1
+            self._last_bar_received_at = received_at
             self._last_bar = {
                 "instrument": bar.instrument,
                 "timeframe": bar.timeframe.label,
                 "timestamp": bar.timestamp,
                 "source": bar.source,
             }
+            self._runtime_health["last_bar_received_at"] = received_at.isoformat()
 
     def _record_event(self, source: str, message: str, **fields: Any) -> None:
         event = {
@@ -1848,6 +2220,47 @@ def _future_requires_resolution(instrument: Instrument) -> bool:
         str(instrument.asset_class).lower() == "future"
         and instrument.expiry is None
     )
+
+
+def _matches_any_instrument(
+    instrument: Instrument,
+    candidates: set[Instrument],
+) -> bool:
+    return any(_instrument_match(instrument, candidate) for candidate in candidates)
+
+
+def _instrument_match(left: Instrument, right: Instrument) -> bool:
+    return (
+        str(left.asset_class).lower() == str(right.asset_class).lower()
+        and left.symbol.upper() == right.symbol.upper()
+        and (left.expiry == right.expiry or left.expiry is None or right.expiry is None)
+        and (left.exchange == right.exchange or not left.exchange or not right.exchange)
+        and (left.currency == right.currency or not left.currency or not right.currency)
+    )
+
+
+def _position_quantities(
+    positions: Sequence[Position],
+    instruments: set[Instrument],
+) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for position in positions:
+        if not _matches_any_instrument(position.instrument, instruments):
+            continue
+        key = _instrument_quantity_key(position.instrument)
+        result[key] = round(result.get(key, 0.0) + float(position.quantity), 8)
+    return {key: qty for key, qty in sorted(result.items()) if abs(qty) > 1e-8}
+
+
+def _instrument_quantity_key(instrument: Instrument) -> str:
+    expiry = instrument.expiry.isoformat() if instrument.expiry is not None else ""
+    return "|".join([
+        str(instrument.asset_class).lower(),
+        instrument.symbol.upper(),
+        expiry,
+        str(instrument.exchange or ""),
+        str(instrument.currency or ""),
+    ])
 
 
 def _supports_inline_order_drain(broker: Any) -> bool:

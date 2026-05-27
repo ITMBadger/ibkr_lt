@@ -174,6 +174,9 @@ class OrderRequest:
     strategy_id: str = ""
     idempotency_key: str = ""
     tif: Literal["DAY", "GTC"] = "DAY"
+    client_order_id: str | None = None
+    outside_rth: bool | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -184,6 +187,31 @@ class OrderStatus:
     status: Literal["pending", "open", "filled", "cancelled", "rejected", "dry_run"]
     filled_qty: float = 0.0
     avg_fill_price: float | None = None
+    remaining_qty: float = 0.0
+    error_code: int | None = None
+    message: str | None = None
+    permanent_id: str | None = None
+
+
+@dataclass(frozen=True)
+class OpenOrder:
+    """Broker-side open order snapshot used for restart reconciliation."""
+
+    broker_order_id: str
+    instrument: Instrument
+    side: Literal["long", "short"]
+    quantity: float
+    order_type: str
+    status: str = ""
+    limit_price: float | None = None
+    stop_price: float | None = None
+    tif: str | None = None
+    account: str | None = None
+    permanent_id: str | None = None
+    parent_id: str | None = None
+    oca_group: str | None = None
+    order_ref: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

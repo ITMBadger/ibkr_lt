@@ -41,6 +41,12 @@ class DataFeed:
         if self._historical is not None:
             await self._historical.disconnect()
 
+    def is_connected(self) -> bool:
+        connected = getattr(self._live, "is_connected", None)
+        if callable(connected):
+            return bool(connected())
+        return True
+
     async def fetch(
         self,
         instrument: Instrument,
@@ -61,6 +67,11 @@ class DataFeed:
 
     async def unsubscribe(self, instrument: Instrument) -> None:
         await self._live.unsubscribe(instrument)
+
+    async def resubscribe_all(self) -> None:
+        resubscribe = getattr(self._live, "resubscribe_all", None)
+        if callable(resubscribe):
+            await resubscribe()
 
     async def bars(self) -> AsyncIterator[Bar]:
         async for bar in self._live.bars():

@@ -134,6 +134,9 @@ def main() -> None:
     default_risk = RiskPolicy(
         position_size_shares=int(config.get("position_size_shares", 1)),
         max_order_quantity=_optional_int(config.get("max_order_quantity", 2)),
+        max_order_notional=_optional_float(config.get("max_order_notional")),
+        buying_power_buffer_pct=_optional_float(config.get("buying_power_buffer_pct")),
+        max_intraday_drawdown_pct=_optional_float(config.get("max_intraday_drawdown_pct")),
     )
     engine = Engine(
         broker=broker,
@@ -159,6 +162,8 @@ def main() -> None:
         startup_position_gate_enabled=_startup_gate_enabled(config),
         instrument_resolver=instrument_resolver,
         option_data_provider=option_data_provider,
+        live_health=dict(config.get("live_health") or {}),
+        runtime_reconciliation=dict(config.get("runtime_reconciliation") or {}),
     )
     api_metadata = _api_metadata(
         config,
@@ -271,7 +276,7 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             execution["host"] = args.host
         else:
             execution.setdefault("host", "127.0.0.1")
-        execution.setdefault("port", port)
+        _set_validated_ibkr_port(execution, expected_port=port, mode=mode, name="execution")
         if args.client_id is not None:
             execution["client_id"] = args.client_id
         else:
@@ -289,7 +294,12 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
                 provider_cfg["host"] = args.host
             else:
                 provider_cfg.setdefault("host", execution.get("host", "127.0.0.1"))
-            provider_cfg.setdefault("port", execution.get("port", port))
+            _set_validated_ibkr_port(
+                provider_cfg,
+                expected_port=port,
+                mode=mode,
+                name=f"data.{key}",
+            )
             if args.client_id is not None:
                 provider_cfg["client_id"] = args.client_id
             else:
@@ -302,6 +312,22 @@ def _ibkr_port(mode: str, gateway: bool) -> int:
     if mode == "paper":
         return 4002 if gateway else 7497
     return 4001 if gateway else 7496
+
+
+def _set_validated_ibkr_port(
+    cfg: dict[str, Any],
+    *,
+    expected_port: int,
+    mode: str,
+    name: str,
+) -> None:
+    configured = cfg.get("port")
+    if configured not in (None, "") and int(configured) != int(expected_port):
+        raise ConfigError(
+            f"{name}.port={configured} does not match --{mode} IBKR port "
+            f"{expected_port}"
+        )
+    cfg["port"] = int(expected_port)
 
 
 def _load_yaml(path: str | None) -> dict[str, Any]:
@@ -509,6 +535,18 @@ def _strategy_risk(
             ),
             sizing_mode=default_risk.sizing_mode,
             equity_fraction=default_risk.equity_fraction,
+            max_order_notional=_optional_float(
+                item.get("max_order_notional", default_risk.max_order_notional)
+            ),
+            buying_power_buffer_pct=_optional_float(
+                item.get("buying_power_buffer_pct", default_risk.buying_power_buffer_pct)
+            ),
+            max_intraday_drawdown_pct=_optional_float(
+                item.get(
+                    "max_intraday_drawdown_pct",
+                    default_risk.max_intraday_drawdown_pct,
+                )
+            ),
         )
     return result
 
@@ -594,6 +632,9 @@ def _api_metadata(
     strategy_aliases: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     data = dict(config.get("data") or {})
+    execution = dict(config.get("execution") or {})
+    historical_cfg = dict(data.get("historical") or {})
+    live_cfg = dict(data.get("live") or {})
     modes = dict(strategy_modes or strategy_mode_map(config.get("strategy_modes"), strategy_ids))
     aliases = dict(strategy_aliases or {})
     if is_customer_profile(metadata_profile):
@@ -611,9 +652,16 @@ def _api_metadata(
             aliases=aliases if is_customer_profile(metadata_profile) else None,
         ),
         "session_timezone": str(config.get("session_timezone", "America/New_York")),
-        "execution_provider": str(dict(config.get("execution") or {}).get("provider", "ibkr")),
-        "historical_provider": str(dict(data.get("historical") or {}).get("provider", "ibkr")),
-        "live_provider": str(dict(data.get("live") or {}).get("provider", "ibkr")),
+        "execution_provider": str(execution.get("provider", "ibkr")),
+        "historical_provider": str(historical_cfg.get("provider", "ibkr")),
+        "live_provider": str(live_cfg.get("provider", "ibkr")),
+        "ibkr_endpoint": {
+            "mode": str(config.get("mode", "")),
+            "host": str(execution.get("host", "")),
+            "port": execution.get("port"),
+            "client_id": execution.get("client_id"),
+            "account": _redacted_account(execution.get("account")),
+        },
     }
 
 
@@ -663,6 +711,13 @@ def _as_config_list(value: Any) -> list[Any]:
     if isinstance(value, Sequence):
         return list(value)
     return [value]
+
+
+def _redacted_account(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) <= 4:
+        return "***" if text else ""
+    return f"{text[:2]}***{text[-2:]}"
 
 
 if __name__ == "__main__":

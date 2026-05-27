@@ -47,6 +47,7 @@ class IBKRDataProvider:
         self._port = port
         self._client_id = client_id
         self._subscriptions: dict[Instrument, int] = {}  # instrument → req_id
+        self._subscription_timeframes: dict[Instrument, Timeframe] = {}
         self._req_id_to_instrument: dict[int, Instrument] = {}
         self._next_req_id = 10_000
 
@@ -66,6 +67,12 @@ class IBKRDataProvider:
         for instrument in list(self._subscriptions):
             await self.unsubscribe(instrument)
 
+    def is_connected(self) -> bool:
+        try:
+            return bool(self._client.is_ready() and self._client.isConnected())
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     # StreamingDataProvider protocol
     # ------------------------------------------------------------------
@@ -75,6 +82,7 @@ class IBKRDataProvider:
         timeframe is ignored — IBKR always streams at 5s; DataManager/BarBuilder handles upsampling.
         """
         if instrument in self._subscriptions:
+            self._subscription_timeframes[instrument] = timeframe
             return
         req_id = self._next_req_id
         self._next_req_id += 1
@@ -82,6 +90,7 @@ class IBKRDataProvider:
         what_to_show = "TRADES" if instrument.asset_class != "fx" else "MIDPOINT"
         self._client.reqRealTimeBars(req_id, contract, 5, what_to_show, True, [])
         self._subscriptions[instrument] = req_id
+        self._subscription_timeframes[instrument] = timeframe
         self._req_id_to_instrument[req_id] = instrument
         log.info("Subscribed realtime bars: %s (req_id=%d)", instrument.symbol, req_id)
 
@@ -89,7 +98,18 @@ class IBKRDataProvider:
         req_id = self._subscriptions.pop(instrument, None)
         if req_id is not None:
             self._req_id_to_instrument.pop(req_id, None)
-            self._client.cancelRealTimeBars(req_id)
+            self._subscription_timeframes.pop(instrument, None)
+            try:
+                self._client.cancelRealTimeBars(req_id)
+            except Exception as exc:
+                log.debug("cancelRealTimeBars failed during unsubscribe: %s", exc)
+
+    async def resubscribe_all(self) -> None:
+        subscriptions = dict(self._subscription_timeframes)
+        self._subscriptions.clear()
+        self._req_id_to_instrument.clear()
+        for instrument, timeframe in subscriptions.items():
+            await self.subscribe(instrument, timeframe)
 
     async def bars(self) -> AsyncIterator[Bar]:
         """Drain bar_queue; yield one Bar per 5s IBKR callback.

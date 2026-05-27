@@ -44,6 +44,8 @@ class ProtectiveStopSpec:
     pct: float
     reference: str = "fill_price"
     tif: Literal["DAY", "GTC"] = "DAY"
+    rth_only: bool = False
+    cancel_after_session: bool = False
 
 
 @dataclass(frozen=True)

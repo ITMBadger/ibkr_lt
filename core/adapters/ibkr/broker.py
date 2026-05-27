@@ -22,6 +22,7 @@ from ...types import (
     BrokerCapabilities,
     Fill,
     Instrument,
+    OpenOrder,
     OrderRequest,
     OrderStatus,
     Position,
@@ -97,6 +98,12 @@ class IBKRBroker:
     async def disconnect(self) -> None:
         self._client.disconnect()
 
+    def is_connected(self) -> bool:
+        try:
+            return bool(self._client.is_ready() and self._client.isConnected())
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     # Account / positions
     # ------------------------------------------------------------------
@@ -104,9 +111,11 @@ class IBKRBroker:
     async def get_account(self) -> AccountSnapshot:
         req_id = self._client.get_next_order_id()
         tags = "NetLiquidation,BuyingPower,AvailableFunds,ExcessLiquidity"
-        self._client.reqAccountSummary(req_id, "All", tags)
+        self._client.reqAccountSummary(req_id, self._account or "All", tags)
         data: dict[str, float] = {}
         account_id = self._account
+        seen_accounts: set[str] = set()
+        matched_configured_account = False
         try:
             while True:
                 item = await asyncio.wait_for(self._client.account_queue.get(), timeout=15)
@@ -115,9 +124,16 @@ class IBKRBroker:
                     continue
                 if item.get("done"):
                     break
+                item_account = str(item.get("account", ""))
+                if item_account:
+                    seen_accounts.add(item_account)
+                if self._account and item_account != self._account:
+                    continue
+                if self._account and item_account == self._account:
+                    matched_configured_account = True
                 data[item["tag"]] = item["value"]
                 if not account_id:
-                    account_id = item.get("account", "")
+                    account_id = item_account
         except asyncio.TimeoutError:
             log.warning("account summary timed out")
         finally:
@@ -125,6 +141,15 @@ class IBKRBroker:
                 self._client.cancelAccountSummary(req_id)
             except Exception:
                 pass
+        if self._account and not matched_configured_account:
+            raise RuntimeError(
+                "configured IBKR account was not returned by account summary: "
+                f"{self._account}"
+            )
+        if not self._account and len(seen_accounts) > 1:
+            raise RuntimeError(
+                "IBKR returned multiple accounts; configure execution.account explicitly"
+            )
         return AccountSnapshot(
             account_id=account_id,
             net_liquidation=data.get("NetLiquidation", 0.0),
@@ -155,9 +180,27 @@ class IBKRBroker:
             self._client.cancelPositions()
         return [p for p in positions if not p.is_flat]
 
+    async def get_open_orders(self) -> list[OpenOrder]:
+        self._client.reqOpenOrders()
+        orders: list[OpenOrder] = []
+        try:
+            while True:
+                item = await asyncio.wait_for(self._client.open_order_queue.get(), timeout=15)
+                if item.get("done"):
+                    break
+                if self._account and item.get("account") not in ("", self._account):
+                    continue
+                orders.append(_open_order_from_ibkr_item(item))
+        except asyncio.TimeoutError:
+            log.warning("open orders request timed out")
+        return orders
+
     # ------------------------------------------------------------------
     # Order submission
     # ------------------------------------------------------------------
+
+    async def reserve_order_id(self) -> str:
+        return str(self._client.get_next_order_id())
 
     async def submit_order(self, order: OrderRequest) -> OrderStatus:
         if not _IBAPI_AVAILABLE:
@@ -165,13 +208,16 @@ class IBKRBroker:
         contract = instrument_to_contract(order.instrument)
         ib_order = self._build_ib_order(order)
 
-        order_id = self._client.get_next_order_id()
+        order_id = int(order.client_order_id or self._client.get_next_order_id())
         self._client.placeOrder(order_id, contract, ib_order)
         log.info(
             "Placed order %d: %s %s %.0f @ %s",
             order_id, ib_order.action, order.instrument.symbol,
             order.quantity, order.order_type,
         )
+        status = await self._initial_order_status(str(order_id))
+        if status is not None:
+            return status
         return OrderStatus(
             broker_order_id=str(order_id),
             status="pending",
@@ -190,6 +236,9 @@ class IBKRBroker:
             order_id, ib_order.action, order.instrument.symbol,
             order.quantity, order.order_type,
         )
+        status = await self._initial_order_status(str(order_id))
+        if status is not None:
+            return status
         return OrderStatus(
             broker_order_id=str(order_id),
             status="pending",
@@ -213,6 +262,8 @@ class IBKRBroker:
             ib_order.auxPrice = order.stop_price
         if self._account:
             ib_order.account = self._account
+        if order.idempotency_key:
+            ib_order.orderRef = order.idempotency_key
         # ibapi defaults these legacy SMART-routing flags to True. Current
         # TWS paper rejects them for simple stock orders with error 10268.
         if hasattr(ib_order, "eTradeOnly"):
@@ -220,8 +271,71 @@ class IBKRBroker:
         if hasattr(ib_order, "firmQuoteOnly"):
             ib_order.firmQuoteOnly = False
         ib_order.tif = str(order.tif or "DAY").upper()
+        if order.outside_rth is not None:
+            ib_order.outsideRth = bool(order.outside_rth)
         ib_order.transmit = True
         return ib_order
+
+    async def _initial_order_status(self, order_id: str) -> OrderStatus | None:
+        """Return an immediate reject/accepted state without stealing updates."""
+        error_queue = getattr(self._client, "error_queue", None)
+        order_update_queue = getattr(self._client, "order_update_queue", None)
+        if error_queue is None or order_update_queue is None:
+            return None
+        deadline = asyncio.get_running_loop().time() + 1.5
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            error_task = asyncio.create_task(error_queue.get())
+            update_task = asyncio.create_task(order_update_queue.get())
+            done, pending = await asyncio.wait(
+                {error_task, update_task},
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if not done:
+                return None
+            matched_update: dict | None = None
+            for task in done:
+                item = task.result()
+                if task is error_task:
+                    if str(item.get("req_id")) == order_id:
+                        return OrderStatus(
+                            broker_order_id=order_id,
+                            status="rejected",
+                            filled_qty=0.0,
+                            error_code=item.get("error_code"),
+                            message=item.get("message"),
+                        )
+                    await error_queue.put(item)
+                    continue
+                await order_update_queue.put(item)
+                if str(item.get("order_id")) == order_id:
+                    matched_update = item
+            if matched_update is None:
+                continue
+            raw = str(matched_update.get("status", "")).lower()
+            if raw in {"submitted", "presubmitted"}:
+                return OrderStatus(
+                    broker_order_id=order_id,
+                    status="open" if raw == "submitted" else "pending",
+                    filled_qty=float(matched_update.get("filled", 0.0) or 0.0),
+                    avg_fill_price=matched_update.get("avg_fill_price"),
+                    remaining_qty=float(matched_update.get("remaining", 0.0) or 0.0),
+                    permanent_id=str(matched_update.get("perm_id", "") or "") or None,
+                )
+            if raw in {"inactive", "apicancelled", "cancelled"}:
+                return OrderStatus(
+                    broker_order_id=order_id,
+                    status="cancelled",
+                    filled_qty=float(matched_update.get("filled", 0.0) or 0.0),
+                    avg_fill_price=matched_update.get("avg_fill_price"),
+                    remaining_qty=float(matched_update.get("remaining", 0.0) or 0.0),
+                    permanent_id=str(matched_update.get("perm_id", "") or "") or None,
+                )
 
     # ------------------------------------------------------------------
     # Streaming updates
@@ -245,6 +359,8 @@ class IBKRBroker:
                 status=status,  # type: ignore[arg-type]
                 filled_qty=item.get("filled", 0.0),
                 avg_fill_price=item.get("avg_fill_price"),
+                remaining_qty=item.get("remaining", 0.0),
+                permanent_id=str(item.get("perm_id", "") or "") or None,
             )
 
     async def fills(self) -> AsyncIterator[Fill]:
@@ -286,6 +402,44 @@ def _instrument_from_ibkr_item(item: dict) -> Instrument:
         right=_non_empty(item.get("right")),  # type: ignore[arg-type]
         multiplier=_parse_multiplier(item.get("multiplier")),
     )
+
+
+def _open_order_from_ibkr_item(item: dict) -> OpenOrder:
+    order_type = _normalize_ibkr_order_type(str(item.get("order_type", "")))
+    return OpenOrder(
+        broker_order_id=str(item["order_id"]),
+        instrument=_instrument_from_ibkr_item(item),
+        side=_side_from_ibkr_action(str(item.get("action", ""))),
+        quantity=float(item.get("quantity", 0.0) or 0.0),
+        order_type=order_type,
+        status=str(item.get("status", "") or ""),
+        limit_price=_parse_optional_float(item.get("limit_price")),
+        stop_price=_parse_optional_float(item.get("stop_price")),
+        tif=_non_empty(item.get("tif")),
+        account=_non_empty(item.get("account")),
+        permanent_id=_non_empty(item.get("perm_id")),
+        parent_id=_non_empty(item.get("parent_id")),
+        oca_group=_non_empty(item.get("oca_group")),
+        order_ref=_non_empty(item.get("order_ref")),
+        metadata=_broker_metadata(item),
+    )
+
+
+def _side_from_ibkr_action(action: str) -> str:
+    return "long" if action.upper() == "BUY" else "short"
+
+
+def _normalize_ibkr_order_type(order_type: str) -> str:
+    normalized = order_type.strip().upper()
+    if normalized == "MKT":
+        return "market"
+    if normalized == "LMT":
+        return "limit"
+    if normalized == "STP":
+        return "stop"
+    if normalized == "STP LMT":
+        return "stop_limit"
+    return normalized.lower()
 
 
 def _broker_metadata(item: dict) -> dict[str, str]:

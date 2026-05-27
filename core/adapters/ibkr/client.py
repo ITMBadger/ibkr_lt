@@ -65,6 +65,8 @@ class IBKRClient(EWrapper, EClient):  # type: ignore[misc]
         self.hist_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.fill_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.order_update_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.open_order_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.error_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.position_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.account_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.contract_details_queue: asyncio.Queue[dict] = asyncio.Queue()
@@ -141,6 +143,15 @@ class IBKRClient(EWrapper, EClient):  # type: ignore[misc]
             log.debug("IBKR info [%d]: %s", error_code, error_msg)
             return
         log.warning("IBKR error reqId=%d code=%d: %s", reqId, error_code, error_msg)
+        try:
+            parsed_code = int(error_code)
+        except (TypeError, ValueError):
+            parsed_code = 0
+        self._push(self.error_queue, {
+            "req_id": reqId,
+            "error_code": parsed_code,
+            "message": str(error_msg),
+        })
 
     def connectionClosed(self) -> None:
         log.warning("IBKR connection closed")
@@ -239,6 +250,8 @@ class IBKRClient(EWrapper, EClient):  # type: ignore[misc]
             "filled": filled,
             "remaining": remaining,
             "avg_fill_price": avgFillPrice,
+            "perm_id": str(permId) if permId else "",
+            "parent_id": str(parentId) if parentId else "",
         })
 
     def openOrder(
@@ -248,7 +261,34 @@ class IBKRClient(EWrapper, EClient):  # type: ignore[misc]
         order: "Order",
         orderState: "OrderState",
     ) -> None:
-        pass  # Handled via orderStatus
+        self._push(self.open_order_queue, {
+            "order_id": str(orderId),
+            "symbol": contract.symbol,
+            "sec_type": contract.secType,
+            "exchange": getattr(contract, "exchange", ""),
+            "currency": getattr(contract, "currency", ""),
+            "last_trade_date": getattr(contract, "lastTradeDateOrContractMonth", ""),
+            "strike": getattr(contract, "strike", 0.0),
+            "right": getattr(contract, "right", ""),
+            "multiplier": getattr(contract, "multiplier", ""),
+            "con_id": getattr(contract, "conId", 0),
+            "local_symbol": getattr(contract, "localSymbol", ""),
+            "action": getattr(order, "action", ""),
+            "quantity": _optional_float(getattr(order, "totalQuantity", None)) or 0.0,
+            "order_type": getattr(order, "orderType", ""),
+            "limit_price": _optional_price(getattr(order, "lmtPrice", None)),
+            "stop_price": _optional_price(getattr(order, "auxPrice", None)),
+            "tif": getattr(order, "tif", ""),
+            "account": getattr(order, "account", ""),
+            "perm_id": str(getattr(order, "permId", "") or ""),
+            "parent_id": str(getattr(order, "parentId", "") or ""),
+            "oca_group": getattr(order, "ocaGroup", ""),
+            "order_ref": getattr(order, "orderRef", ""),
+            "status": getattr(orderState, "status", ""),
+        })
+
+    def openOrderEnd(self) -> None:
+        self._push(self.open_order_queue, {"done": True})
 
     # ------------------------------------------------------------------
     # EWrapper: positions → position_queue
@@ -417,5 +457,12 @@ def _optional_float(value) -> float | None:
     except (TypeError, ValueError):
         return None
     if parsed <= -1e300:
+        return None
+    return parsed
+
+
+def _optional_price(value) -> float | None:
+    parsed = _optional_float(value)
+    if parsed is None or parsed <= 0 or abs(parsed) > 1e100:
         return None
     return parsed

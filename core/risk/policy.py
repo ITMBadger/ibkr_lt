@@ -25,6 +25,9 @@ class RiskPolicy:
     max_order_quantity: float | None = 2
     sizing_mode: SizingMode = SIZING_MODE_FIXED_SHARES
     equity_fraction: float = 1.0
+    max_order_notional: float | None = None
+    buying_power_buffer_pct: float | None = None
+    max_intraday_drawdown_pct: float | None = None
 
     def size_order(
         self,

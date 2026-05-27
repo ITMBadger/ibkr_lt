@@ -21,6 +21,7 @@ from ...types import (
     BrokerCapabilities,
     Fill,
     Instrument,
+    OpenOrder,
     OrderRequest,
     OrderStatus,
     Position,
@@ -82,9 +83,30 @@ class PaperBroker:
             if qty != 0
         ]
 
+    async def get_open_orders(self) -> list[OpenOrder]:
+        return [
+            OpenOrder(
+                broker_order_id=pending.broker_id,
+                instrument=pending.order.instrument,
+                side=pending.order.side,
+                quantity=pending.order.quantity,
+                order_type=pending.order.order_type,
+                status="pending",
+                limit_price=pending.order.limit_price,
+                stop_price=pending.order.stop_price,
+                tif=pending.order.tif,
+                order_ref=pending.order.idempotency_key or None,
+                metadata=pending.order.metadata,
+            )
+            for pending in self._pending
+        ]
+
+    def is_connected(self) -> bool:
+        return True
+
     async def submit_order(self, order: OrderRequest) -> OrderStatus:
         """Queue order for fill at next bar. Returns pending status immediately."""
-        broker_id = order.idempotency_key or str(uuid.uuid4())
+        broker_id = order.client_order_id or order.idempotency_key or str(uuid.uuid4())
         self._pending.append(
             _PendingOrder(
                 order=order,
