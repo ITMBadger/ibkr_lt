@@ -111,7 +111,7 @@ class IBKRBroker:
     async def get_account(self) -> AccountSnapshot:
         req_id = self._client.get_next_order_id()
         tags = "NetLiquidation,BuyingPower,AvailableFunds,ExcessLiquidity"
-        self._client.reqAccountSummary(req_id, self._account or "All", tags)
+        self._client.reqAccountSummary(req_id, "All", tags)
         data: dict[str, float] = {}
         account_id = self._account
         seen_accounts: set[str] = set()
