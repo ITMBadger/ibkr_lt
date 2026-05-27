@@ -70,13 +70,15 @@ IBKR paper/live is only an environment and port selection. It is not an executio
 
 `Engine` loads broker positions on startup and seeds `PortfolioState`.
 
-In live mode, the startup position gate is enabled. Broker positions that do
-not match any enabled strategy execution instrument are logged as unmanaged and
-startup continues. Broker positions that match one or more enabled strategy
-execution instruments either use a stored ownership-ledger/config allocation or
-pause startup at `awaiting_startup_mapping` until an operator submits protected
-allocations through the API or dashboard. A strategy can adopt a live broker
-position only when its
+In live mode, the startup position gate is enabled. Paper mode can opt into the
+same mapping gate with `startup_position_gate.enabled: true` for paper-account
+rehearsal. Broker positions that do not match any enabled strategy execution
+instrument are logged as unmanaged and startup continues. Broker positions that
+match one or more enabled strategy execution instruments either use saved
+strategy state/config allocation or pause startup at
+`awaiting_startup_mapping` until an operator submits protected allocations
+through the API or dashboard. A strategy can adopt a broker position only when
+its
 `PositionPolicy.supports_position_adoption` is `True` and
 `on_adopt_position()` returns the strategy-owned `Position`.
 
@@ -87,10 +89,21 @@ must choose the owner. If mapping is required and neither the control API nor
 the protected dashboard is available, live startup fails fast rather than
 waiting without a mapping path.
 
-`runs/state/position_ownership.json` records bot-created live ownership from
-fills and is used only to remap still-open broker positions on restart. YAML
-`adopted_positions` remains available as an explicit startup ownership mapping
-when the ledger cannot know the owner.
+`runs/state/strategy_state.json` is the canonical live restart record. Paper
+mode defaults to `runs/state/strategy_paper_state.json` so rehearsal mappings do
+not mix with live ownership state. Each file stores the strategy state dict plus
+still-open strategy positions, including instrument, quantity, trade id, entry
+timestamp, and average cost. On boot, the engine loads that state before startup
+mapping, then uses the saved open-position records to map broker positions when
+the match is exact and all adoption-required fields are present. If saved state
+cannot safely map the broker position, startup stays in
+`awaiting_startup_mapping` for dashboard/API operator mapping instead of
+silently reinitializing strategy memory.
+
+`runs/state/position_ownership.json` is retained only as a legacy fallback when
+the strategy-state store is disabled. YAML `adopted_positions` remains available
+as an explicit startup ownership mapping when no saved state can identify the
+owner.
 
 ### Strategy-Owned Exits
 
@@ -152,6 +165,12 @@ Decision logging is controlled by `logging.decision_scope`:
 The shared deployment config uses `trigger_and_interval` with `decision_interval_minutes: 30` to avoid minute-by-minute live log noise while preserving full trigger traces and one historical diagnostic snapshot per 30-minute wall-clock bucket. Duplicate trace folders in the same minute receive a numeric suffix rather than overwriting. Each trace folder contains `decision.csv` plus optional per-timeframe table CSVs, typically current bar plus the previous four bars.
 
 Signal, order, and fill logs remain append-only: `signals.jsonl`, `orders.jsonl`, and `fills.jsonl`.
+
+When strategy-state persistence is enabled, the active durable live state lives
+at `runs/state/strategy_state.json`; paper uses
+`runs/state/strategy_paper_state.json` unless `strategy_state.path` overrides
+it. Each audit run also receives `strategy_state_snapshot.json` so the run
+folder contains the strategy state view used during that run.
 
 For protected/customer distribution, use `logging.profile: customer` and
 strategy aliases. Customer profile suppresses full decision traces, minimizes

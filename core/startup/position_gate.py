@@ -160,6 +160,13 @@ def build_startup_gate_status(
             require_remainder_ack=False,
         )
     except ValueError as exc:
+        if all(str(item.get("source") or "") == "strategy_state" for item in auto_allocations):
+            status["message"] = (
+                "Saved strategy state could not safely map broker positions; "
+                "operator mapping is required."
+            )
+            status["last_error"] = str(exc)
+            return status
         status["phase"] = PHASE_BLOCKED
         status["message"] = "Startup ownership mappings are invalid."
         status["last_error"] = str(exc)
@@ -210,8 +217,6 @@ def validate_startup_mapping_submission(
 ) -> StartupMappingSubmission:
     if require_awaiting and status.get("phase") != PHASE_AWAITING_MAPPING:
         raise ValueError("startup gate is not awaiting position mappings")
-    if not allocations:
-        raise ValueError("at least one allocation is required")
 
     positions = {
         item["position_id"]: item
@@ -219,6 +224,10 @@ def validate_startup_mapping_submission(
     }
     if not positions:
         raise ValueError("startup gate has no managed broker positions")
+    if not allocations and not ack_unmanaged_remainders:
+        raise ValueError(
+            "at least one allocation or unmanaged acknowledgement is required"
+        )
 
     allocated_by_position: dict[str, float] = defaultdict(float)
     allocated_by_strategy_position: dict[tuple[str, str], int] = defaultdict(int)
@@ -374,12 +383,16 @@ def _validate_unmanaged_remainder_acknowledgements(
                 "is missing reason"
             )
         acknowledged.add(position_id_key)
-        normalized.append({
+        normalized_ack = {
             "position_id": position_id_key,
             "quantity": quantity,
             "reason": reason,
             "source": str(raw.get("source") or "operator"),
-        })
+        }
+        sleeve_id = str(raw.get("sleeve_id") or "").strip()
+        if sleeve_id:
+            normalized_ack["sleeve_id"] = sleeve_id
+        normalized.append(normalized_ack)
 
     missing = sorted(set(remainders) - acknowledged)
     if missing:
@@ -398,6 +411,10 @@ def instruments_match(position_instrument: Instrument, strategy_instrument: Inst
         return _simple_fields_match(position_instrument, strategy_instrument)
     required_fields = _DERIVATIVE_REQUIRED_FIELDS[asset_class]
     for field in required_fields:
+        if asset_class == "future" and field == "exchange":
+            if not _simple_fields_match(position_instrument, strategy_instrument):
+                return False
+            continue
         if asset_class == "future" and field == "expiry":
             if not _future_contract_month_equal(
                 position_instrument.expiry,

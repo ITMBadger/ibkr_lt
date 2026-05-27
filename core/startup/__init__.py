@@ -23,6 +23,7 @@ from .position_gate import (
     validate_startup_allocations,
     validate_startup_mapping_submission,
 )
+from .strategy_state import StrategyStateStore
 
 __all__ = [
     "PHASE_AWAITING_MAPPING",
@@ -35,6 +36,7 @@ __all__ = [
     "StartupGateResult",
     "StartupMappingSubmission",
     "StartupPositionGateController",
+    "StrategyStateStore",
     "apply_startup_position_allocations",
     "build_startup_gate_status",
     "instrument_identity_key",

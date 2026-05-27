@@ -125,6 +125,47 @@ def test_api_metadata_uses_normalized_strategy_modes_argument():
     assert metadata["strategy_modes"] == {"a": "dry_run"}
 
 
+def test_api_metadata_includes_dashboard_sleeves():
+    metadata = _api_metadata(
+        {
+            "mode": "paper",
+            "session_timezone": "America/New_York",
+            "dashboard": {
+                "fund_name": "LT Capital",
+                "sleeves": [
+                    {
+                        "id": "trading",
+                        "label": "Trading",
+                        "target_pct": 40,
+                        "color": "#0d9488",
+                        "strategy_ids": ["sample_futures_strategy"],
+                        "asset_classes": ["future"],
+                    }
+                ],
+            },
+        },
+        ["sample_futures_strategy"],
+        {"sample_futures_strategy": "live"},
+    )
+
+    assert metadata["session_timezone"] == "America/New_York"
+    assert metadata["dashboard_config"] == {
+        "fund_name": "LT Capital",
+        "sleeves": [
+            {
+                "id": "trading",
+                "label": "Trading",
+                "target_pct": 40.0,
+                "color": "#0d9488",
+                "strategy_ids": ["sample_futures_strategy"],
+                "symbols": [],
+                "asset_classes": ["future"],
+                "cash": False,
+            }
+        ],
+    }
+
+
 def test_strategy_params_returns_per_strategy_mapping():
     params = _strategy_params(
         {

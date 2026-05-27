@@ -9,7 +9,7 @@ modules, so this sample will not be auto-loaded as a real strategy.
 
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from core import register_strategy
@@ -157,6 +157,13 @@ class SampleStrategy(StrategyKernel):
             rhs={"start": self._ENTRY_START_HHMM, "end": self._ENTRY_END_HHMM},
         )
         if not in_entry_window:
+            # Dashboard contract: expose only sanitized operator telemetry.
+            # This percent is useful for monitoring but does not reveal which
+            # private rule failed. Raw condition names stay in audit traces.
+            trace.set_entry_readiness(
+                [in_entry_window, False],
+                label="Waiting for setup",
+            )
             return finish("no_signal", "outside_entry_window")
 
         # Use latest_bar() when only the current completed bar is needed. It is
@@ -182,6 +189,13 @@ class SampleStrategy(StrategyKernel):
         # runner's candidate lifecycle exactly. If a setup is consumed by its
         # first confirmation attempt, do not let a later bar reuse that same
         # setup just because final filters rejected the first candidate.
+        #
+        # Dashboard contract: when the strategy has raw same-day trigger/setup
+        # action times, pass only the timestamps with set_trigger_times().
+        # Do not pass rule names, counts, thresholds, scores, or formulas; the
+        # dashboard uses these times only to show whether a possible trigger
+        # occurred today. For completed 3m bars, action time is bar start + 3m.
+        raw_trigger_times = []
 
         # Preferred shared-indicator style. This keeps SPEC minimal and avoids
         # advertising every private feature dependency through metadata.
@@ -192,6 +206,9 @@ class SampleStrategy(StrategyKernel):
 
         # Placeholder condition. Replace this with the real strategy logic.
         condition_ok = bool(ema_fast.iloc[-1] > ema_slow.iloc[-1])
+        if condition_ok:
+            raw_trigger_times.append(current_3m_bar + timedelta(minutes=3))
+        trace.set_trigger_times(raw_trigger_times)
         trace.add_condition(
             "sample_condition",
             condition_ok,
@@ -200,7 +217,29 @@ class SampleStrategy(StrategyKernel):
             rhs=float(ema_slow.iloc[-1]),
         )
         if not condition_ok:
+            # Dashboard contract: count only the entry gates this strategy
+            # deliberately wants represented as a percent. Do not derive this
+            # from every trace.add_condition(); some conditions are diagnostics
+            # or context and should not affect the operator-facing percent.
+            trace.set_entry_readiness(
+                [in_entry_window, not already_evaluated, condition_ok],
+                label="Entry filters not met",
+            )
             return finish("no_signal", "sample_condition_failed")
+
+        # Dashboard contract: if a strategy computes a per-entry runtime stop
+        # such as ATR, add these metrics and pass protective_stop_pct on the
+        # Signal. Otherwise the dashboard will show the static SPEC fallback.
+        #
+        # Example:
+        # entry_stop_pct = 0.0125
+        # trace.add_metric("entry_stop_pct", entry_stop_pct)
+        # trace.add_metric("entry_stop_pct_source", "atr")
+        # signal = Signal(
+        #     instrument=self.SPEC.execution_instrument,
+        #     side="long",
+        #     protective_stop_pct=entry_stop_pct,
+        # )
 
         # For multi_position strategies that need independent exit state, pass
         # a deterministic trade_id, for example:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 
@@ -17,6 +18,7 @@ from core.adapters.ibkr.data import IBKRDataProvider
 from core.adapters.paper.broker import PaperBroker
 from core.adapters.paper.data import ReplayDataProvider
 from core.engine.loader import get_registry, load_strategies
+from core.engine.market_summary import build_market_summary
 from core.engine.timeframes import TF_1M, TF_5S
 from core.interfaces.strategy import (
     POSITION_MODE_MULTI,
@@ -32,8 +34,11 @@ from core.portfolio.state import PortfolioState
 from core.risk.policy import RiskPolicy
 from core.startup import (
     PositionOwnershipLedger,
+    StrategyStateStore,
     StartupPositionGateController,
+    apply_startup_position_allocations,
     build_startup_gate_status,
+    position_id,
     validate_startup_allocations,
     validate_startup_mapping_submission,
 )
@@ -86,6 +91,13 @@ def _bars(instrument: Instrument, n: int = 3) -> list[Bar]:
         )
         for i in range(n)
     ]
+
+
+def _close_frame(start: datetime, closes: list[float]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {"close": closes},
+        index=pd.date_range(start, periods=len(closes), freq="min"),
+    )
 
 
 class _CountingBroker(PaperBroker):
@@ -224,7 +236,29 @@ class _TraceStrategy(StrategyKernel):
         bars = ctx.bars[QQQ]["1m"]
         trace.add_bar("qqq_1m_current", QQQ, "1m", bars.iloc[-1])
         trace.add_condition("always_false", False, lhs=1, op=">", rhs=2)
+        trace.set_entry_readiness(pct=25.0, label="Entry filters not met")
+        trace.set_trigger_times([ctx.timestamp])
         trace.set_decision("no_signal", reason="test")
+        record_decision(state, trace)
+        return None
+
+
+class _ReadinessPreserveStrategy(StrategyKernel):
+    SPEC = StrategySpec(
+        id="_phase6_readiness_preserve",
+        primary_instrument=QQQ,
+        execution_instrument=MNQ,
+        timeframes=("1m",),
+    )
+
+    def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
+        trace = DecisionTrace.entry(ctx, self.SPEC.id)
+        if state.get("seen_readiness"):
+            trace.set_decision("no_signal", reason="housekeeping")
+        else:
+            state["seen_readiness"] = True
+            trace.set_entry_readiness(pct=50.0, label="Entry filters not met")
+            trace.set_decision("no_signal", reason="test")
         record_decision(state, trace)
         return None
 
@@ -244,6 +278,23 @@ class _AdoptableQqqStrategy(StrategyKernel):
     def on_adopt_position(self, position, adoption, state):
         state["adopted_entry_ts"] = adoption.entry_ts
         return position
+
+
+class _EntryTsRequiredQqqStrategy(StrategyKernel):
+    POSITION_ADOPTION_REQUIRED_FIELDS = ("entry_ts",)
+    SPEC = StrategySpec(
+        id="_entry_ts_required_qqq",
+        primary_instrument=QQQ,
+        execution_instrument=QQQ,
+        timeframes=("1m",),
+        position_policy=PositionPolicy(supports_position_adoption=True),
+    )
+
+    def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
+        return None
+
+    def on_adopt_position(self, position, adoption, state):
+        raise AssertionError("state-store recovery should not call adoption hook")
 
 
 class _AdoptableStopStrategy(StrategyKernel):
@@ -355,6 +406,7 @@ class _FakeIBKRDataClient:
             "duration_str": duration_str,
             "bar_size": bar_size,
             "what_to_show": what_to_show,
+            "format_date": format_date,
         })
         for item in self.hist_items:
             payload = {"req_id": req_id, **item}
@@ -442,8 +494,41 @@ def test_ibkr_fetch_caps_1m_duration_and_uses_midpoint_for_fx(monkeypatch):
         assert call["duration_str"] == "10 D"
         assert call["bar_size"] == "1 min"
         assert call["what_to_show"] == "MIDPOINT"
+        assert call["format_date"] == 2
 
     asyncio.run(run())
+
+
+def test_ibkr_fetch_parses_epoch_historical_dates(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            "core.adapters.ibkr.data.instrument_to_contract",
+            lambda instrument: object(),
+        )
+        ts = datetime(2026, 5, 26, 18, 0, tzinfo=timezone.utc)
+        client = _FakeIBKRDataClient(hist_items=[
+            {
+                "date": str(int(ts.timestamp())),
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100.5,
+                "volume": 1000,
+            },
+            {"done": True},
+        ])
+        provider = IBKRDataProvider(client)
+        return await provider.fetch(
+            QQQ,
+            TF_1M,
+            datetime(2026, 5, 1, tzinfo=timezone.utc),
+            datetime(2026, 5, 2, tzinfo=timezone.utc),
+        )
+
+    bars = asyncio.run(run())
+    assert len(bars) == 1
+    assert bars[0].timestamp == datetime(2026, 5, 26, 18, 0, tzinfo=timezone.utc)
+    assert bars[0].close == 100.5
 
 
 def test_ibkr_fetch_logs_unparsable_dates(monkeypatch, caplog):
@@ -708,6 +793,138 @@ def test_engine_attaches_shared_feature_registry_to_context():
     assert strategy.feature_seen
 
 
+def test_market_summary_waits_for_data_when_bars_empty():
+    frame = pd.DataFrame(
+        columns=["close"],
+        index=pd.DatetimeIndex([], tz="UTC", name="timestamp"),
+    )
+
+    summary = build_market_summary(QQQ, frame)
+
+    assert summary["status"] == "waiting_for_market_data"
+    assert summary["symbol"] == "QQQ"
+    assert summary["points"] == []
+
+
+def test_market_summary_calculates_change_from_previous_session_close():
+    previous = _close_frame(
+        datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc),
+        [100.0, 101.0],
+    )
+    current = _close_frame(
+        datetime(2026, 5, 4, 13, 30, tzinfo=timezone.utc),
+        [105.0, 106.0],
+    )
+    frame = pd.concat([previous, current])
+
+    summary = build_market_summary(QQQ, frame)
+
+    assert summary["status"] == "ok"
+    assert summary["latest_close"] == 106.0
+    assert summary["previous_close"] == 101.0
+    assert summary["change_abs"] == 5.0
+    assert summary["change_pct"] == pytest.approx(4.950495)
+    assert summary["window_sessions"] == ["2026-05-01", "2026-05-04"]
+
+
+def test_market_summary_uses_equity_rth_close_and_ignores_future_rows():
+    frame = pd.DataFrame(
+        {"close": [100.0, 80.0, 105.0, 110.0]},
+        index=pd.DatetimeIndex(
+            [
+                datetime(2026, 5, 22, 19, 59, tzinfo=timezone.utc),  # 15:59 ET
+                datetime(2026, 5, 23, 0, 0, tzinfo=timezone.utc),  # 20:00 ET
+                datetime(2026, 5, 26, 14, 0, tzinfo=timezone.utc),  # 10:00 ET
+                datetime(2026, 5, 27, 6, 0, tzinfo=timezone.utc),  # bad future row
+            ],
+            name="timestamp",
+        ),
+    )
+
+    summary = build_market_summary(
+        QQQ,
+        frame,
+        now=datetime(2026, 5, 26, 18, 1, tzinfo=timezone.utc),
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["latest_close"] == 105.0
+    assert summary["previous_close"] == 100.0
+    assert summary["change_pct"] == pytest.approx(5.0)
+    assert summary["window_sessions"] == ["2026-05-22", "2026-05-26"]
+
+
+def test_market_summary_caps_points_for_dashboard_sparkline():
+    first_session = _close_frame(
+        datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc),
+        [100.0 + index for index in range(180)],
+    )
+    second_session = _close_frame(
+        datetime(2026, 5, 4, 13, 30, tzinfo=timezone.utc),
+        [300.0 + index for index in range(180)],
+    )
+    frame = pd.concat([first_session, second_session])
+
+    summary = build_market_summary(QQQ, frame, max_points=20)
+
+    assert summary["raw_points"] == 360
+    assert len(summary["points"]) == 20
+    assert summary["points"][0]["close"] == 100.0
+    assert summary["points"][-1]["close"] == 479.0
+
+
+def test_engine_snapshot_includes_strategy_market_summary():
+    bars = [
+        Bar(
+            instrument=QQQ,
+            timeframe=TF_1M,
+            timestamp=datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc) + timedelta(minutes=index),
+            open=100.0 + index,
+            high=101.0 + index,
+            low=99.0 + index,
+            close=100.0 + index,
+            volume=1000.0,
+            is_closed=True,
+            source="test",
+        )
+        for index in range(3)
+    ] + [
+        Bar(
+            instrument=QQQ,
+            timeframe=TF_1M,
+            timestamp=datetime(2026, 5, 4, 13, 30, tzinfo=timezone.utc) + timedelta(minutes=index),
+            open=110.0 + index,
+            high=111.0 + index,
+            low=109.0 + index,
+            close=110.0 + index,
+            volume=1000.0,
+            is_closed=True,
+            source="test",
+        )
+        for index in range(3)
+    ]
+    engine = Engine(
+        broker=PaperBroker(),
+        streaming=ReplayDataProvider(bars),
+        historical=None,
+        clock=SimulatedClock(),
+        strategies=[(_FeatureStrategy(), {})],
+        risk=RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        thread_pool_workers=1,
+        lookback_days=10,
+    )
+
+    engine.run_backtest()
+    market = engine.snapshot_state()["strategy_market"]["_phase6_feature"]
+
+    assert market["symbol"] == "QQQ"
+    assert market["status"] == "ok"
+    assert market["latest_close"] == 112.0
+    assert market["previous_close"] == 102.0
+    assert market["change_pct"] == pytest.approx(9.803921)
+    assert market["points"]
+
+
 def test_engine_writes_strategy_decision_trace(tmp_path):
     provider = ReplayDataProvider(_bars(QQQ, 2))
     broker = PaperBroker()
@@ -730,6 +947,101 @@ def test_engine_writes_strategy_decision_trace(tmp_path):
         row = next(csv.DictReader(fh))
     assert row["strategy_id"] == "_phase6_trace"
     assert row["condition_always_false"] == "False"
+    last_decision = engine.snapshot_state()["last_decisions"]["_phase6_trace"]
+    assert last_decision["decision"] == "no_signal"
+    assert last_decision["entry_readiness_pct"] == 25.0
+    assert last_decision["entry_readiness_label"] == "Entry filters not met"
+    assert last_decision["trigger_times"] == ["2026-05-01T13:31:00+00:00"]
+    assert "reason" not in last_decision
+    assert "failed_condition" not in last_decision
+    assert "failed_conditions" not in last_decision
+
+
+def test_engine_preserves_same_day_readiness_on_housekeeping_decision():
+    provider = ReplayDataProvider(_bars(QQQ, 2))
+    engine = Engine(
+        broker=PaperBroker(),
+        streaming=provider,
+        historical=None,
+        clock=SimulatedClock(),
+        strategies=[(_ReadinessPreserveStrategy(), {})],
+        risk=RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        thread_pool_workers=1,
+        lookback_days=10,
+    )
+
+    engine.run_backtest()
+    last_decision = engine.snapshot_state()["last_decisions"]["_phase6_readiness_preserve"]
+
+    assert last_decision["decision"] == "no_signal"
+    assert last_decision["entry_readiness_pct"] == 50.0
+    assert last_decision["entry_readiness_label"] == "Entry filters not met"
+
+
+def test_engine_does_not_preserve_readiness_across_market_days():
+    bars = [
+        Bar(
+            instrument=QQQ,
+            timeframe=TF_1M,
+            timestamp=datetime(2026, 5, 1, 19, 59, tzinfo=timezone.utc),
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=1000.0,
+            is_closed=True,
+            source="test",
+        ),
+        Bar(
+            instrument=QQQ,
+            timeframe=TF_1M,
+            timestamp=datetime(2026, 5, 2, 13, 30, tzinfo=timezone.utc),
+            open=101.0,
+            high=102.0,
+            low=100.0,
+            close=101.5,
+            volume=1000.0,
+            is_closed=True,
+            source="test",
+        ),
+    ]
+    engine = Engine(
+        broker=PaperBroker(),
+        streaming=ReplayDataProvider(bars),
+        historical=None,
+        clock=SimulatedClock(),
+        strategies=[(_ReadinessPreserveStrategy(), {})],
+        risk=RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        thread_pool_workers=1,
+        lookback_days=10,
+    )
+
+    engine.run_backtest()
+    last_decision = engine.snapshot_state()["last_decisions"]["_phase6_readiness_preserve"]
+
+    assert last_decision["entry_readiness_pct"] is None
+    assert last_decision["entry_readiness_label"] == "Waiting"
+
+
+def test_engine_customer_snapshot_omits_trigger_times():
+    provider = ReplayDataProvider(_bars(QQQ, 1))
+    engine = Engine(
+        broker=PaperBroker(),
+        streaming=provider,
+        historical=None,
+        clock=SimulatedClock(),
+        strategies=[(_TraceStrategy(), {})],
+        risk=RiskPolicy(position_size_shares=1, max_order_quantity=2),
+        thread_pool_workers=1,
+        lookback_days=10,
+        metadata_profile="customer",
+        strategy_aliases={"_phase6_trace": "strategy_1"},
+    )
+
+    engine.run_backtest()
+    snapshot_text = json.dumps(engine.snapshot_state())
+
+    assert "trigger_times" not in snapshot_text
 
 
 def test_startup_gate_ignores_unrelated_positions():
@@ -773,6 +1085,40 @@ def test_startup_gate_uses_operator_quantity():
 
     assert result.allocations[0]["quantity"] == 3.0
     assert result.unmanaged_remainder_acknowledgements[0]["quantity"] == 2.0
+
+
+def test_startup_gate_allows_manual_position_without_strategy_mapping():
+    status = build_startup_gate_status(
+        [Position(QQQ, quantity=1, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
+    )
+
+    position_id_value = status["positions"][0]["position_id"]
+    result = validate_startup_mapping_submission(
+        status,
+        [],
+        ack_unmanaged_remainders=[
+            {
+                "position_id": position_id_value,
+                "quantity": 1,
+                "reason": "manual_unmanaged:trading",
+                "source": "dashboard",
+                "sleeve_id": "trading",
+            }
+        ],
+    )
+
+    assert result.allocations == []
+    assert result.unmanaged_remainder_acknowledgements == [
+        {
+            "position_id": position_id_value,
+            "quantity": 1.0,
+            "reason": "manual_unmanaged:trading",
+            "source": "dashboard",
+            "sleeve_id": "trading",
+        }
+    ]
 
 
 def test_startup_gate_rejects_partial_mapping_without_remainder_ack():
@@ -907,6 +1253,46 @@ def test_startup_gate_matches_future_contract_month():
 
     assert status["phase"] == "awaiting_mapping"
     assert status["positions"][0]["candidates"][0]["strategy_id"] == "_adoptable_future_same_month"
+
+
+def test_startup_gate_matches_future_when_broker_omits_exchange():
+    strategy_instrument = Instrument(
+        asset_class="future",
+        symbol="MNQ",
+        exchange="CME",
+        currency="USD",
+        expiry=date(2026, 6, 18),
+        multiplier=2.0,
+    )
+    broker_instrument = Instrument(
+        asset_class="future",
+        symbol="MNQ",
+        exchange=None,
+        currency="USD",
+        expiry=date(2026, 6, 18),
+        multiplier=2.0,
+    )
+
+    class _AdoptableFutureStrategy(StrategyKernel):
+        SPEC = StrategySpec(
+            id="_adoptable_future_missing_exchange",
+            primary_instrument=QQQ,
+            execution_instrument=strategy_instrument,
+            timeframes=("1m",),
+            position_policy=PositionPolicy(supports_position_adoption=True),
+        )
+
+        def generate(self, ctx: MarketContext, state: dict) -> Signal | None:
+            return None
+
+    status = build_startup_gate_status(
+        [Position(broker_instrument, quantity=1, avg_cost=18000.0)],
+        [(_AdoptableFutureStrategy(), {})],
+        default_risk=RiskPolicy(),
+    )
+
+    assert status["phase"] == "awaiting_mapping"
+    assert status["positions"][0]["candidates"][0]["strategy_id"] == "_adoptable_future_missing_exchange"
 
 
 def test_startup_gate_uses_configured_adopted_position_mapping():
@@ -1079,6 +1465,168 @@ def test_position_ownership_ledger_recovers_fill_allocation(tmp_path):
             },
         }
     ]
+
+
+def test_strategy_state_store_round_trips_state_and_allocations(tmp_path):
+    store = StrategyStateStore(tmp_path / "strategy_state.json", run_id="run-1")
+    entry_ts = datetime(2026, 5, 25, 14, 18, tzinfo=timezone.utc)
+    state = {
+        "_lot_exit_state": {
+            "lot_a": {
+                "entry_signal_date": date(2026, 5, 25),
+                "entry_signal_ts": entry_ts,
+                "trailing_peak": 101.25,
+                "trailing_stop": 99.75,
+            }
+        }
+    }
+    position = Position(QQQ, quantity=1, avg_cost=100.0, trade_id="lot_a")
+
+    store.save_strategy("_adoptable_qqq", state, [position])
+
+    loaded = store.load_state("_adoptable_qqq")
+    assert loaded["_lot_exit_state"]["lot_a"]["entry_signal_date"] == date(2026, 5, 25)
+    assert loaded["_lot_exit_state"]["lot_a"]["entry_signal_ts"] == entry_ts
+    allocations = store.open_allocations()
+    assert allocations == [
+        {
+            "strategy_id": "_adoptable_qqq",
+            "quantity": 1.0,
+            "entry_ts": "2026-05-25T14:18:00+00:00",
+            "trade_id": "lot_a",
+            "source": "strategy_state",
+            "side": "long",
+            "instrument": {
+                "asset_class": "equity",
+                "symbol": "QQQ",
+                "exchange": None,
+                "currency": None,
+                "expiry": None,
+                "strike": None,
+                "right": None,
+                "multiplier": 1.0,
+            },
+        }
+    ]
+
+
+def test_strategy_state_store_uses_mode_specific_default_paths():
+    paper_store = StrategyStateStore.from_config({"mode": "paper"})
+    live_store = StrategyStateStore.from_config({"mode": "live"})
+    explicit_store = StrategyStateStore.from_config({
+        "mode": "paper",
+        "strategy_state": {"path": "runs/state/custom_state.json"},
+    })
+
+    assert paper_store is not None
+    assert live_store is not None
+    assert explicit_store is not None
+    assert str(paper_store.path) == "runs/state/strategy_paper_state.json"
+    assert str(live_store.path) == "runs/state/strategy_state.json"
+    assert str(explicit_store.path) == "runs/state/custom_state.json"
+
+
+def test_startup_gate_auto_maps_from_strategy_state_allocation(tmp_path):
+    store = StrategyStateStore(tmp_path / "strategy_state.json")
+    store.save_strategy(
+        "_adoptable_qqq",
+        {"entry_ts": datetime(2026, 5, 25, 14, 18, tzinfo=timezone.utc)},
+        [Position(QQQ, quantity=1, avg_cost=100.0, trade_id="lot_a")],
+    )
+
+    status = build_startup_gate_status(
+        [Position(QQQ, quantity=1, avg_cost=100.0)],
+        [(_AdoptableQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
+        ledger_allocations=store.open_allocations(),
+    )
+
+    assert status["phase"] == "clear"
+    assert status["allocations"][0]["source"] == "strategy_state"
+    assert status["allocations"][0]["trade_id"] == "lot_a"
+
+
+def test_startup_gate_asks_operator_when_strategy_state_is_not_safe():
+    status = build_startup_gate_status(
+        [Position(QQQ, quantity=1, avg_cost=100.0)],
+        [(_EntryTsRequiredQqqStrategy(), {})],
+        default_risk=RiskPolicy(),
+        ledger_allocations=[
+            {
+                "strategy_id": "_entry_ts_required_qqq",
+                "quantity": 1,
+                "source": "strategy_state",
+                "instrument": {
+                    "asset_class": "equity",
+                    "symbol": "QQQ",
+                },
+            }
+        ],
+    )
+
+    assert status["phase"] == "awaiting_mapping"
+    assert "requires entry_ts" in status["last_error"]
+
+
+def test_strategy_state_recovery_adopts_without_reinitializing_state():
+    state = {
+        "_lot_exit_state": {
+            "lot_a": {
+                "entry_signal_ts": datetime(2026, 5, 25, 14, 18, tzinfo=timezone.utc),
+                "trailing_peak": 101.25,
+                "trailing_stop": 99.75,
+            }
+        }
+    }
+    portfolio = PortfolioState()
+    broker_position = Position(QQQ, quantity=1, avg_cost=100.0)
+
+    apply_startup_position_allocations(
+        [
+            {
+                "position_id": position_id(broker_position),
+                "strategy_id": "_entry_ts_required_qqq",
+                "quantity": 1,
+                "entry_ts": "2026-05-25T14:18:00+00:00",
+                "trade_id": "lot_a",
+                "source": "strategy_state",
+            }
+        ],
+        [broker_position],
+        [(_EntryTsRequiredQqqStrategy(), state)],
+        portfolio,
+    )
+
+    assert state["_lot_exit_state"]["lot_a"]["trailing_stop"] == 99.75
+    assert portfolio.get_strategy_positions("_entry_ts_required_qqq", QQQ)[0].trade_id == "lot_a"
+
+
+def test_startup_allocation_apply_records_manual_ack_without_strategy_position():
+    broker_position = Position(QQQ, quantity=1, avg_cost=100.0)
+    events: list[tuple[str, dict]] = []
+    portfolio = PortfolioState()
+
+    apply_startup_position_allocations(
+        [],
+        [broker_position],
+        [(_AdoptableQqqStrategy(), {})],
+        portfolio,
+        unmanaged_remainder_acknowledgements=[
+            {
+                "position_id": position_id(broker_position),
+                "quantity": 1,
+                "reason": "manual_unmanaged:trading",
+                "source": "dashboard",
+                "sleeve_id": "trading",
+            }
+        ],
+        write_event=lambda event, **fields: events.append((event, fields)),
+    )
+
+    assert portfolio.get_strategy_positions("_adoptable_qqq", QQQ) == []
+    assert events[0][0] == "startup_position_unmanaged_acknowledged"
+    assert events[0][1]["unmanaged_quantity"] == 1.0
+    assert events[0][1]["acknowledgement"]["sleeve_id"] == "trading"
 
 
 def test_load_strategies_accepts_protected_package(tmp_path, monkeypatch):

@@ -146,7 +146,7 @@ class IBKRDataProvider:
 
         self._client.reqHistoricalData(
             req_id, contract, end_str, duration_str, "1 min",
-            what_to_show, 1, 1, False, []
+            what_to_show, 1, 2, False, []
         )
 
         bars: list[Bar] = []
@@ -188,6 +188,8 @@ class IBKRDataProvider:
 def _parse_ibkr_date(date_str: str) -> datetime | None:
     """Parse IBKR date string to tz-aware UTC datetime."""
     try:
+        if date_str.isdigit() and len(date_str) > 8:
+            return datetime.fromtimestamp(int(date_str), tz=timezone.utc)
         if len(date_str) > 8:
             # "20260501 09:30:00 US/Eastern" or "20260501 13:30:00"
             parts = date_str.split()

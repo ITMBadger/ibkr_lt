@@ -7,6 +7,8 @@ writing.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
@@ -37,6 +39,7 @@ class DecisionTrace:
             "indicators": {},
             "conditions": [],
             "metrics": {},
+            "operator_summary": {},
             "decision": None,
             "reason": None,
         }
@@ -134,6 +137,42 @@ class DecisionTrace:
     def add_metric(self, label: str, value: Any) -> None:
         self._event["metrics"][label] = to_jsonable(value)
 
+    def set_entry_readiness(
+        self,
+        checks: Iterable[bool] | None = None,
+        *,
+        pct: float | None = None,
+        label: str | None = None,
+    ) -> None:
+        """Attach sanitized operator-facing entry readiness.
+
+        This intentionally stores only a percent and generic label. Raw
+        condition names and values stay in the audit trace only.
+        """
+        if checks is not None:
+            items = [bool(item) for item in checks]
+            pct = (sum(items) / len(items)) * 100.0 if items else None
+        summary = self._event.setdefault("operator_summary", {})
+        if pct is None:
+            summary["entry_readiness_pct"] = None
+        else:
+            try:
+                value = float(pct)
+            except (TypeError, ValueError):
+                value = math.nan
+            summary["entry_readiness_pct"] = (
+                round(max(0.0, min(100.0, value)), 2)
+                if math.isfinite(value)
+                else None
+            )
+        if label is not None:
+            summary["entry_readiness_label"] = str(label)
+
+    def set_trigger_times(self, times: Iterable[Any]) -> None:
+        """Attach sanitized operator-facing trigger action timestamps."""
+        summary = self._event.setdefault("operator_summary", {})
+        summary["trigger_times"] = to_jsonable(list(times))
+
     def set_decision(
         self,
         decision: str,
@@ -142,6 +181,11 @@ class DecisionTrace:
         signal: Signal | None = None,
         exit_reason: str | None = None,
     ) -> None:
+        if self._event.get("phase") == "entry":
+            if signal is not None or decision == "signal":
+                self.set_entry_readiness(pct=100.0, label="Signal ready")
+            elif "entry_readiness_pct" not in self._event.get("operator_summary", {}):
+                self.set_entry_readiness(pct=None, label="Waiting")
         self._event["decision"] = decision
         self._event["reason"] = reason
         if signal is not None:

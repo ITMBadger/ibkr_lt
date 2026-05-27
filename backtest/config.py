@@ -50,6 +50,7 @@ class BacktestSettings:
     sizing_equity_fraction: float = 1.0
     sizing_max_order_quantity: float | None = None
     strategy_packages: list[str] = field(default_factory=lambda: ["strategies"])
+    strategy_params: dict[str, Any] = field(default_factory=dict)
 
 
 def load_yaml_config(path: str | Path) -> dict[str, Any]:
@@ -151,6 +152,7 @@ def resolve_settings(
         strategy_packages=resolve_strategy_packages(config),
         strategy_ids=strategy_ids,
         strategy_modes=strategy_modes,
+        strategy_params=resolve_strategy_params(config.get("strategy_params")),
         position_size_shares=int(config.get("position_size_shares", 1)),
         max_order_quantity=int(config.get("max_order_quantity", 2)),
         thread_pool_workers=int(
@@ -247,6 +249,19 @@ def resolve_strategy_ids(
             f"Unknown strategy id(s): {unknown}. Available: {sorted(known)}"
         )
     return strategy_ids
+
+
+def resolve_strategy_params(configured: Any) -> dict[str, Any]:
+    if configured is None:
+        return {}
+    if not isinstance(configured, Mapping):
+        raise ConfigError("strategy_params must be a mapping of strategy_id to params")
+    result: dict[str, Any] = {}
+    for strategy_id, params in configured.items():
+        if not isinstance(params, Mapping):
+            raise ConfigError(f"strategy_params.{strategy_id} must be a mapping")
+        result[str(strategy_id)] = dict(params)
+    return result
 
 
 def parse_boundary(value: str, session_tz: str, *, is_end: bool) -> datetime:

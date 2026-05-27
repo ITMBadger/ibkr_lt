@@ -39,6 +39,7 @@ class _ChunkPayload:
     bars: list[Bar]
     strategy_packages: list[str]
     strategy_ids: list[str]
+    strategy_params: dict
     evaluation_timeframes: dict[str, str]
     lookback_days: int
     session_tz: str
@@ -84,6 +85,7 @@ def generate_parallel_entry_candidates(
         session_tz=settings.session_tz,
         workers=workers,
         strategy_ids=list(settings.strategy_ids),
+        strategy_params=dict(getattr(settings, "strategy_params", {}) or {}),
         strategy_packages=list(settings.strategy_packages),
         evaluation_timeframes=dict(evaluation_timeframes),
     )
@@ -149,7 +151,11 @@ def candidates_to_engine_map(
 def _generate_chunk_candidates(payload: _ChunkPayload) -> _ChunkResult:
     load_strategies(payload.strategy_packages)
     registry = get_registry()
-    strategies = instantiate_strategies(registry, payload.strategy_ids)
+    strategies = instantiate_strategies(
+        registry,
+        payload.strategy_ids,
+        payload.strategy_params,
+    )
     data_instruments = _strategy_data_instruments(strategies)
     managers = {
         instrument: DataManager(
@@ -238,6 +244,7 @@ def _build_chunks(
     workers: int,
     strategy_packages: list[str],
     strategy_ids: list[str],
+    strategy_params: dict,
     evaluation_timeframes: dict[str, str],
 ) -> list[_ChunkPayload]:
     tz = ZoneInfo(session_tz)
@@ -264,6 +271,7 @@ def _build_chunks(
                 bars=chunk_bars,
                 strategy_packages=list(strategy_packages),
                 strategy_ids=strategy_ids,
+                strategy_params=dict(strategy_params),
                 evaluation_timeframes=evaluation_timeframes,
                 lookback_days=lookback_days,
                 session_tz=session_tz,

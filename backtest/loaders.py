@@ -15,11 +15,16 @@ from core.types import Bar, Instrument
 def instantiate_strategies(
     registry: dict[str, type[StrategyKernel]],
     strategy_ids: Iterable[str],
+    strategy_params: dict[str, object] | None = None,
 ) -> list[tuple[StrategyKernel, dict]]:
     strategies: list[tuple[StrategyKernel, dict]] = []
+    params_by_strategy = strategy_params or {}
     for strategy_id in strategy_ids:
         cls = registry[str(strategy_id)]
-        strategies.append((cls(), {}))
+        params = params_by_strategy.get(str(strategy_id), {})
+        if not isinstance(params, dict):
+            raise ConfigError(f"strategy_params.{strategy_id} must be a mapping")
+        strategies.append((cls(params), {}))
     return strategies
 
 

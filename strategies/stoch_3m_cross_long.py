@@ -150,6 +150,10 @@ class Stoch3mCrossLong(StrategyKernel):
             rhs={"start": entry_start, "end": entry_end, "timezone": str(MARKET_TZ)},
         )
         if not in_entry_window:
+            trace.set_entry_readiness(
+                [in_entry_window, False],
+                label="Waiting for setup",
+            )
             return finish("no_signal", "outside_entry_window")
 
         current_3m_bar = bars_3m.index[-1]
@@ -173,6 +177,10 @@ class Stoch3mCrossLong(StrategyKernel):
             rhs=threshold,
         )
         if not crossed_up:
+            trace.set_entry_readiness(
+                [in_entry_window, not already_evaluated_bar, crossed_up],
+                label="Entry filters not met",
+            )
             return finish("no_signal", "stoch_d_not_crossed")
 
         signal = Signal(instrument=self.SPEC.execution_instrument, side="long")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -39,6 +40,7 @@ from ..startup import (
     PositionOwnershipLedger,
     StartupPositionGateController,
     apply_startup_position_allocations,
+    position_id,
     resolve_adopted_position_map,
 )
 from .timeframes import TF_1M, TF_5S, Timeframe
@@ -53,6 +55,11 @@ from ..interfaces.strategy import (
 from ..risk.policy import RiskPolicy
 from ..types import Bar, Fill, Instrument, MarketContext, OptionDataRequest, Position, Signal
 from .clock import Clock, SimulatedClock, WallClock
+from .market_summary import (
+    DEFAULT_MARKET_SUMMARY_POINTS,
+    build_market_summary,
+    unavailable_market_summary,
+)
 from .scheduler import Scheduler
 
 if TYPE_CHECKING:
@@ -60,6 +67,7 @@ if TYPE_CHECKING:
     from ..interfaces.data import HistoricalDataProvider, StreamingDataProvider
     from ..interfaces.instruments import InstrumentResolver
     from ..interfaces.options import OptionDataProvider
+    from ..startup import StrategyStateStore
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +101,7 @@ class Engine:
         startup_position_allocations: Sequence[Mapping[str, Any]] | None = None,
         startup_position_mapping_enabled: bool = True,
         ownership_ledger: PositionOwnershipLedger | None = None,
+        strategy_state_store: "StrategyStateStore | None" = None,
         audit_logger: AuditLogger | None = None,
         strategy_modes: Mapping[str, str] | None = None,
         metadata_profile: str = "owner",
@@ -145,6 +154,7 @@ class Engine:
         self._session_tz = session_tz
         self._adopted_position_map = adopted_position_map or {}
         self._ownership_ledger = ownership_ledger
+        self._strategy_state_store = strategy_state_store
         self._audit = audit_logger
         self._metadata_profile = str(metadata_profile or "owner")
         self._strategy_aliases = dict(strategy_aliases or {})
@@ -158,6 +168,11 @@ class Engine:
         self._last_bar: dict[str, Any] | None = None
         self._bar_count = 0
         self._managers: dict[Instrument, DataManager] = {}
+        self._strategy_market_cache: dict[
+            tuple[Instrument, int, str, int],
+            dict[str, Any],
+        ] = {}
+        self._last_strategy_decisions: dict[str, dict[str, Any]] = {}
         self._portfolio: PortfolioState | None = None
         self._order_manager: OrderManager | None = None
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
@@ -171,6 +186,7 @@ class Engine:
             strategy_modes=self._strategy_modes,
             configured_allocations=startup_position_allocations,
             ownership_ledger=self._ownership_ledger,
+            strategy_state_store=self._strategy_state_store,
             write_event=self._write_startup_order_event,
         )
 
@@ -234,6 +250,7 @@ class Engine:
                     "last_bar": to_jsonable(self._last_bar),
                 },
                 "strategies": self._snapshot_strategies(),
+                "last_decisions": dict(self._last_strategy_decisions),
                 "dispatch_mode": self._dispatch_mode,
                 "risk": {
                     "position_size_shares": self._risk.position_size_shares,
@@ -251,8 +268,18 @@ class Engine:
                 "recent_events": list(self._recent_events),
             }
 
+        state["strategy_market"] = self._snapshot_strategy_market(managers)
+
+        broker_positions: list[dict[str, Any]] = []
+        if portfolio is not None:
+            for position in portfolio.positions():
+                item = to_jsonable(position)
+                if isinstance(item, dict):
+                    item["position_id"] = position_id(position)
+                    broker_positions.append(item)
+
         state["positions"] = {
-            "broker": to_jsonable(portfolio.positions()) if portfolio is not None else [],
+            "broker": broker_positions,
             "strategy": [
                 {"strategy_id": sid, "position": to_jsonable(position)}
                 for sid, position in portfolio.strategy_positions()
@@ -272,7 +299,51 @@ class Engine:
                 profile=self._metadata_profile,
                 aliases=self._strategy_aliases,
             )
+        elif self._strategy_state_store is not None:
+            state["strategy_state"] = self._strategy_state_store.summary()
         return state
+
+    def _snapshot_strategy_market(
+        self,
+        managers: Mapping[Instrument, DataManager],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for kernel, _ in self._strategies:
+            strategy_id = kernel.SPEC.id
+            instrument = kernel.SPEC.primary_instrument
+            manager = managers.get(instrument)
+            if manager is None:
+                result[strategy_id] = unavailable_market_summary(instrument)
+                continue
+            result[strategy_id] = self._cached_market_summary(instrument, manager)
+        return result
+
+    def _cached_market_summary(
+        self,
+        instrument: Instrument,
+        manager: DataManager,
+    ) -> dict[str, Any]:
+        max_points = DEFAULT_MARKET_SUMMARY_POINTS
+        cache_key = (instrument, manager.revision, self._session_tz, max_points)
+        with self._state_lock:
+            cached = self._strategy_market_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        summary = build_market_summary(
+            instrument,
+            manager.bars_1m(lookback_days=10),
+            session_tz=self._session_tz,
+            max_points=max_points,
+        )
+        with self._state_lock:
+            self._strategy_market_cache = {
+                key: value
+                for key, value in self._strategy_market_cache.items()
+                if key[0] != instrument
+            }
+            self._strategy_market_cache[cache_key] = summary
+        return summary
 
     def _snapshot_strategies(self) -> list[dict[str, Any]]:
         if is_customer_profile(self._metadata_profile):
@@ -371,6 +442,8 @@ class Engine:
         for kernel, initial_state in self._strategies:
             state: dict = dict(initial_state)
             kernel.on_start(state)
+            if self._strategy_state_store is not None:
+                state.update(self._strategy_state_store.load_state(kernel.SPEC.id))
             strategy_entries.append((kernel, state))
 
         self._progress.info(
@@ -431,6 +504,7 @@ class Engine:
                     position.avg_cost,
                     owner,
                 )
+        self._persist_strategy_states(strategy_entries, portfolio)
         protective_stops = {
             kernel.SPEC.id: kernel.SPEC.protective_stop
             for kernel, _ in self._strategies
@@ -444,6 +518,11 @@ class Engine:
             kernel.SPEC.id: kernel.SPEC.execution_instrument
             for kernel, _ in self._strategies
         }
+
+        def on_fill_applied(fill: Fill) -> None:
+            sizing_account.apply_fill(fill)
+            self._persist_strategy_states(strategy_entries, portfolio)
+
         order_manager = OrderManager(
             self._broker,
             portfolio,
@@ -458,7 +537,7 @@ class Engine:
             strategy_aliases=self._strategy_aliases,
             sizing_price_provider=sizing_account.latest_price,
             sizing_equity_provider=sizing_account.equity,
-            fill_listener=sizing_account.apply_fill,
+            fill_listener=on_fill_applied,
             strategy_execution_instruments=strategy_execution_instruments,
             approval_store=self._approval_store,
         )
@@ -544,10 +623,12 @@ class Engine:
 
         # Start background tasks
         pool = ThreadPoolExecutor(max_workers=self._pool_workers)
+        inline_order_drain = _supports_inline_order_drain(self._broker)
+        inline_strategy_calls = is_simulated or inline_order_drain
         drain_orders_task = None
         drain_fills_task = None
         drain_order_updates_task = None
-        if not is_simulated:
+        if not is_simulated and not inline_order_drain:
             drain_orders_task = loop.create_task(order_manager.drain_orders())
             drain_fills_task = loop.create_task(order_manager.drain_fills())
             drain_order_updates_task = loop.create_task(order_manager.drain_order_updates())
@@ -562,7 +643,7 @@ class Engine:
             ctx = self._context_with_positions(ctx, kernel, portfolio)
             self._progress.count("exit_evals")
             strategy_t0 = time.perf_counter()
-            if is_simulated:
+            if inline_strategy_calls:
                 reason = kernel.on_exit(ctx, position, state)
             else:
                 reason = await loop.run_in_executor(
@@ -573,9 +654,10 @@ class Engine:
             audit_t0 = time.perf_counter()
             self._write_decision_trace(state)
             self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
+            self._persist_strategy_states(strategy_entries, portfolio)
             if not reason:
                 strategy_t0 = time.perf_counter()
-                if is_simulated:
+                if inline_strategy_calls:
                     stop_update = kernel.on_protective_stop_update(ctx, position, state)
                 else:
                     stop_update = await loop.run_in_executor(
@@ -586,6 +668,7 @@ class Engine:
                 audit_t0 = time.perf_counter()
                 self._write_decision_trace(state)
                 self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
+                self._persist_strategy_states(strategy_entries, portfolio)
                 if stop_update is None:
                     return
 
@@ -606,10 +689,11 @@ class Engine:
                     stop_update.stop_price,
                     stop_update.reason,
                 )
-                if is_simulated:
+                if is_simulated or inline_order_drain:
                     await order_manager.drain_ready_order_updates()
                 else:
                     await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+                self._persist_strategy_states(strategy_entries, portfolio)
                 self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
                 return
 
@@ -629,6 +713,7 @@ class Engine:
                 position,
                 reason,
             )
+            self._persist_strategy_states(strategy_entries, portfolio)
             self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
 
         async def refresh_option_data(
@@ -640,7 +725,7 @@ class Engine:
                 return
             seen: set[tuple] = set()
             for _ in range(2):
-                if is_simulated:
+                if inline_strategy_calls:
                     requests = kernel.option_data_requests(ctx, state)
                 else:
                     requests = await loop.run_in_executor(
@@ -683,11 +768,12 @@ class Engine:
                         source="precomputed",
                     )
                     await order_manager.submit(signal, kernel.SPEC.id)
-                    if is_simulated:
+                    if is_simulated or inline_order_drain:
                         await order_manager.drain_ready_orders()
                         await order_manager.drain_ready_order_updates()
                     else:
                         await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+                    self._persist_strategy_states(strategy_entries, portfolio)
                     self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
                 return
 
@@ -698,7 +784,7 @@ class Engine:
             self._progress.count("entry_evals")
             await refresh_option_data(kernel, ctx, state)
             strategy_t0 = time.perf_counter()
-            if is_simulated:
+            if inline_strategy_calls:
                 signal = kernel.generate(ctx, state)
             else:
                 signal = await loop.run_in_executor(
@@ -709,7 +795,7 @@ class Engine:
             audit_t0 = time.perf_counter()
             self._write_decision_trace(state)
             self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
-            if is_simulated:
+            if inline_strategy_calls:
                 intents = kernel.generate_intents(ctx, state)
             else:
                 intents = await loop.run_in_executor(
@@ -718,7 +804,11 @@ class Engine:
                     ctx,
                     state,
                 )
+            audit_t0 = time.perf_counter()
+            self._write_decision_trace(state)
+            self._progress.add_timing("audit_decision", time.perf_counter() - audit_t0)
             if signal is None and not intents:
+                self._persist_strategy_states(strategy_entries, portfolio)
                 return
 
             self._mark_entry_frequency(kernel, state, ctx.timestamp)
@@ -743,11 +833,12 @@ class Engine:
                     trade_id=intent.trade_id,
                 )
                 await order_manager.submit_intent(intent, kernel.SPEC.id)
-            if is_simulated:
+            if is_simulated or inline_order_drain:
                 await order_manager.drain_ready_orders()
                 await order_manager.drain_ready_order_updates()
             else:
                 await asyncio.sleep(_ORDER_TASK_YIELD_SECONDS)
+            self._persist_strategy_states(strategy_entries, portfolio)
             self._progress.add_timing("signal_order", time.perf_counter() - order_t0)
 
         try:
@@ -783,7 +874,7 @@ class Engine:
                 if hasattr(self._broker, "on_bar"):
                     stage_t0 = time.perf_counter()
                     await self._broker.on_bar(bar_1m)
-                    if is_simulated:
+                    if is_simulated or inline_order_drain:
                         await order_manager.drain_ready_fills()
                         await order_manager.drain_ready_order_updates()
                     else:
@@ -926,7 +1017,7 @@ class Engine:
                 drain_order_updates_task.cancel()
             self._order_manager = None
             self._runtime_loop = None
-            pool.shutdown(wait=False)
+            pool.shutdown(wait=True, cancel_futures=True)
             if self._option_data_provider is not None:
                 await self._option_data_provider.disconnect()
             await self._data_feed.disconnect()
@@ -1086,13 +1177,35 @@ class Engine:
                     "startup adopted position protective stop was not accepted: "
                     f"strategy={strategy_id} instrument={position.instrument.symbol} "
                     f"trade_id={position.trade_id}"
-                )
+            )
             self._write_startup_order_event(
-                    "startup_protective_stop_seeded",
-                    strategy_id=strategy_id,
-                    position=position,
-                    stop_update=stop_update,
-                )
+                "startup_protective_stop_seeded",
+                strategy_id=strategy_id,
+                position=position,
+                stop_update=stop_update,
+            )
+            self._persist_strategy_states(strategy_entries, portfolio)
+
+    def _persist_strategy_states(
+        self,
+        strategy_entries: Sequence[tuple[StrategyKernel, dict]],
+        portfolio: PortfolioState,
+    ) -> None:
+        if self._strategy_state_store is None:
+            return
+        positions_by_strategy = {
+            kernel.SPEC.id: portfolio.get_all_strategy_positions(kernel.SPEC.id)
+            for kernel, _ in strategy_entries
+        }
+        run_id = self._audit.run_id if self._audit is not None else None
+        try:
+            self._strategy_state_store.save_all(
+                strategy_entries,
+                positions_by_strategy,
+                run_id=run_id,
+            )
+        except Exception as exc:
+            log.warning("Strategy state persistence failed: %s", exc)
 
     async def _refresh_option_data_request(self, request: OptionDataRequest) -> None:
         if self._option_data_provider is None:
@@ -1319,11 +1432,77 @@ class Engine:
         return "unlimited"
 
     def _write_decision_trace(self, state: dict) -> None:
-        if self._audit is None:
-            return
         trace = pop_decision(state)
-        if trace is not None:
+        if trace is None:
+            return
+        self._record_last_decision(trace.to_event())
+        if self._audit is not None:
             self._audit.decision(trace)
+
+    def _record_last_decision(self, event: dict[str, Any]) -> None:
+        strategy_id = event.get("strategy_id")
+        if not strategy_id:
+            return
+
+        with self._state_lock:
+            previous_decision = self._last_strategy_decisions.get(str(strategy_id))
+
+        summary: dict[str, Any] = {
+            "strategy_id": strategy_id,
+            "timestamp": event.get("timestamp"),
+            "phase": event.get("phase"),
+            "decision": event.get("decision"),
+        }
+        operator_summary = event.get("operator_summary")
+        if isinstance(operator_summary, dict):
+            readiness_pct = _percentage_or_none(operator_summary.get("entry_readiness_pct"))
+            readiness_label = operator_summary.get("entry_readiness_label")
+            if (
+                readiness_pct is None
+                and event.get("phase") == "entry"
+                and isinstance(previous_decision, dict)
+                and _same_local_date(
+                    previous_decision.get("timestamp"),
+                    event.get("timestamp"),
+                    self._session_tz,
+                )
+            ):
+                previous_pct = _percentage_or_none(previous_decision.get("entry_readiness_pct"))
+                if previous_pct is not None:
+                    readiness_pct = previous_pct
+                    readiness_label = previous_decision.get("entry_readiness_label")
+            summary.update({
+                "entry_readiness_pct": readiness_pct,
+                "entry_readiness_label": readiness_label,
+            })
+        if not is_customer_profile(self._metadata_profile):
+            if isinstance(operator_summary, dict):
+                trigger_times = operator_summary.get("trigger_times")
+                if isinstance(trigger_times, list):
+                    summary["trigger_times"] = to_jsonable(trigger_times)
+            metrics = event.get("metrics")
+            if not isinstance(metrics, dict):
+                metrics = {}
+            signal = event.get("signal")
+            if not isinstance(signal, dict):
+                signal = {}
+            instrument = signal.get("instrument")
+            if not isinstance(instrument, dict):
+                instrument = {}
+            summary.update({
+                "signal_side": signal.get("side"),
+                "signal_symbol": instrument.get("symbol"),
+                "trade_id": signal.get("trade_id"),
+                "entry_stop_pct": _first_present(
+                    metrics,
+                    "entry_stop_pct",
+                    "atr_trailing_stop_pct",
+                ),
+                "entry_stop_pct_source": metrics.get("entry_stop_pct_source"),
+                "protective_stop_mode": metrics.get("protective_stop_mode"),
+            })
+        with self._state_lock:
+            self._last_strategy_decisions[str(strategy_id)] = to_jsonable(summary)
 
     def _write_signal_event(
         self,
@@ -1669,6 +1848,60 @@ def _future_requires_resolution(instrument: Instrument) -> bool:
         str(instrument.asset_class).lower() == "future"
         and instrument.expiry is None
     )
+
+
+def _supports_inline_order_drain(broker: Any) -> bool:
+    return (
+        callable(getattr(broker, "ready_fills", None))
+        and callable(getattr(broker, "ready_order_updates", None))
+    )
+
+
+def _first_present(values: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = values.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _percentage_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(pct):
+        return None
+    return round(max(0.0, min(100.0, pct)), 2)
+
+
+def _same_local_date(left: Any, right: Any, tz_name: str) -> bool:
+    left_dt = _datetime_or_none(left)
+    right_dt = _datetime_or_none(right)
+    if left_dt is None or right_dt is None:
+        return False
+    try:
+        tz = ZoneInfo(str(tz_name))
+    except Exception:
+        tz = timezone.utc
+    return left_dt.astimezone(tz).date() == right_dt.astimezone(tz).date()
+
+
+def _datetime_or_none(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _normalize_dispatch_mode(mode: str) -> str:

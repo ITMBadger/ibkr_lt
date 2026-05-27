@@ -27,6 +27,14 @@ class _SnapshotEngine:
                 "net_liquidation": 100_000.0,
             },
             "strategies": [{"id": "example_strategy"}],
+            "strategy_market": {
+                "example_strategy": {
+                    "symbol": "QQQ",
+                    "latest_close": 430.25,
+                    "change_pct": 1.23,
+                    "points": [{"timestamp": "2026-05-19T00:00:00+00:00", "close": 430.25}],
+                }
+            },
             "approvals": [
                 {
                     "approval_id": "example:buy-base",
@@ -247,6 +255,7 @@ async def test_runtime_snapshot_requires_bearer_token_when_configured():
 
         assert response.status_code == 200
         assert response.json()["phase"] == "running"
+        assert response.json()["strategy_market"]["example_strategy"]["symbol"] == "QQQ"
 
 
 @pytest.mark.anyio

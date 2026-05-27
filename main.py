@@ -27,7 +27,7 @@ from core.privacy import build_strategy_aliases, is_customer_profile
 from core.risk.policy import RiskPolicy
 from core.engine.loader import get_registry
 from core.orders.strategy_modes import strategy_mode_map, validate_strategy_modes
-from core.startup import PositionOwnershipLedger
+from core.startup import PositionOwnershipLedger, StrategyStateStore
 from api.server import start_control_api_thread
 
 logging.basicConfig(
@@ -110,6 +110,10 @@ def main() -> None:
     data_feed = _build_data_feed(config, shared)
     instrument_resolver = _build_instrument_resolver(config, shared)
     option_data_provider = _build_option_data_provider(config, shared)
+    strategy_state_store = StrategyStateStore.from_config(
+        config,
+        audit_logger=audit_logger,
+    )
 
     print(f"Execution: {broker.name}")
     print(f"IBKR environment: {config.get('mode', '')}")
@@ -144,12 +148,15 @@ def main() -> None:
         adopted_position_map=_adopted_position_map(config),
         startup_position_allocations=_adopted_position_allocations(config),
         startup_position_mapping_enabled=_startup_mapping_enabled(config),
-        ownership_ledger=PositionOwnershipLedger.from_config(config),
+        ownership_ledger=(
+            None if strategy_state_store is not None else PositionOwnershipLedger.from_config(config)
+        ),
+        strategy_state_store=strategy_state_store,
         audit_logger=audit_logger,
         strategy_modes=strategy_modes,
         metadata_profile=metadata_profile,
         strategy_aliases=strategy_aliases,
-        startup_position_gate_enabled=str(config.get("mode", "")).lower() == "live",
+        startup_position_gate_enabled=_startup_gate_enabled(config),
         instrument_resolver=instrument_resolver,
         option_data_provider=option_data_provider,
     )
@@ -439,6 +446,13 @@ def _startup_mapping_enabled(
     return bool(api_cfg.get("enabled", True)) or bool(dashboard_active)
 
 
+def _startup_gate_enabled(config: dict[str, Any]) -> bool:
+    cfg = dict(config.get("startup_position_gate") or {})
+    if "enabled" in cfg:
+        return bool(cfg["enabled"])
+    return str(config.get("mode", "")).lower() == "live"
+
+
 def _adopted_position_map(config: dict[str, Any]) -> dict[Instrument, str]:
     result: dict[Instrument, str] = {}
     for item in config.get("adopted_positions", []) or []:
@@ -592,10 +606,63 @@ def _api_metadata(
         "runtime_profile": metadata_profile,
         "strategy_modes": modes,
         "strategies": safe_ids,
+        "dashboard_config": _dashboard_metadata(
+            config,
+            aliases=aliases if is_customer_profile(metadata_profile) else None,
+        ),
+        "session_timezone": str(config.get("session_timezone", "America/New_York")),
         "execution_provider": str(dict(config.get("execution") or {}).get("provider", "ibkr")),
         "historical_provider": str(dict(data.get("historical") or {}).get("provider", "ibkr")),
         "live_provider": str(dict(data.get("live") or {}).get("provider", "ibkr")),
     }
+
+
+def _dashboard_metadata(
+    config: Mapping[str, Any],
+    *,
+    aliases: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    dashboard = config.get("dashboard")
+    if not isinstance(dashboard, Mapping):
+        return {
+            "fund_name": "LT Capital",
+            "sleeves": [],
+        }
+    aliases = dict(aliases or {})
+    sleeves = []
+    for raw in _as_config_list(dashboard.get("sleeves")):
+        if not isinstance(raw, Mapping):
+            continue
+        strategy_ids = [
+            aliases.get(str(strategy_id), str(strategy_id))
+            for strategy_id in _as_config_list(raw.get("strategy_ids"))
+        ]
+        sleeves.append({
+            "id": str(raw.get("id") or ""),
+            "label": str(raw.get("label") or raw.get("id") or ""),
+            "target_pct": _optional_float(raw.get("target_pct")),
+            "color": str(raw.get("color") or ""),
+            "strategy_ids": strategy_ids,
+            "symbols": [str(item) for item in _as_config_list(raw.get("symbols"))],
+            "asset_classes": [
+                str(item) for item in _as_config_list(raw.get("asset_classes"))
+            ],
+            "cash": bool(raw.get("cash", False)),
+        })
+    return {
+        "fund_name": str(dashboard.get("fund_name") or "LT Capital"),
+        "sleeves": sleeves,
+    }
+
+
+def _as_config_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence):
+        return list(value)
+    return [value]
 
 
 if __name__ == "__main__":

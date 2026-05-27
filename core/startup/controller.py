@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from ..portfolio.state import PortfolioState
     from ..risk.policy import RiskPolicy
     from .ownership import PositionOwnershipLedger
+    from .strategy_state import StrategyStateStore
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class StartupPositionGateController:
         strategy_modes: Mapping[str, str] | None = None,
         configured_allocations: Sequence[Mapping[str, Any]] | None = None,
         ownership_ledger: "PositionOwnershipLedger | None" = None,
+        strategy_state_store: "StrategyStateStore | None" = None,
         write_event: WriteStartupEvent | None = None,
     ) -> None:
         self._enabled = bool(enabled)
@@ -69,6 +71,7 @@ class StartupPositionGateController:
             for item in (configured_allocations or [])
         ]
         self._ownership_ledger = ownership_ledger
+        self._strategy_state_store = strategy_state_store
         self._write_event = write_event
         self._lock = RLock()
         self._status: dict[str, Any] = {
@@ -250,9 +253,14 @@ class StartupPositionGateController:
         positions: Sequence[Position],
         strategy_entries: Sequence[tuple["StrategyKernel", dict]],
     ) -> dict[str, Any]:
-        ledger_allocations = (
+        state_allocations = (
+            self._strategy_state_store.open_allocations()
+            if self._strategy_state_store is not None
+            else []
+        )
+        ownership_allocations = (
             self._ownership_ledger.open_allocations()
-            if self._ownership_ledger is not None
+            if self._ownership_ledger is not None and not state_allocations
             else []
         )
         return build_startup_gate_status(
@@ -262,7 +270,7 @@ class StartupPositionGateController:
             strategy_risk=self._strategy_risk,
             strategy_modes=self._strategy_modes,
             configured_allocations=self._configured_allocations,
-            ledger_allocations=ledger_allocations,
+            ledger_allocations=[*state_allocations, *ownership_allocations],
         )
 
     def _set_status(self, status: Mapping[str, Any]) -> None:
@@ -343,7 +351,7 @@ def apply_startup_position_allocations(
     ownership_ledger: "PositionOwnershipLedger | None" = None,
     write_event: WriteStartupEvent | None = None,
 ) -> None:
-    if not allocations:
+    if not allocations and not unmanaged_remainder_acknowledgements:
         return
     positions_by_id = {
         position_id(position): position
@@ -375,9 +383,12 @@ def apply_startup_position_allocations(
             avg_cost=broker_position.avg_cost,
             trade_id=adoption.trade_id,
         )
-        adopted_position = kernel.on_adopt_position(candidate_position, adoption, state)
-        if adopted_position is None:
-            raise RuntimeError(f"strategy {strategy_id!r} rejected adopted position")
+        if str(allocation.get("source") or "") == "strategy_state":
+            adopted_position = candidate_position
+        else:
+            adopted_position = kernel.on_adopt_position(candidate_position, adoption, state)
+            if adopted_position is None:
+                raise RuntimeError(f"strategy {strategy_id!r} rejected adopted position")
         portfolio.adopt_strategy_position(strategy_id, adopted_position)
         if ownership_ledger is not None:
             try:

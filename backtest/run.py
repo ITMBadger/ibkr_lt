@@ -153,7 +153,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             config=config,
             known_strategy_ids=sorted(registry),
         )
-        strategies = instantiate_strategies(registry, settings.strategy_ids)
+        strategies = instantiate_strategies(
+            registry,
+            settings.strategy_ids,
+            settings.strategy_params,
+        )
         result = run_backtest(settings, strategies)
     except (ConfigError, ValueError) as exc:
         print(f"Backtest config error: {exc}", file=sys.stderr)
