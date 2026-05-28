@@ -21,123 +21,18 @@ build/
 dist/
 *.egg-info/
 
-# Runtime logs, audit output, reports, and generated state. These can reveal
-# instruments, timing, orders, fills, decisions, and ownership mappings.
-/runs/
-runs*/
-/var/
-logs/
-logs*/
-backtest_runs/
-backtest_runs*/
-results/
-results*/
-reports/
-reports*/
-outputs/
-outputs*/
-scratch/
-scratch*/
-tmp/
-tmp*/
-*.log
-*.jsonl
-*.json
-strategy_decisions*.jsonl
-strategy_trigger_decisions*.jsonl
-strategy_30m_latest_*.json
-signals*.jsonl
-orders*.jsonl
-fills*.jsonl
-*decision*
-*signal*
-*order*
-*fill*
-
-# Config privacy. The root runtime config is local/private. The example config
-# is the public shared starting point.
-*.yaml
-*.yml
-/config.*
-!/config.example.yaml
-!configs/
-!configs/customer.template.yaml
-configs/local/
-configs/local/**
-
-# Public demo strategy surface only. All other strategy implementations are
-# proprietary unless explicitly allowed here.
-strategies/**
-!strategies/
-!strategies/__init__.py
-!strategies/_sample_strategy.py
-!strategies/stoch_3m_cross_long.py
-
-# Protected strategy/dashboard packages and any artifacts/logs/configs named
-# after them are private. Do not whitelist package markers here; tracked files
-# under these paths must be removed from Git tracking separately.
-protected_*/
-protected_*/**
-*protected_*
-*protected_strategies*
-protected_strategies/
-protected_strategies/**
-*protected_dashboard*
+# Private runtime/proprietary files
+runs/
 protected_dashboard/
-protected_dashboard/**
+protected_strategies/
 
-# Internal docs/tests can reveal strategy IDs, instruments, thresholds, scoring
-# formulas, exits, and pending roadmap items.
-*.md
-!README.md
-docs/**
-!docs/
+# Private configs/tests
+config.yaml
+config.*.local.yaml
+configs/local/
+tests/unit/test_vwap_reclaim.py
+tests/unit/test_dashboard_labels.py
+
+docs/*
 !docs/guardrails.md
 !docs/project_rules.md
-tests/**
-!tests/
-!tests/**/
-!tests/**/__init__.py
-
-# Generic private/research catchalls. Avoid strategy-specific names in this
-# public file.
-*private*
-*proprietary*
-*internal*
-*secret*
-*research*
-*experiment*
-*sweep*
-*walk_forward*
-*backtest_run*
-legacy/
-archived/
-archive/
-research/
-research*/
-experiments/
-experiments*/
-sweeps/
-sweeps*/
-notebooks/
-*.ipynb
-
-# Market data and replay corpora can leak signal timing when paired with logs.
-/data/
-/market_data/
-data*/
-market_data*/
-*.csv
-*.csv.gz
-*.parquet
-*.feather
-*.h5
-*.hdf5
-*.db
-*.sqlite
-*.sqlite3
-*.pkl
-*.pickle
-*.npy
-*.npz
-*.arrow
