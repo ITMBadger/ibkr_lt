@@ -1,6 +1,8 @@
 """Resampler — downsample a 1-min DataFrame to any coarser timeframe.
 
-Produces only fully-completed bars (drops the current, still-open bar).
+Produces only fully-completed bars. Intraday buckets must contain the exact
+number of expected 1-minute inputs; daily/weekly buckets keep historical
+session aggregates and drop the latest bucket as potentially in-progress.
 Cached by DataManager so the resample only runs when the revision changes.
 """
 
@@ -44,8 +46,8 @@ class Resampler:
     ) -> pd.DataFrame:
         """Resample `bars_1m` (1-min OHLCV DataFrame) to `target_tf`.
 
-        Returns only fully-completed bars. The current (potentially incomplete)
-        bar is always dropped.
+        Returns only fully-completed bars. Intraday buckets are considered
+        complete only when they contain every expected 1-minute source row.
 
         Args:
             bars_1m: DataFrame with DatetimeIndex (tz-aware) and columns
@@ -57,6 +59,8 @@ class Resampler:
             return bars_1m.copy()
 
         offset = _to_pandas_offset(target_tf)
+        is_intraday = target_tf.seconds < 86_400
+        expected_count = max(1, target_tf.seconds // 60)
         resampled = (
             bars_1m.resample(offset, label="left", closed="left")
             .agg(
@@ -65,13 +69,19 @@ class Resampler:
                 low=("low", "min"),
                 close=("close", "last"),
                 volume=("volume", "sum"),
+                _count=("close", "count"),
             )
             .dropna(subset=["open"])
         )
 
-        # Drop the last (current, potentially incomplete) bar
-        if len(resampled) > 0:
-            resampled = resampled.iloc[:-1]
+        if "_count" in resampled and is_intraday:
+            resampled = resampled[resampled["_count"] == expected_count].drop(
+                columns="_count"
+            )
+        elif "_count" in resampled:
+            resampled = resampled.drop(columns="_count")
+            if len(resampled) > 0:
+                resampled = resampled.iloc[:-1]
 
         if lookback_bars > 0:
             resampled = resampled.iloc[-lookback_bars:]

@@ -123,10 +123,6 @@ class IBKRDataProvider:
             if instrument is None:
                 continue
 
-            volume = item["volume"]
-            if instrument.asset_class == "equity":
-                volume *= 100  # IBKR STK lots
-
             yield Bar(
                 instrument=instrument,
                 timeframe=TF_5S,
@@ -135,7 +131,7 @@ class IBKRDataProvider:
                 high=item["high"],
                 low=item["low"],
                 close=item["close"],
-                volume=volume,
+                volume=float(item["volume"]) * _volume_scale(instrument),
                 is_closed=True,
                 source="ibkr",
             )
@@ -155,7 +151,11 @@ class IBKRDataProvider:
         duration_days = max(1, (end - start).days + 1)
         duration_str = f"{min(duration_days, _MAX_1M_HISTORICAL_DAYS)} D"
 
-        end_dt = end.astimezone(timezone.utc) if end.tzinfo else end.replace(tzinfo=timezone.utc)
+        end_dt = (
+            end.astimezone(timezone.utc)
+            if end.tzinfo
+            else end.replace(tzinfo=timezone.utc)
+        )
         end_str = end_dt.strftime("%Y%m%d %H:%M:%S UTC")
 
         contract = instrument_to_contract(instrument)
@@ -195,7 +195,7 @@ class IBKRDataProvider:
                     high=float(item["high"]),
                     low=float(item["low"]),
                     close=float(item["close"]),
-                    volume=float(item["volume"]),
+                    volume=float(item["volume"]) * _volume_scale(instrument),
                     is_closed=True,
                     source="ibkr",
                 ))
@@ -203,6 +203,10 @@ class IBKRDataProvider:
             log.warning("Historical data request timed out for %s", instrument.symbol)
 
         return bars
+
+
+def _volume_scale(instrument: Instrument) -> float:
+    return 100.0 if instrument.asset_class == "equity" else 1.0
 
 
 def _parse_ibkr_date(date_str: str) -> datetime | None:

@@ -53,10 +53,31 @@ class DataFeed:
         timeframe: Timeframe,
         start: datetime,
         end: datetime,
+        *,
+        live_session_start: datetime | None = None,
     ) -> list[Bar]:
         if self._historical is None:
             return []
         bars = await self._historical.fetch(instrument, timeframe, start, end)
+        if live_session_start is not None and self._historical is not self._live:
+            supplemental = await self._fetch_live_session(
+                instrument,
+                timeframe,
+                start,
+                end,
+                live_session_start,
+            )
+            if not supplemental:
+                return bars
+            session_start = _ensure_aware(live_session_start)
+            historical_prior = [
+                bar for bar in bars
+                if _ensure_aware(bar.timestamp) < session_start
+            ]
+            return sorted(
+                [*historical_prior, *supplemental],
+                key=lambda bar: bar.timestamp,
+            )
         supplemental = await self._fetch_live_gap(instrument, timeframe, start, end, bars)
         if not supplemental:
             return bars
@@ -97,6 +118,23 @@ class DataFeed:
         if gap_start > end:
             return []
         return await self._live.fetch(instrument, timeframe, gap_start, end)
+
+    async def _fetch_live_session(
+        self,
+        instrument: Instrument,
+        timeframe: Timeframe,
+        start: datetime,
+        end: datetime,
+        live_session_start: datetime,
+    ) -> list[Bar]:
+        """Fetch current-session history from the live provider when available."""
+        if not isinstance(self._live, HistoricalDataProvider):
+            return []
+        session_start = max(_ensure_aware(start), _ensure_aware(live_session_start))
+        end = _ensure_aware(end)
+        if session_start > end:
+            return []
+        return await self._live.fetch(instrument, timeframe, session_start, end)
 
 
 def _ensure_aware(ts: datetime) -> datetime:

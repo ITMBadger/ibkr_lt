@@ -1,8 +1,9 @@
 """DataManager — per-instrument 1-min bar store with backfill/stream merge.
 
 Dedup policy:
-  - Offline history wins when timestamps already exist.
-  - Supplemental broker history fills missing timestamps up to startup.
+  - Prior-session offline history wins when timestamps already exist.
+  - Live split-feed runs can make the live provider authoritative for the
+    current local session so CSV and broker/provider volume are not mixed.
   - Live 1-min bars: latest writer wins (keep='last').
 
 One DataManager per instrument. The engine creates managers for strategy data
@@ -14,6 +15,7 @@ from __future__ import annotations
 import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -22,6 +24,10 @@ from ..engine.timeframes import Timeframe
 from .resampler import Resampler
 
 _OHLCV = ["open", "high", "low", "close", "volume"]
+_BAR_COLUMNS = [*_OHLCV, "source"]
+_OFFLINE_SOURCES = {"csv"}
+MERGE_POLICY_PRESERVE = "preserve"
+MERGE_POLICY_LIVE_PROVIDER_WINS = "live_provider_wins"
 
 
 class DataManager:
@@ -36,13 +42,21 @@ class DataManager:
         self._session_tz = session_tz
 
         self._bars: pd.DataFrame = _empty_frame()
-        self._pending_rows: list[tuple[pd.Timestamp, list[float]]] = []
+        self._pending_rows: list[tuple[pd.Timestamp, list[object]]] = []
         self._pending_flush_size = 512
         self._revision: int = 0
         self._lock = threading.RLock()
 
         self._resampler = Resampler()
         self._resample_cache: dict[tuple, tuple[int, pd.DataFrame]] = {}  # key → (revision, df)
+        self._last_merge_report: dict[str, object] = {
+            "policy": MERGE_POLICY_PRESERVE,
+            "input_bars": 0,
+            "added": 0,
+            "replaced_session_rows": 0,
+            "dropped_current_session_offline": 0,
+            "source_counts": {},
+        }
 
     # ------------------------------------------------------------------
     # Startup: CSV load + backfill
@@ -70,6 +84,7 @@ class DataManager:
         df.index = _normalize_index(df.index, tz or self._session_tz)
         df = df.sort_index()
         df = df[~df.index.duplicated(keep="last")]
+        df["source"] = "csv"
 
         with self._lock:
             self._pending_rows.clear()
@@ -78,30 +93,79 @@ class DataManager:
             self._trim_lookback()
         return len(df)
 
-    def merge_backfill(self, bars: list[Bar], live_session_date: date | None = None) -> int:
-        """Merge IBKR historical backfill bars.
+    def merge_backfill(
+        self,
+        bars: list[Bar],
+        live_session_date: date | None = None,
+        *,
+        current_session_source_policy: str = MERGE_POLICY_PRESERVE,
+    ) -> int:
+        """Merge historical backfill bars.
 
-        Prior sessions: CSV wins (skip if timestamp already in _bars).
-        If live_session_date is provided, skip that session and later. Current
-        runtime startup passes None so supplemental broker history can fill up
-        to the most recent completed bar before the live stream takes over.
-        Gap fills: add bars not already present.
-        Returns number of new bars added.
+        Prior sessions preserve existing offline rows. Live split-feed startup
+        should pass ``current_session_source_policy="live_provider_wins"`` and
+        the current local session date so live-provider history replaces current
+        session CSV rows before streaming begins.
         """
         if not bars:
+            self._last_merge_report = {
+                "policy": current_session_source_policy,
+                "input_bars": 0,
+                "added": 0,
+                "replaced_session_rows": 0,
+                "dropped_current_session_offline": 0,
+                "source_counts": {},
+            }
             return 0
 
         new_rows: list[dict] = []
+        source_counts: dict[str, int] = {}
+        dropped_current_session_offline = 0
+        replaced_session_rows = 0
+        policy = str(current_session_source_policy or MERGE_POLICY_PRESERVE)
 
         with self._lock:
             self._flush_pending()
+            live_provider_policy = (
+                live_session_date is not None
+                and policy == MERGE_POLICY_LIVE_PROVIDER_WINS
+            )
+            if live_provider_policy:
+                if not self._bars.empty:
+                    local_dates = self._bars.index.tz_convert(self._session_tz).date
+                    if "source" in self._bars.columns:
+                        offline = (
+                            self._bars["source"]
+                            .fillna("")
+                            .astype(str)
+                            .isin(_OFFLINE_SOURCES)
+                        )
+                    else:
+                        offline = pd.Series(True, index=self._bars.index)
+                    replace = (local_dates == live_session_date) & offline.to_numpy()
+                    keep = ~replace
+                    replaced_session_rows = int((~keep).sum())
+                    if replaced_session_rows:
+                        self._bars = self._bars[keep]
+
             existing = set(self._bars.index)
             for bar in bars:
-                ts = bar.timestamp
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                if live_session_date is not None and ts.date() >= live_session_date:
-                    continue  # live stream owns current live session
+                ts = _bar_timestamp_utc(bar.timestamp)
+                source = str(bar.source or "")
+                source_counts[source] = source_counts.get(source, 0) + 1
+                is_current_session = (
+                    live_session_date is not None
+                    and _local_session_date(ts, self._session_tz) == live_session_date
+                )
+                if live_provider_policy and is_current_session and source in _OFFLINE_SOURCES:
+                    dropped_current_session_offline += 1
+                    continue
+                if (
+                    policy == MERGE_POLICY_PRESERVE
+                    and live_session_date is not None
+                    and _local_session_date(ts, self._session_tz) >= live_session_date
+                ):
+                    continue
                 if ts in existing:
                     continue  # CSV wins for prior sessions
                 new_rows.append({
@@ -111,13 +175,25 @@ class DataManager:
                     "low": bar.low,
                     "close": bar.close,
                     "volume": bar.volume,
+                    "source": source,
                 })
 
             if not new_rows:
+                if replaced_session_rows:
+                    self._revision += 1
+                    self._trim_lookback()
+                self._last_merge_report = {
+                    "policy": policy,
+                    "input_bars": len(bars),
+                    "added": 0,
+                    "replaced_session_rows": replaced_session_rows,
+                    "dropped_current_session_offline": dropped_current_session_offline,
+                    "source_counts": source_counts,
+                }
                 return 0
 
             new_df = pd.DataFrame(new_rows).set_index("timestamp")
-            new_df.index = pd.DatetimeIndex(new_df.index, tz="UTC")
+            new_df.index = _normalize_index(new_df.index, "UTC")
             self._bars = (
                 pd.concat([self._bars, new_df])
                 .sort_index()
@@ -125,6 +201,14 @@ class DataManager:
             self._bars = self._bars[~self._bars.index.duplicated(keep="last")]
             self._revision += 1
             self._trim_lookback()
+            self._last_merge_report = {
+                "policy": policy,
+                "input_bars": len(bars),
+                "added": len(new_rows),
+                "replaced_session_rows": replaced_session_rows,
+                "dropped_current_session_offline": dropped_current_session_offline,
+                "source_counts": source_counts,
+            }
             return len(new_rows)
 
     # ------------------------------------------------------------------
@@ -143,7 +227,7 @@ class DataManager:
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         ts = pd.Timestamp(ts).tz_convert("UTC")
-        values = [bar.open, bar.high, bar.low, bar.close, bar.volume]
+        values = [bar.open, bar.high, bar.low, bar.close, bar.volume, bar.source]
 
         with self._lock:
             latest_pending = self._pending_rows[-1][0] if self._pending_rows else None
@@ -158,7 +242,7 @@ class DataManager:
                 row = pd.DataFrame(
                     [values],
                     index=pd.DatetimeIndex([ts], tz="UTC", name="timestamp"),
-                    columns=_OHLCV,
+                    columns=_BAR_COLUMNS,
                 )
                 self._bars = (
                     pd.concat([self._bars, row])
@@ -223,6 +307,24 @@ class DataManager:
                 return None
             return self._bars.index[-1].to_pydatetime()
 
+    def data_quality(self) -> dict[str, object]:
+        """Return compact read-only data-source diagnostics for operators."""
+        with self._lock:
+            self._flush_pending()
+            source_counts: dict[str, int] = {}
+            if "source" in self._bars.columns:
+                source_counts = {
+                    str(source): int(count)
+                    for source, count in self._bars["source"].fillna("").value_counts().items()
+                }
+            latest = self.latest_timestamp()
+            return {
+                "bar_count": len(self._bars),
+                "latest_timestamp": latest.isoformat() if latest is not None else None,
+                "source_counts": source_counts,
+                "last_merge": dict(self._last_merge_report),
+            }
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -246,7 +348,7 @@ class DataManager:
             name="timestamp",
         )
         values = [row for _, row in self._pending_rows]
-        pending = pd.DataFrame(values, index=index, columns=_OHLCV)
+        pending = pd.DataFrame(values, index=index, columns=_BAR_COLUMNS)
         self._pending_rows.clear()
 
         if self._bars.empty:
@@ -272,9 +374,20 @@ class DataManager:
 # ---------------------------------------------------------------------------
 
 def _empty_frame() -> pd.DataFrame:
-    df = pd.DataFrame(columns=_OHLCV)
+    df = pd.DataFrame(columns=_BAR_COLUMNS)
     df.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
     return df
+
+
+def _bar_timestamp_utc(timestamp: datetime | pd.Timestamp) -> pd.Timestamp:
+    ts = pd.Timestamp(timestamp)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(timezone.utc)
+    return ts.tz_convert("UTC")
+
+
+def _local_session_date(timestamp: datetime | pd.Timestamp, session_tz: str) -> date:
+    return _bar_timestamp_utc(timestamp).tz_convert(ZoneInfo(session_tz)).date()
 
 
 def _normalize_index(index: pd.Index, tz: str) -> pd.DatetimeIndex:

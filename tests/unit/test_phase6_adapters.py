@@ -475,6 +475,45 @@ def test_data_feed_supplements_historical_gap_from_live_provider():
     asyncio.run(run())
 
 
+def test_data_feed_uses_live_provider_for_current_session():
+    def bar(ts: datetime, close: float, source: str) -> Bar:
+        return Bar(
+            instrument=QQQ,
+            timeframe=TF_1M,
+            timestamp=ts,
+            open=close - 0.5,
+            high=close + 0.5,
+            low=close - 1.0,
+            close=close,
+            volume=1000.0,
+            is_closed=True,
+            source=source,
+        )
+
+    async def run():
+        prior = bar(datetime(2026, 4, 30, 13, 30, tzinfo=timezone.utc), 100.5, "csv")
+        stale_current = bar(datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc), 200.5, "csv")
+        live_current = [
+            bar(datetime(2026, 5, 1, 13, 30, tzinfo=timezone.utc), 300.5, "ibkr"),
+            bar(datetime(2026, 5, 1, 13, 31, tzinfo=timezone.utc), 301.5, "ibkr"),
+        ]
+        feed = DataFeed(_StaticHistorical([prior, stale_current]), _StaticLive(live_current))
+
+        fetched = await feed.fetch(
+            QQQ,
+            TF_1M,
+            prior.timestamp,
+            live_current[-1].timestamp,
+            live_session_start=datetime(2026, 5, 1, 4, tzinfo=timezone.utc),
+        )
+
+        assert [bar.close for bar in fetched] == [100.5, 300.5, 301.5]
+        assert [bar.source for bar in fetched] == ["csv", "ibkr", "ibkr"]
+
+    import asyncio
+    asyncio.run(run())
+
+
 def test_ibkr_fetch_caps_1m_duration_and_uses_midpoint_for_fx(monkeypatch):
     async def run():
         monkeypatch.setattr(
@@ -529,6 +568,38 @@ def test_ibkr_fetch_parses_epoch_historical_dates(monkeypatch):
     assert len(bars) == 1
     assert bars[0].timestamp == datetime(2026, 5, 26, 18, 0, tzinfo=timezone.utc)
     assert bars[0].close == 100.5
+    assert bars[0].volume == pytest.approx(100000.0)
+
+
+def test_ibkr_fetch_keeps_future_historical_volume_unscaled(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            "core.adapters.ibkr.data.instrument_to_contract",
+            lambda instrument: object(),
+        )
+        ts = datetime(2026, 5, 26, 18, 0, tzinfo=timezone.utc)
+        client = _FakeIBKRDataClient(hist_items=[
+            {
+                "date": str(int(ts.timestamp())),
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100.5,
+                "volume": 1000,
+            },
+            {"done": True},
+        ])
+        provider = IBKRDataProvider(client)
+        return await provider.fetch(
+            MNQ,
+            TF_1M,
+            datetime(2026, 5, 1, tzinfo=timezone.utc),
+            datetime(2026, 5, 2, tzinfo=timezone.utc),
+        )
+
+    bars = asyncio.run(run())
+    assert len(bars) == 1
+    assert bars[0].volume == pytest.approx(1000.0)
 
 
 def test_ibkr_fetch_logs_unparsable_dates(monkeypatch, caplog):
@@ -2566,6 +2637,111 @@ def test_ibkr_broker_honors_order_tif(monkeypatch):
         assert modified_order.tif == "GTC"
 
     import asyncio
+    asyncio.run(run())
+
+
+def test_ibkr_broker_collects_all_accounts_without_changing_filtering():
+    from core.adapters.ibkr.broker import IBKRBroker
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.account_queue = asyncio.Queue()
+            self.position_queue = asyncio.Queue()
+            self.open_order_queue = asyncio.Queue()
+            self._next_id = 100
+            self.cancelled_account = []
+            self.cancelled_positions = 0
+            self.requested_all_open_orders = 0
+
+        def managed_accounts(self):
+            return ["U1", "U2"]
+
+        def get_next_order_id(self) -> int:
+            self._next_id += 1
+            return self._next_id
+
+        def reqAccountSummary(self, req_id, group, tags):
+            for account, net_liq, buying_power, available in [
+                ("U1", 10_000.0, 8_000.0, 7_000.0),
+                ("U2", 20_000.0, 16_000.0, 14_000.0),
+            ]:
+                self.account_queue.put_nowait({"req_id": req_id, "account": account, "tag": "NetLiquidation", "value": net_liq})
+                self.account_queue.put_nowait({"req_id": req_id, "account": account, "tag": "BuyingPower", "value": buying_power})
+                self.account_queue.put_nowait({"req_id": req_id, "account": account, "tag": "AvailableFunds", "value": available})
+            self.account_queue.put_nowait({"req_id": req_id, "done": True})
+
+        def cancelAccountSummary(self, req_id):
+            self.cancelled_account.append(req_id)
+
+        def reqPositions(self):
+            for account, symbol, qty in [("U1", "AAPL", 3.0), ("U2", "QQQ", 4.0)]:
+                self.position_queue.put_nowait({
+                    "account": account,
+                    "symbol": symbol,
+                    "sec_type": "STK",
+                    "exchange": "NASDAQ",
+                    "currency": "USD",
+                    "last_trade_date": "",
+                    "strike": 0.0,
+                    "right": "",
+                    "multiplier": "",
+                    "con_id": 1,
+                    "local_symbol": symbol,
+                    "position": qty,
+                    "avg_cost": 100.0,
+                })
+            self.position_queue.put_nowait({"done": True})
+
+        def cancelPositions(self):
+            self.cancelled_positions += 1
+
+        def reqAllOpenOrders(self):
+            self.requested_all_open_orders += 1
+            self.open_order_queue.put_nowait({
+                "order_id": "12",
+                "account": "U2",
+                "symbol": "QQQ",
+                "sec_type": "STK",
+                "exchange": "NASDAQ",
+                "currency": "USD",
+                "last_trade_date": "",
+                "strike": 0.0,
+                "right": "",
+                "multiplier": "",
+                "con_id": 2,
+                "local_symbol": "QQQ",
+                "action": "BUY",
+                "quantity": 1.0,
+                "order_type": "MKT",
+                "limit_price": None,
+                "stop_price": None,
+                "tif": "DAY",
+                "perm_id": "",
+                "parent_id": "",
+                "oca_group": "",
+                "order_ref": "",
+                "status": "Submitted",
+            })
+            self.open_order_queue.put_nowait({"done": True})
+
+    async def run():
+        client = _FakeClient()
+        broker = IBKRBroker(client, account="U2")
+
+        all_accounts = await broker.get_all_accounts()
+        assert [account.account_id for account in all_accounts] == ["U1", "U2"]
+        assert sum(account.net_liquidation for account in all_accounts) == pytest.approx(30_000.0)
+        assert (await broker.get_account()).account_id == "U2"
+
+        all_positions = await broker.get_all_positions()
+        assert sorted(all_positions) == ["U1", "U2"]
+        assert [position.instrument.symbol for position in await broker.get_positions()] == ["QQQ"]
+
+        all_orders = await broker.get_all_open_orders()
+        assert list(all_orders) == ["U2"]
+        assert (await broker.get_open_orders())[0].account == "U2"
+        assert client.requested_all_open_orders == 2
+
     asyncio.run(run())
 
 

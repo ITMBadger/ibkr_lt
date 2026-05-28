@@ -385,6 +385,39 @@ class TestRiskPolicy:
 
 
 # ---------------------------------------------------------------------------
+# Runtime account overview
+# ---------------------------------------------------------------------------
+
+def test_account_overview_payload_totals_and_masks_account_ids():
+    from core.engine.runner import _account_overview_payload
+    from core.types import AccountSnapshot, OpenOrder, Position
+
+    payload = _account_overview_payload(
+        [
+            AccountSnapshot("U1234567", net_liquidation=10_000.0, buying_power=8_000.0, available_funds=7_000.0),
+            AccountSnapshot("U7654321", net_liquidation=20_000.0, buying_power=16_000.0, available_funds=14_000.0),
+        ],
+        {
+            "U1234567": [Position(QQQ, quantity=3.0, avg_cost=100.0)],
+            "U7654321": [Position(SPY, quantity=-2.0, avg_cost=200.0)],
+        },
+        {
+            "U7654321": [OpenOrder("12", SPY, side="long", quantity=1.0, order_type="MKT", account="U7654321")],
+        },
+        execution_account="U7654321",
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["total"]["net_liquidation"] == pytest.approx(30_000.0)
+    assert payload["total"]["positions"] == 2
+    assert payload["total"]["open_orders"] == 1
+    assert [account["display_id"] for account in payload["accounts"]] == ["U1***67", "U7***21"]
+    assert [account["execution"] for account in payload["accounts"]] == [False, True]
+    assert {position["account_id"] for position in payload["positions"]} == {"U1234567", "U7654321"}
+    assert payload["open_orders"][0]["account_display_id"] == "U7***21"
+
+
+# ---------------------------------------------------------------------------
 # Strategy loader
 # ---------------------------------------------------------------------------
 

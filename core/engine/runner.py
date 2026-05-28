@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 from ..audit.serialize import to_jsonable
 from ..data.bar_builder import BarBuilder
 from ..data.feed import DataFeed
-from ..data.manager import DataManager
+from ..data.manager import DataManager, MERGE_POLICY_LIVE_PROVIDER_WINS
 from ..data.options import OptionDataCache
 from ..orders.approvals import ApprovalStore
 from ..orders.order_manager import OrderManager
@@ -53,7 +53,17 @@ from ..interfaces.strategy import (
     StrategyKernel,
 )
 from ..risk.policy import RiskPolicy
-from ..types import Bar, Fill, Instrument, MarketContext, OptionDataRequest, Position, Signal
+from ..types import (
+    AccountSnapshot,
+    Bar,
+    Fill,
+    Instrument,
+    MarketContext,
+    OpenOrder,
+    OptionDataRequest,
+    Position,
+    Signal,
+)
 from .clock import Clock, SimulatedClock, WallClock
 from .market_summary import (
     DEFAULT_MARKET_SUMMARY_POINTS,
@@ -178,6 +188,13 @@ class Engine:
         self._last_strategy_decisions: dict[str, dict[str, Any]] = {}
         self._portfolio: PortfolioState | None = None
         self._order_manager: OrderManager | None = None
+        self._account_overview: dict[str, Any] = {
+            "status": "unavailable",
+            "accounts": [],
+            "positions": [],
+            "open_orders": [],
+            "total": {},
+        }
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
         self._recent_events: list[dict[str, Any]] = []
         self._entry_block_reason: str | None = None
@@ -268,6 +285,13 @@ class Engine:
                             key=lambda item: item[0].symbol,
                         )
                     },
+                    "quality": {
+                        instrument.symbol: to_jsonable(manager.data_quality())
+                        for instrument, manager in sorted(
+                            managers.items(),
+                            key=lambda item: item[0].symbol,
+                        )
+                    },
                     "bar_count": self._bar_count,
                     "last_bar": to_jsonable(self._last_bar),
                 },
@@ -288,6 +312,7 @@ class Engine:
                 "startup_gate": startup_gate_status,
                 "approvals": to_jsonable(self._approval_store.list()),
                 "recent_events": list(self._recent_events),
+                "account_overview": dict(self._account_overview),
             }
 
         state["strategy_market"] = self._snapshot_strategy_market(managers)
@@ -577,6 +602,7 @@ class Engine:
 
             if not is_simulated:
                 await self._startup_open_order_gate(all_instruments)
+                await self._refresh_account_overview()
 
             # Backfill historical data. Split feeds may load offline history first
             # and supplement the gap with broker historical bars before live starts.
@@ -584,6 +610,16 @@ class Engine:
             if isinstance(self._clock, SimulatedClock) and end.year == 1:
                 end = datetime.now(tz=timezone.utc)
             start = end - timedelta(days=self._lookback_days)
+            live_session_start = (
+                _local_session_start(end, self._session_tz)
+                if not is_simulated
+                else None
+            )
+            live_session_date = (
+                live_session_start.astimezone(ZoneInfo(self._session_tz)).date()
+                if live_session_start is not None
+                else None
+            )
             for instr, dm in managers.items():
                 try:
                     fetch_t0 = time.perf_counter()
@@ -594,12 +630,34 @@ class Engine:
                         start.isoformat(),
                         end.isoformat(),
                     )
-                    bars = await self._data_feed.fetch(instr, TF_1M, start, end)
+                    bars = await self._data_feed.fetch(
+                        instr,
+                        TF_1M,
+                        start,
+                        end,
+                        live_session_start=live_session_start,
+                    )
                     self._progress.add_timing("setup_backfill_fetch", time.perf_counter() - fetch_t0)
                     merge_t0 = time.perf_counter()
-                    dm.merge_backfill(bars)
+                    added = dm.merge_backfill(
+                        bars,
+                        live_session_date=live_session_date,
+                        current_session_source_policy=(
+                            MERGE_POLICY_LIVE_PROVIDER_WINS
+                            if live_session_date is not None
+                            else "preserve"
+                        ),
+                    )
                     self._progress.add_timing("setup_backfill_merge", time.perf_counter() - merge_t0)
-                    log.info("Backfilled %d bars for %s", len(bars), instr.symbol)
+                    quality = dm.data_quality().get("last_merge", {})
+                    log.info(
+                        "Backfilled %d bars for %s added=%d policy=%s replaced_session_rows=%s",
+                        len(bars),
+                        instr.symbol,
+                        added,
+                        quality.get("policy"),
+                        quality.get("replaced_session_rows"),
+                    )
                     self._record_event(
                         "data",
                         "backfill_complete",
@@ -1808,6 +1866,7 @@ class Engine:
             broker_positions=broker_qty,
             local_positions=local_qty,
         )
+        await self._refresh_account_overview()
         if block_reason is not None:
             self._set_entry_block(f"reconciliation_{block_reason}")
             self._record_event(
@@ -1820,6 +1879,46 @@ class Engine:
             )
         elif self._entry_block_reason and self._entry_block_reason.startswith("reconciliation_"):
             self._set_entry_block(None)
+
+    async def _refresh_account_overview(self) -> None:
+        get_all_accounts = getattr(self._broker, "get_all_accounts", None)
+        if not callable(get_all_accounts):
+            return
+        try:
+            accounts = await get_all_accounts()
+            get_all_positions = getattr(self._broker, "get_all_positions", None)
+            get_all_open_orders = getattr(self._broker, "get_all_open_orders", None)
+            positions_by_account = (
+                await get_all_positions()
+                if callable(get_all_positions)
+                else {}
+            )
+            open_orders_by_account = (
+                await get_all_open_orders()
+                if callable(get_all_open_orders)
+                else {}
+            )
+            overview = _account_overview_payload(
+                accounts,
+                positions_by_account,
+                open_orders_by_account,
+                execution_account=self._latest_account_snapshot.account_id
+                if self._latest_account_snapshot is not None
+                else "",
+            )
+        except Exception as exc:
+            log.warning("Account overview refresh failed: %s", exc)
+            overview = {
+                "status": "error",
+                "message": str(exc),
+                "accounts": [],
+                "positions": [],
+                "open_orders": [],
+                "total": {},
+                "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+            }
+        with self._state_lock:
+            self._account_overview = overview
 
     async def _maybe_cancel_session_protective_stops(
         self,
@@ -2239,6 +2338,110 @@ def _instrument_match(left: Instrument, right: Instrument) -> bool:
     )
 
 
+def _account_overview_payload(
+    accounts: Sequence[AccountSnapshot],
+    positions_by_account: Mapping[str, Sequence[Position]],
+    open_orders_by_account: Mapping[str, Sequence[OpenOrder]],
+    *,
+    execution_account: str = "",
+) -> dict[str, Any]:
+    account_ids = _account_ids(accounts, positions_by_account, open_orders_by_account)
+    account_by_id = {account.account_id: account for account in accounts}
+    rows: list[dict[str, Any]] = []
+    positions_payload: list[dict[str, Any]] = []
+    open_orders_payload: list[dict[str, Any]] = []
+    total = {
+        "net_liquidation": 0.0,
+        "buying_power": 0.0,
+        "available_funds": 0.0,
+        "positions": 0,
+        "open_orders": 0,
+        "unmanaged": 0,
+    }
+
+    for index, account_id in enumerate(account_ids):
+        account = account_by_id.get(account_id) or AccountSnapshot(
+            account_id=account_id,
+            net_liquidation=0.0,
+            buying_power=0.0,
+            available_funds=0.0,
+        )
+        positions = list(positions_by_account.get(account_id, ()))
+        open_orders = list(open_orders_by_account.get(account_id, ()))
+        label = f"Account {index + 1}"
+        display_id = _mask_account_id(account_id)
+        row = {
+            "account_id": account_id,
+            "label": label,
+            "display_id": display_id,
+            "execution": bool(account_id and account_id == execution_account),
+            "net_liquidation": account.net_liquidation,
+            "buying_power": account.buying_power,
+            "available_funds": account.available_funds,
+            "positions": len(positions),
+            "open_orders": len(open_orders),
+            "unmanaged": len(positions),
+        }
+        rows.append(row)
+        total["net_liquidation"] += float(account.net_liquidation or 0.0)
+        total["buying_power"] += float(account.buying_power or 0.0)
+        total["available_funds"] += float(account.available_funds or 0.0)
+        total["positions"] += len(positions)
+        total["open_orders"] += len(open_orders)
+        total["unmanaged"] += len(positions)
+        for position in positions:
+            item = to_jsonable(position)
+            if isinstance(item, dict):
+                item.update({
+                    "account_id": account_id,
+                    "account_label": label,
+                    "account_display_id": display_id,
+                    "position_id": position_id(position),
+                })
+                positions_payload.append(item)
+        for order in open_orders:
+            item = to_jsonable(order)
+            if isinstance(item, dict):
+                item.update({
+                    "account_id": account_id,
+                    "account_label": label,
+                    "account_display_id": display_id,
+                })
+                open_orders_payload.append(item)
+
+    return {
+        "status": "ok",
+        "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "execution_account": execution_account,
+        "accounts": rows,
+        "positions": positions_payload,
+        "open_orders": open_orders_payload,
+        "total": total,
+    }
+
+
+def _account_ids(
+    accounts: Sequence[AccountSnapshot],
+    positions_by_account: Mapping[str, Sequence[Position]],
+    open_orders_by_account: Mapping[str, Sequence[OpenOrder]],
+) -> list[str]:
+    result = {account.account_id for account in accounts if account.account_id}
+    result.update(account for account in positions_by_account if account)
+    result.update(account for account in open_orders_by_account if account)
+    if "" in positions_by_account or "" in open_orders_by_account:
+        result.add("")
+    return sorted(result)
+
+
+def _mask_account_id(account_id: str) -> str:
+    text = str(account_id or "").strip()
+    if not text:
+        return "Unassigned"
+    if len(text) <= 4:
+        return "***"
+    return f"{text[:2]}***{text[-2:]}"
+
+
 def _position_quantities(
     positions: Sequence[Position],
     instruments: set[Instrument],
@@ -2354,12 +2557,19 @@ def _normalize_precomputed_timestamp(timestamp: datetime) -> datetime:
     return timestamp.astimezone(timezone.utc)
 
 
+def _local_session_start(timestamp: datetime, session_tz: str) -> datetime:
+    """Return the UTC timestamp for the local session date containing timestamp."""
+    ts = timestamp.astimezone(timezone.utc) if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)
+    local = ts.astimezone(ZoneInfo(session_tz))
+    session_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return session_start.astimezone(timezone.utc)
+
+
 def _completed_timeframe_bar_start(latest_ts: datetime, timeframe: Timeframe) -> datetime:
     """Return the start of the latest completed resample bucket.
 
-    This mirrors the engine resampler's left-labeled, left-closed buckets with
-    the last in-progress bucket dropped, without rebuilding a full DataFrame on
-    every fast-event skip check.
+    This mirrors the engine resampler's left-labeled, left-closed buckets,
+    without rebuilding a full DataFrame on every fast-event skip check.
     """
     latest = latest_ts.astimezone(timezone.utc) if latest_ts.tzinfo else latest_ts.replace(tzinfo=timezone.utc)
     candidate = latest - timedelta(seconds=timeframe.seconds)

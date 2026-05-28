@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, AsyncIterator
 
@@ -109,13 +110,29 @@ class IBKRBroker:
     # ------------------------------------------------------------------
 
     async def get_account(self) -> AccountSnapshot:
+        accounts = await self.get_all_accounts()
+        if self._account:
+            for account in accounts:
+                if account.account_id == self._account:
+                    return account
+            raise RuntimeError(
+                "configured IBKR account was not returned by account summary: "
+                f"{self._account}"
+            )
+        if len(accounts) > 1:
+            raise RuntimeError(
+                "IBKR returned multiple accounts; configure execution.account explicitly"
+            )
+        if accounts:
+            return accounts[0]
+        return AccountSnapshot(account_id="", net_liquidation=0.0, buying_power=0.0, available_funds=0.0)
+
+    async def get_all_accounts(self) -> list[AccountSnapshot]:
         req_id = self._client.get_next_order_id()
         tags = "NetLiquidation,BuyingPower,AvailableFunds,ExcessLiquidity"
         self._client.reqAccountSummary(req_id, "All", tags)
-        data: dict[str, float] = {}
-        account_id = self._account
-        seen_accounts: set[str] = set()
-        matched_configured_account = False
+        data_by_account: dict[str, dict[str, float]] = defaultdict(dict)
+        seen_accounts: set[str] = set(_managed_accounts(self._client))
         try:
             while True:
                 item = await asyncio.wait_for(self._client.account_queue.get(), timeout=15)
@@ -124,16 +141,11 @@ class IBKRBroker:
                     continue
                 if item.get("done"):
                     break
-                item_account = str(item.get("account", ""))
-                if item_account:
-                    seen_accounts.add(item_account)
-                if self._account and item_account != self._account:
+                account = str(item.get("account", "") or "")
+                if not account:
                     continue
-                if self._account and item_account == self._account:
-                    matched_configured_account = True
-                data[item["tag"]] = item["value"]
-                if not account_id:
-                    account_id = item_account
+                seen_accounts.add(account)
+                data_by_account[account][str(item["tag"])] = float(item["value"])
         except asyncio.TimeoutError:
             log.warning("account summary timed out")
         finally:
@@ -141,59 +153,82 @@ class IBKRBroker:
                 self._client.cancelAccountSummary(req_id)
             except Exception:
                 pass
-        if self._account and not matched_configured_account:
-            raise RuntimeError(
-                "configured IBKR account was not returned by account summary: "
-                f"{self._account}"
+        return [
+            AccountSnapshot(
+                account_id=account,
+                net_liquidation=data_by_account.get(account, {}).get("NetLiquidation", 0.0),
+                buying_power=data_by_account.get(account, {}).get("BuyingPower", 0.0),
+                available_funds=data_by_account.get(account, {}).get("AvailableFunds", 0.0),
             )
-        if not self._account and len(seen_accounts) > 1:
-            raise RuntimeError(
-                "IBKR returned multiple accounts; configure execution.account explicitly"
-            )
-        return AccountSnapshot(
-            account_id=account_id,
-            net_liquidation=data.get("NetLiquidation", 0.0),
-            buying_power=data.get("BuyingPower", 0.0),
-            available_funds=data.get("AvailableFunds", 0.0),
-        )
+            for account in sorted(seen_accounts)
+        ]
 
     async def get_positions(self) -> list[Position]:
+        positions_by_account = await self.get_all_positions()
+        if self._account:
+            return list(positions_by_account.get(self._account, []))
+        return [
+            position
+            for positions in positions_by_account.values()
+            for position in positions
+        ]
+
+    async def get_all_positions(self) -> dict[str, list[Position]]:
         self._client.reqPositions()
-        positions: list[Position] = []
+        positions_by_account: dict[str, list[Position]] = defaultdict(list)
         try:
             while True:
                 item = await asyncio.wait_for(self._client.position_queue.get(), timeout=15)
                 if item.get("done"):
                     break
-                if self._account and item.get("account") != self._account:
-                    continue
+                account = str(item.get("account", "") or "")
                 instr = _instrument_from_ibkr_item(item)
-                positions.append(Position(
+                position = Position(
                     instrument=instr,
                     quantity=item["position"],
                     avg_cost=item["avg_cost"],
                     metadata=_broker_metadata(item),
-                ))
+                )
+                if not position.is_flat:
+                    positions_by_account[account].append(position)
         except asyncio.TimeoutError:
             log.warning("positions request timed out")
         finally:
             self._client.cancelPositions()
-        return [p for p in positions if not p.is_flat]
+        return dict(positions_by_account)
 
     async def get_open_orders(self) -> list[OpenOrder]:
-        self._client.reqOpenOrders()
-        orders: list[OpenOrder] = []
+        orders_by_account = await self.get_all_open_orders()
+        if self._account:
+            return [
+                order
+                for account, orders in orders_by_account.items()
+                if account in ("", self._account)
+                for order in orders
+            ]
+        return [
+            order
+            for orders in orders_by_account.values()
+            for order in orders
+        ]
+
+    async def get_all_open_orders(self) -> dict[str, list[OpenOrder]]:
+        req_all_open_orders = getattr(self._client, "reqAllOpenOrders", None)
+        if callable(req_all_open_orders):
+            req_all_open_orders()
+        else:
+            self._client.reqOpenOrders()
+        orders_by_account: dict[str, list[OpenOrder]] = defaultdict(list)
         try:
             while True:
                 item = await asyncio.wait_for(self._client.open_order_queue.get(), timeout=15)
                 if item.get("done"):
                     break
-                if self._account and item.get("account") not in ("", self._account):
-                    continue
-                orders.append(_open_order_from_ibkr_item(item))
+                order = _open_order_from_ibkr_item(item)
+                orders_by_account[str(item.get("account", "") or "")].append(order)
         except asyncio.TimeoutError:
             log.warning("open orders request timed out")
-        return orders
+        return dict(orders_by_account)
 
     # ------------------------------------------------------------------
     # Order submission
@@ -451,6 +486,13 @@ def _broker_metadata(item: dict) -> dict[str, str]:
     if local_symbol:
         metadata["local_symbol"] = local_symbol
     return metadata
+
+
+def _managed_accounts(client) -> list[str]:
+    managed_accounts = getattr(client, "managed_accounts", None)
+    if callable(managed_accounts):
+        return [str(account) for account in managed_accounts()]
+    return []
 
 
 def _parse_ibkr_expiry(value) -> date | None:

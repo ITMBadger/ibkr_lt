@@ -678,6 +678,29 @@ def _dashboard_metadata(
         }
     aliases = dict(aliases or {})
     sleeves = []
+    accounts = []
+    account_aliases = {}
+    raw_aliases = dashboard.get("account_aliases")
+    if isinstance(raw_aliases, Mapping):
+        account_aliases.update({
+            str(account): str(label)
+            for account, label in raw_aliases.items()
+            if str(account or "").strip() and str(label or "").strip()
+        })
+    for raw in _as_config_list(dashboard.get("accounts")):
+        if not isinstance(raw, Mapping):
+            continue
+        account_id = str(raw.get("account") or raw.get("account_id") or raw.get("id") or "").strip()
+        label = str(raw.get("label") or raw.get("name") or "").strip()
+        if not account_id:
+            continue
+        if label:
+            account_aliases[account_id] = label
+        accounts.append({
+            "account": account_id,
+            "label": label,
+            "display_id": _redacted_account(account_id),
+        })
     for raw in _as_config_list(dashboard.get("sleeves")):
         if not isinstance(raw, Mapping):
             continue
@@ -697,10 +720,15 @@ def _dashboard_metadata(
             ],
             "cash": bool(raw.get("cash", False)),
         })
-    return {
+    result = {
         "fund_name": str(dashboard.get("fund_name") or "LT Capital"),
         "sleeves": sleeves,
     }
+    if accounts:
+        result["accounts"] = accounts
+    if account_aliases:
+        result["account_aliases"] = account_aliases
+    return result
 
 
 def _as_config_list(value: Any) -> list[Any]:

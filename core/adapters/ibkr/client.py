@@ -72,6 +72,7 @@ class IBKRClient(EWrapper, EClient):  # type: ignore[misc]
         self.contract_details_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.market_data_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.option_params_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._managed_accounts: list[str] = []
 
         # Map reqId → asyncio.Event for blocking requests
         self._req_events: dict[int, threading.Event] = {}
@@ -156,6 +157,18 @@ class IBKRClient(EWrapper, EClient):  # type: ignore[misc]
     def connectionClosed(self) -> None:
         log.warning("IBKR connection closed")
         self._ready_event.clear()
+
+    def managedAccounts(self, accountsList: str) -> None:
+        accounts = [
+            account.strip()
+            for account in str(accountsList or "").split(",")
+            if account.strip()
+        ]
+        self._managed_accounts = accounts
+        log.info("IBKR managed accounts received count=%d", len(accounts))
+
+    def managed_accounts(self) -> list[str]:
+        return list(self._managed_accounts)
 
     # ------------------------------------------------------------------
     # EWrapper: real-time bars (5s) → bar_queue

@@ -5,16 +5,16 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 
 import pandas as pd
 import pytest
 
 from core.types import Bar, Instrument
-from core.engine.timeframes import TF_5S, TF_1M, TF_3M, TF_30M
+from core.engine.timeframes import TF_5S, TF_1M, TF_3M, TF_30M, TF_1D
 from core.data.bar_builder import BarBuilder
 from core.data.resampler import Resampler
-from core.data.manager import DataManager
+from core.data.manager import DataManager, MERGE_POLICY_LIVE_PROVIDER_WINS
 from core.features.registry import FeatureRegistry
 from core.adapters.csv.data import CSVDataProvider
 from core.adapters.paper.data import ReplayDataProvider
@@ -33,13 +33,22 @@ def _bar(instrument, ts_utc, o=100.0, h=101.0, low=99.0, c=100.5, v=1000.0, sour
     )
 
 
-def _1m_bar(instrument, ts_utc, o=100.0, h=101.0, low=99.0, c=100.5, v=1000.0):
+def _1m_bar(
+    instrument,
+    ts_utc,
+    o=100.0,
+    h=101.0,
+    low=99.0,
+    c=100.5,
+    v=1000.0,
+    source="test",
+):
     return Bar(
         instrument=instrument,
         timeframe=TF_1M,
         timestamp=datetime.fromisoformat(ts_utc).replace(tzinfo=timezone.utc),
         open=o, high=h, low=low, close=c, volume=v,
-        is_closed=True, source="test",
+        is_closed=True, source=source,
     )
 
 
@@ -116,8 +125,8 @@ class TestResampler:
         df = self._make_1m_df(9)
         rs = Resampler()
         out = rs.resample(df, TF_3M)
-        # 9 bars → 3 complete 3m bars, last is dropped (current bar rule)
-        assert len(out) == 2
+        # 9 bars -> 3 complete 3m bars.
+        assert len(out) == 3
 
     def test_1m_to_30m(self):
         df = self._make_1m_df(65)
@@ -129,8 +138,45 @@ class TestResampler:
         df = self._make_1m_df(3)
         rs = Resampler()
         out = rs.resample(df, TF_3M, lookback_bars=0)
-        # Only 3 bars → 1 group, but it's the "current" (incomplete) bar, so dropped → 0
-        assert len(out) == 0
+        assert len(out) == 1
+        assert out.iloc[0]["volume"] == pytest.approx(3000.0)
+
+    def test_incomplete_interior_bucket_is_dropped(self):
+        df = self._make_1m_df(6).drop(
+            pd.Timestamp("2026-05-01 09:31", tz="America/New_York").tz_convert("UTC")
+        )
+        rs = Resampler()
+        out = rs.resample(df, TF_3M)
+        assert len(out) == 1
+        assert out.index[0] == pd.Timestamp(
+            "2026-05-01 09:33",
+            tz="America/New_York",
+        ).tz_convert("UTC")
+
+    def test_daily_resample_keeps_rth_session_aggregate(self):
+        first_day = pd.date_range(
+            pd.Timestamp("2026-05-01 09:30", tz="America/New_York").tz_convert("UTC"),
+            periods=390,
+            freq="min",
+        )
+        current_day = pd.date_range(
+            pd.Timestamp("2026-05-04 09:30", tz="America/New_York").tz_convert("UTC"),
+            periods=100,
+            freq="min",
+        )
+        df = pd.DataFrame(
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1000.0,
+            },
+            index=first_day.append(current_day),
+        )
+        out = Resampler().resample(df, TF_1D)
+        assert len(out) == 1
+        assert out.iloc[0]["volume"] == pytest.approx(390000.0)
 
     def test_lookback_bars_limit(self):
         df = self._make_1m_df(70)
@@ -227,6 +273,66 @@ class TestDataManager:
             df = dm.bars_1m()
             # CSV value should be preserved
             assert df.iloc[0]["open"] == pytest.approx(100.0)
+        finally:
+            os.unlink(path)
+
+    def test_backfill_live_provider_wins_current_session(self):
+        dm = DataManager(QQQ)
+        path = self._make_csv([
+            ("2026-04-30 09:30:00", 100, 101, 99, 100.5, 1000),
+            ("2026-05-01 09:30:00", 200, 201, 199, 200.5, 2000),
+            ("2026-05-01 09:31:00", 201, 202, 200, 201.5, 2100),
+        ])
+        try:
+            dm.load_csv(path)
+            added = dm.merge_backfill(
+                [
+                    _1m_bar(QQQ, "2026-04-30 13:30:00", c=999.5, source="ibkr"),
+                    _1m_bar(QQQ, "2026-05-01 13:30:00", c=888.5, source="csv"),
+                    _1m_bar(QQQ, "2026-05-01 13:30:00", c=300.5, source="ibkr"),
+                    _1m_bar(QQQ, "2026-05-01 13:31:00", c=301.5, source="ibkr"),
+                ],
+                live_session_date=date(2026, 5, 1),
+                current_session_source_policy=MERGE_POLICY_LIVE_PROVIDER_WINS,
+            )
+
+            df = dm.bars_1m()
+            assert added == 2
+            assert len(df) == 3
+            assert list(df["close"]) == [100.5, 300.5, 301.5]
+            assert list(df["source"]) == ["csv", "ibkr", "ibkr"]
+            quality = dm.data_quality()
+            assert quality["source_counts"] == {"ibkr": 2, "csv": 1}
+            assert quality["last_merge"]["replaced_session_rows"] == 2
+            assert quality["last_merge"]["dropped_current_session_offline"] == 1
+        finally:
+            os.unlink(path)
+
+    def test_live_provider_policy_drops_current_session_csv_without_live_history(self):
+        dm = DataManager(QQQ)
+        path = self._make_csv([
+            ("2026-04-30 09:30:00", 100, 101, 99, 100.5, 1000),
+            ("2026-05-01 09:30:00", 200, 201, 199, 200.5, 2000),
+        ])
+        try:
+            dm.load_csv(path)
+            revision = dm.revision
+            added = dm.merge_backfill(
+                [
+                    _1m_bar(QQQ, "2026-05-01 13:30:00", c=888.5, source="csv"),
+                ],
+                live_session_date=date(2026, 5, 1),
+                current_session_source_policy=MERGE_POLICY_LIVE_PROVIDER_WINS,
+            )
+
+            df = dm.bars_1m()
+            assert added == 0
+            assert dm.revision == revision + 1
+            assert len(df) == 1
+            assert list(df["close"]) == [100.5]
+            quality = dm.data_quality()
+            assert quality["last_merge"]["replaced_session_rows"] == 1
+            assert quality["last_merge"]["dropped_current_session_offline"] == 1
         finally:
             os.unlink(path)
 
